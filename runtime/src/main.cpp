@@ -3,6 +3,7 @@
 //   fullauto <game.iso>
 //   fullauto <default.xex> <game.iso | extracted game folder>
 #include "fa/rt/hle_hooks.hpp"
+#include "fa/rt/crash.hpp"
 #include "fa/rt/loader.hpp"
 #include "fa/rt/memory.hpp"
 #include "fa/xdvdfs.hpp"
@@ -34,8 +35,11 @@ static bool read_game(const std::string& path, std::vector<uint8_t>& xex) {
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: fullauto <game.iso> | fullauto <default.xex> <game.iso | folder>\n"); return 2; }
+    install_crash_handler();
     std::vector<uint8_t> xex;
+    std::fprintf(stderr, "[boot] reading game\n");
     if (!read_game(argv[1], xex)) return 1;
+    std::fprintf(stderr, "[boot] reserving guest memory\n");
     if (!g_mem.init()) return 1;
     // XMA/APU register page: plain memory the audio layer polls.
     g_mem.commit_fixed(0x7FEA0000, 0x10000);
@@ -52,12 +56,14 @@ int main(int argc, char** argv) {
         hle_cfg.game_path = slash == std::string::npos ? "." : hle_cfg.game_path.substr(0, slash);
     }
     hle_cfg.audio_output = !std::getenv("FA_NO_AUDIO");
+    std::fprintf(stderr, "[boot] starting file, input, audio services\n");
     std::string hle_err;
     if (!fa::hle::init_services(hle_cfg, make_runtime_hooks(), hle_err)) {
         std::fprintf(stderr, "cannot mount game files from %s: %s\n", hle_cfg.game_path.c_str(), hle_err.c_str());
         return 1;
     }
 
+    std::fprintf(stderr, "[boot] loading XEX\n");
     LoadedImage img;
     if (!load_xex(xex, img)) return 1;
     g_kernel.set_tls_info(img.tls);
