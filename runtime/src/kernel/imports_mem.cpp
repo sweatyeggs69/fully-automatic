@@ -1,4 +1,5 @@
 // Memory related kernel imports: Mm*, NtAllocateVirtualMemory, Ex pools, Rtl heaps.
+#include <cstdio>
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/memory.hpp"
 #include "fa/rt/import.hpp"
@@ -49,8 +50,10 @@ FA_IMPORT(NtAllocateVirtualMemory) {
         result = want;
         size = ((size + kPageSize - 1) & ~(kPageSize - 1));
     } else {
-        Heap h = (want >= 0xA0000000 && want < 0xE0000000) ? Heap::Physical : Heap::User;
+        Heap h = (want >= 0xA0000000 && want < 0xE0000000) ? Heap::Physical
+               : (want >= 0x90000000 && want < 0xA0000000) ? Heap::View : Heap::User;
         result = g_mem.alloc(h, size, kAllocGranularity, want);
+        if (!result) std::fprintf(stderr, "NtAllocateVirtualMemory failed: base=%08x size=%08x type=%x\n", want, size, type);
         if (!result && want == 0) result = 0;
         size = g_mem.allocation_size(result);
     }

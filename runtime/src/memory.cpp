@@ -36,6 +36,7 @@ GuestMemory::Range GuestMemory::range_of(Heap h) {
         case Heap::System: return {0x60000000, 0x70000000};
         case Heap::Malloc: return {0x70000000, 0x7F000000};
         case Heap::Physical: return {0xA0000000, 0xE0000000};
+        case Heap::View: return {0x90000000, 0xA0000000};
     }
     return {0, 0};
 }
