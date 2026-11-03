@@ -1,0 +1,92 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..5b00684 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -727,6 +727,14 @@ bool Recompiler::Recompile(
+         printConditionalBranch(true, "eq");
+         break;
+ 
++    case PPC_INST_BSO:
++        printConditionalBranch(false, "so");
++        break;
++
++    case PPC_INST_BNS:
++        printConditionalBranch(true, "so");
++        break;
++
+     case PPC_INST_BNECTR:
+         println("\tif (!{}.eq) {{", cr(insn.operands[0]));
+         println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32);", ctr());
+@@ -738,6 +746,16 @@ bool Recompiler::Recompile(
+         println("\tif (!{}.eq) return;", cr(insn.operands[0]));
+         break;
+ 
++    case PPC_INST_CROR:
++    case PPC_INST_CRORC:
++    {
++        constexpr std::string_view crFields[] = { "lt", "gt", "eq", "so" };
++        auto crBit = [&](uint32_t bit) { return fmt::format("{}.{}", cr(bit / 4), crFields[bit % 4]); };
++        println("\t{} = {} | {}{};", crBit(insn.operands[0]), crBit(insn.operands[1]),
++            insn.opcode->id == PPC_INST_CRORC ? "!" : "", crBit(insn.operands[2]));
++        break;
++    }
++
+     case PPC_INST_CCTPL:
+         // no op
+         break;
+@@ -1781,6 +1799,10 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_avg_epi16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_VAVGUH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_avg_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
+     case PPC_INST_VAVGUB:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_avg_epu8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+@@ -1877,6 +1899,8 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPGTUH:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_VEXPTEFP:
+@@ -2102,6 +2126,35 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_alignr_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8), {}));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), 16 - insn.operands[3]);
+         break;
+ 
++    case PPC_INST_VSLH:
++        // Per-lane shifts are the same under the full-vector reversal, so lane i maps to lane i.
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = {}.u16[{}] << ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = {}.u16[{}] >> ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRAH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.s16[{}] = {}.s16[{}] >> ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VRLH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = uint16_t((uint32_t({}.u16[{}]) << ({}.u16[{}] & 0xF)) | (uint32_t({}.u16[{}]) >> (16 - ({}.u16[{}] & 0xF))));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSPLTISH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(short(0x{:X})));", v(insn.operands[0]), insn.operands[1]);
++        break;
++
++    case PPC_INST_VSUBSHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_subs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
+     case PPC_INST_VSLW:
+     case PPC_INST_VSLW128:
+         // TODO: vectorize, ensure endianness is correct

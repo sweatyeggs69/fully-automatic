@@ -1,0 +1,116 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index f82ad01..ae653b6 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -254,70 +254,65 @@ void Recompiler::Analyse()
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
+ 
+     // Functions containing jump tables are often cut short by the boundary analysis, because
+-    // the first blr ends them. Merge every function up to the last jump table label.
++    // the first blr ends them. Merge every function up to the last jump table label. Several
++    // overlapping functions can contain the same table, so extend all of them.
+     for (auto& [tableBase, table] : config.switchTables)
+     {
+         if (table.labels.empty())
+             continue;
+ 
+-        auto it = std::upper_bound(functions.begin(), functions.end(), size_t(tableBase),
+-            [](size_t address, const Function& fn) { return address < fn.base; });
+-        if (it == functions.begin())
+-            continue;
+-        --it;
+-
+-        size_t index = it - functions.begin();
+-        size_t fnBase = functions[index].base;
+-        size_t end = fnBase + functions[index].size;
+-        if (tableBase < fnBase || tableBase >= end)
+-            continue;
+-
+         size_t maxLabel = *std::max_element(table.labels.begin(), table.labels.end());
+-        if (maxLabel < end)
+-            continue;
+ 
+-        size_t next = index + 1;
+-        while (next < functions.size() && functions[next].base <= maxLabel)
++        for (size_t index = 0; index < functions.size(); ++index)
+         {
+-            end = std::max(end, functions[next].base + functions[next].size);
+-            ++next;
+-        }
+-        end = std::max(end, maxLabel + 4);
++            size_t fnBase = functions[index].base;
++            if (fnBase > tableBase)
++                break;
+ 
+-        for (size_t k = index; k < next; k++)
+-        {
+-            auto range = image.symbols.equal_range(functions[k].base);
+-            for (auto sym = range.first; sym != range.second;)
++            size_t end = fnBase + functions[index].size;
++            if (tableBase >= end || maxLabel < end)
++                continue;
++
++            size_t next = index + 1;
++            while (next < functions.size() && functions[next].base <= maxLabel)
+             {
+-                if (sym->address == functions[k].base && sym->type == Symbol_Function)
+-                    sym = image.symbols.erase(sym);
+-                else
+-                    ++sym;
++                end = std::max(end, functions[next].base + functions[next].size);
++                ++next;
++            }
++            end = std::max(end, maxLabel + 4);
++
++            for (size_t k = index; k < next; k++)
++            {
++                auto range = image.symbols.equal_range(functions[k].base);
++                for (auto sym = range.first; sym != range.second;)
++                {
++                    if (sym->address == functions[k].base && sym->type == Symbol_Function)
++                        sym = image.symbols.erase(sym);
++                    else
++                        ++sym;
++                }
+             }
+-        }
+ 
+-        functions.erase(functions.begin() + index + 1, functions.begin() + next);
+-        functions[index].size = end - fnBase;
+-        image.symbols.emplace(fmt::format("sub_{:X}", fnBase), fnBase, functions[index].size, Symbol_Function);
++            functions.erase(functions.begin() + index + 1, functions.begin() + next);
++            functions[index].size = end - fnBase;
++            image.symbols.emplace(fmt::format("sub_{:X}", fnBase), fnBase, functions[index].size, Symbol_Function);
++        }
+     }
+ 
+-    // Diagnostics: report jump tables whose labels are still not covered by a single function.
++    // Diagnostics: report jump tables whose labels are not covered by every function containing them.
+     for (auto& [tableBase, table] : config.switchTables)
+     {
+-        auto it = std::upper_bound(functions.begin(), functions.end(), size_t(tableBase),
+-            [](size_t address, const Function& fn) { return address < fn.base; });
+-        if (it == functions.begin())
+-        {
+-            fmt::println("DIAG: switch at {:X} is not inside any function", tableBase);
+-            continue;
+-        }
+-        --it;
+-        for (auto label : table.labels)
++        for (const auto& fn : functions)
+         {
+-            if (label < it->base || label >= it->base + it->size)
++            if (tableBase < fn.base || tableBase >= fn.base + fn.size)
++                continue;
++            for (auto label : table.labels)
+             {
+-                fmt::println("DIAG: switch at {:X} is in function {:X}-{:X} but label {:X} is outside", tableBase, it->base, it->base + it->size, label);
+-                break;
++                if (label < fn.base || label >= fn.base + fn.size)
++                {
++                    fmt::println("DIAG: switch at {:X} is in function {:X}-{:X} but label {:X} is outside", tableBase, fn.base, fn.base + fn.size, label);
++                    break;
++                }
+             }
+         }
+     }

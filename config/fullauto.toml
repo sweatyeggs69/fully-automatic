@@ -1,0 +1,28 @@
+# XenonRecomp config for Full Auto (title 534507D5, default.xex v4).
+# Paths are relative to this file. private/ and ppc/ are gitignored.
+[main]
+file_path = "../private/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "../private/switch_tables.toml"
+
+# Start with all optimizations off; enable only after a working recompilation.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Found with tools/xexscan
+restgprlr_14_address = 0x8257BE00
+savegprlr_14_address = 0x8257BDB0
+restfpr_14_address = 0x8257CB7C
+savefpr_14_address = 0x8257CB30
+restvmx_14_address = 0x8257D9F8
+savevmx_14_address = 0x8257D760
+restvmx_64_address = 0x8257DA8C
+savevmx_64_address = 0x8257D7F4
+
+# TODO: setjmp_address / longjmp_address (only if the game uses them)
