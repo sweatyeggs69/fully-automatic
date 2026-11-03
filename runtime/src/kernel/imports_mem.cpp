@@ -1,5 +1,6 @@
 // Memory related kernel imports: Mm*, NtAllocateVirtualMemory, Ex pools, Rtl heaps.
 #include <cstdio>
+#include <cstring>
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/memory.hpp"
 #include "fa/rt/import.hpp"
@@ -60,6 +61,8 @@ FA_IMPORT(NtAllocateVirtualMemory) {
     if (!result) { ret32(ctx, STATUS_NO_MEMORY); return; }
     if (base_ptr) st32(base_ptr, result);
     if (size_ptr) st32(size_ptr, size);
+    if (fa::rt::g_trace_imports)
+        std::fprintf(stderr, "[mem] NtAllocateVirtualMemory want=%08x type=%08x -> base=%08x size=%08x\n", want, type, result, size);
     ret32(ctx, STATUS_SUCCESS);
     (void)type;
 }
@@ -68,6 +71,21 @@ FA_IMPORT(NtFreeVirtualMemory) {
     // (base_addr_ptr, region_size_ptr, free_type, debug_memory)
     uint32_t base_ptr = arg32(ctx, 0), size_ptr = arg32(ctx, 1), type = arg32(ctx, 2);
     uint32_t addr = base_ptr ? ld32(base_ptr) : 0;
+    if (fa::rt::g_trace_imports)
+        std::fprintf(stderr, "[mem] NtFreeVirtualMemory base=%08x size=%08x type=%08x\n", addr,
+                     size_ptr ? ld32(size_ptr) : 0, type);
+    if ((type & MEM_DECOMMIT) && !(type & MEM_RELEASE)) {
+        // Decommitted pages come back zeroed when committed again.
+        uint32_t a = addr & ~(kPageSize - 1);
+        uint32_t sz = size_ptr ? ld32(size_ptr) : 0;
+        uint32_t end = (addr + sz + kPageSize - 1) & ~(kPageSize - 1);
+        uint32_t st, as;
+        if (end > a && g_mem.find_allocation(a, st, as) && uint64_t(end) <= uint64_t(st) + as) {
+            std::memset(host(a), 0, end - a);
+            if (base_ptr) st32(base_ptr, a);
+            if (size_ptr) st32(size_ptr, end - a);
+        }
+    }
     if (type & MEM_RELEASE) {
         uint32_t freed = 0;
         if (!g_mem.free(addr, &freed)) { ret32(ctx, STATUS_INVALID_PARAMETER); return; }
