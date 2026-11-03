@@ -21,7 +21,7 @@ set(THIRDPARTY_ROOT ${FA_XENONRECOMP}/thirdparty)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
 
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
-    src/memory.cpp src/kernel.cpp src/kernel/*.cpp
+    src/memory.cpp src/kernel.cpp src/crash.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 
 function(fa_rt_library name ppc_include)
@@ -71,6 +71,7 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     add_executable(fullauto src/main.cpp ${STUBS} ${PPC_SOURCES})
     target_link_libraries(fullauto PRIVATE fa_rt)
     target_include_directories(fullauto PRIVATE ${FA_PPC_DIR})
+    target_link_options(fullauto PRIVATE -rdynamic)
     # The recompiled code is huge; keep per-file compile cheap by default.
     set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-fno-strict-aliasing")
 else()
