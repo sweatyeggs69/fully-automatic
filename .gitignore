@@ -1,1 +1,12 @@
 build/
+
+# Never commit game data
+*.iso
+*.xex
+*.pix
+*.pit
+*.rxx
+*.xwb
+*.wmv
+FullAuto_Extracted*/
+extracted/
