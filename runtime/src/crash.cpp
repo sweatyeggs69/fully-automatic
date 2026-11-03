@@ -4,6 +4,7 @@
 // names the guest functions directly.
 #include "fa/rt/crash.hpp"
 #include "fa/rt/guest.hpp"
+#include "fa/rt/kernel.hpp"
 
 #include <execinfo.h>
 #include <signal.h>
@@ -38,6 +39,7 @@ static void handler(int sig, siginfo_t* info, void*) {
     int n = backtrace(frames, 48);
     write_str("backtrace (innermost first):\n");
     backtrace_symbols_fd(frames, n, 2);
+    dump_guest_context();
     _exit(128 + sig);
 }
 
