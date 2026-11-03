@@ -42,10 +42,11 @@ int main(int argc, char** argv) {
         std::printf("title id:      %08X\nmedia id:      %08X\nversion:       %08X\n"
                     "module flags:  %08X\nPE offset:     0x%X\nsecurity info: 0x%X\n"
                     "image size:    0x%X\nbase address:  0x%08X\nentry point:   0x%08X\n"
-                    "optional hdrs: %zu\n",
+                    "optional hdrs: %zu\nencryption:    %d (0 none, 1 normal)\ncompression:   %d (0 none, 1 basic, 2 LZX, 3 delta)\n",
                     x.title_id, x.media_id, x.version, x.module_flags, x.pe_offset,
                     x.security_offset, x.image_size, x.base_address, x.entry_point,
-                    x.optional_headers.size());
+                    x.optional_headers.size(), x.encryption, x.compression);
+        for (auto& [id, v] : x.optional_headers) std::printf("  header %08X = %08X\n", id, v);
         return 0;
     }
     return usage();

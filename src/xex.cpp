@@ -28,6 +28,11 @@ bool parse_xex(const std::vector<uint8_t>& d, XexInfo& x) {
     get(0x10100, x.entry_point);
     get(0x10201, x.base_address);
     be32(d, x.security_offset + 4, x.image_size);
+    auto ff = x.optional_headers.find(0x3FF);  // file format info: offset into file
+    if (ff != x.optional_headers.end() && ff->second + 8 <= d.size()) {
+        x.encryption = d[ff->second + 4] << 8 | d[ff->second + 5];
+        x.compression = d[ff->second + 6] << 8 | d[ff->second + 7];
+    }
     auto ex = x.optional_headers.find(0x40006);  // execution info: offset into file
     if (ex != x.optional_headers.end()) {
         be32(d, ex->second, x.media_id);

@@ -16,6 +16,8 @@ struct XexInfo {
     uint32_t title_id = 0;        // execution info (0x40006)
     uint32_t media_id = 0;
     uint32_t version = 0;
+    int encryption = -1;          // file format info (0x3FF): 0 none, 1 normal; -1 absent
+    int compression = -1;         // 0 none, 1 basic, 2 normal (LZX), 3 delta; -1 absent
     std::map<uint32_t, uint32_t> optional_headers;  // id -> value/offset
 };
 
