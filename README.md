@@ -17,3 +17,12 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
     faiso game.iso list
     faiso game.iso extract default.xex ./default.xex
     faiso game.iso xex
+
+## Recompilation steps (local, needs your own game copy)
+    ./build/faiso game.iso extract default.xex private/default.xex
+    git clone --recursive https://github.com/hedge-dev/XenonRecomp third_party/XenonRecomp
+    cmake -S third_party/XenonRecomp -B third_party/XenonRecomp/out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+    cmake --build third_party/XenonRecomp/out --target XenonAnalyse XenonRecomp
+    ./third_party/XenonRecomp/out/XenonAnalyse/XenonAnalyse private/default.xex private/switch_tables.toml
+    mkdir -p ppc
+    ./third_party/XenonRecomp/out/XenonRecomp/XenonRecomp config/fullauto.toml third_party/XenonRecomp/XenonUtils/ppc_context.h
