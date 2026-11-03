@@ -1,0 +1,22 @@
+find_program(PY python3 REQUIRED)
+set(ISO ${WORKDIR}/test.iso)
+execute_process(COMMAND ${PY} ${CMAKE_CURRENT_LIST_DIR}/make_test_iso.py ${ISO} RESULT_VARIABLE r)
+if(r)
+  message(FATAL_ERROR "iso generation failed")
+endif()
+
+execute_process(COMMAND ${FAISO} ${ISO} list OUTPUT_VARIABLE out RESULT_VARIABLE r)
+if(r OR NOT out MATCHES "default.xex" OR NOT out MATCHES "Media/hello.txt")
+  message(FATAL_ERROR "list failed: ${out}")
+endif()
+
+execute_process(COMMAND ${FAISO} ${ISO} extract Media/Hello.txt ${WORKDIR}/hello.out RESULT_VARIABLE r)
+file(READ ${WORKDIR}/hello.out content)
+if(r OR NOT content STREQUAL "hello")
+  message(FATAL_ERROR "extract failed")
+endif()
+
+execute_process(COMMAND ${FAISO} ${ISO} xex OUTPUT_VARIABLE xo RESULT_VARIABLE r)
+if(r OR NOT xo MATCHES "title id:      4D5307E6" OR NOT xo MATCHES "entry point:   0x82000000")
+  message(FATAL_ERROR "xex failed: ${xo}")
+endif()
