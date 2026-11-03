@@ -104,7 +104,7 @@ bool load_xex(const std::vector<uint8_t>& file, LoadedImage& out) {
     if (out.base != PPC_IMAGE_BASE || out.size != PPC_IMAGE_SIZE)
         std::fprintf(stderr, "warning: image 0x%X/0x%X differs from recompiled 0x%llX/0x%llX\n",
                      out.base, out.size, (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
-    if (!map_image(static_cast<const uint8_t*>(img.Find(img.base)), out.base, out.size)) return false;
+    if (!map_image(img.data.get(), out.base, out.size)) return false;
 
     link_variables(file, info, out.base);
 
