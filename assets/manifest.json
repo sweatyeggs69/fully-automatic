@@ -1,0 +1,1155 @@
+{
+    "total_files": 228,
+    "folders": {
+        ".": [],
+        "Media": [
+            "lastmanstanding1.rxx",
+            "stream.xsb",
+            "Pseudo720.wmv",
+            "Credits.wmv",
+            "scavenger1.rxx",
+            "supercrazy1.rxx",
+            "Euromode.ttf",
+            "msgothic.ttf",
+            "dieselhead0.rxx",
+            "deliverance1.rxx",
+            "stream.xwb",
+            "warlord1.rxx",
+            "smackables.xsb",
+            "musnd.xwb",
+            "AttractLoop720.wmv",
+            "nouturn0.rxx",
+            "dieselanddestruct0.rxx",
+            "fullyautomatic0.rxx",
+            "vocal1.rxx",
+            "chromehounds.wmv",
+            "nouturn1.rxx",
+            "fullyautomatic1.rxx",
+            "propFX.xwb",
+            "petrolhead0.rxx",
+            "predatoror1.rxx",
+            "EuromodeBolditalic.ttf",
+            "world.xsb",
+            "pil.xsb",
+            "weap_prim.xsb",
+            "petrolheadremix1.rxx",
+            "EuromodeExtraBolditalic.ttf",
+            "scrape.xsb",
+            "lastmanremix1.rxx",
+            "zerotohero0.rxx",
+            "world.xwb",
+            "pointofnoreturn0.rxx",
+            "Stones.ttf",
+            "blackmonday0.rxx",
+            "pointofnoreturn1.rxx",
+            "vocal0.rxx",
+            "car.xwb",
+            "blackmonday1.rxx",
+            "deliverance0.rxx",
+            "menu.xsb",
+            "car.xsb",
+            "hud.xwb",
+            "AttractLoopAlt_FINAL.wmv",
+            "petrolhead1.rxx",
+            "scavenger0.rxx",
+            "Harvest_Regular.ttf",
+            "smackables.xwb",
+            "lastmanremix0.rxx",
+            "warriorofthe0.rxx",
+            "xmatest1.rxx",
+            "xarialuni.ttf",
+            "supercrazy0.rxx",
+            "music.xsb",
+            "lastmanstanding0.rxx",
+            "blokrok0.rxx",
+            "musnd.xsb",
+            "asphaltassassin0.rxx",
+            "predatoror0.rxx",
+            "EuromodeGExtraBolditalic.ttf",
+            "Zerotwos.ttf",
+            "music.xwb",
+            "messijlost0.rxx",
+            "Radiosta.ttf",
+            "menu.xwb",
+            "burningworld0.rxx",
+            "dieselhead1.rxx",
+            "propFX.xsb",
+            "warlord0.rxx",
+            "hud.xsb",
+            "zerotohero1.rxx",
+            "scraping.xwb",
+            "burningworld1.rxx",
+            "weap_prim.xwb",
+            "xmatest0.rxx",
+            "warriorofthe1.rxx",
+            "asphaltassassin1.rxx",
+            "dieselanddestruct1.rxx",
+            "blokrok1.rxx",
+            "messijlost1.rxx",
+            "petrolheadremix0.rxx",
+            "pil0.xwb"
+        ],
+        "rtdXenon": [
+            "fa_t111.pix",
+            "fa_T512.pix",
+            "dw_piLX2.pix",
+            "fa_t724.pix",
+            "fa_T213.pix",
+            "fa_T121.pix",
+            "fa_t725.pix",
+            "fa_T511.pix",
+            "fa_T611.pix",
+            "fa_t721.pix",
+            "fa_t722.pix",
+            "fa_t622.pix",
+            "fa_T214.pix",
+            "fa_T112.pix",
+            "fa_frontend.pix",
+            "fa_T113.pix",
+            "fa_t613.pix",
+            "fa_T215.pix",
+            "fa_t216.pix",
+            "fa_t615.pix"
+        ],
+        "piLaunch": [
+            "hint13_racestats1280x720.dds",
+            "fa007.dds",
+            "hint06_rearweapons1280x720.dds",
+            "hint10_tacticalgauge640x480.dds",
+            "GI_Streamline008_480.dds",
+            "GI_VulcanPlus005_480.dds",
+            "fa002.dds",
+            "Game_OXM_002.dds",
+            "hint06_rearweapons640x480.dds",
+            "FA_Wraith_Flight_480.dds",
+            "hint11_armorgauge640x480.dds",
+            "hint05_frontweapons640x480.dds",
+            "fa002_480.dds",
+            "hint16_weaponaim1280x720.dds",
+            "Game_OXM_002_480.dds",
+            "fa011.dds",
+            "ContinueVulcan720.dds",
+            "ContinuePython.dds",
+            "GI_Python004_480.dds",
+            "hint16_weaponaim640x480.dds",
+            "GI_PhantomPlus001_480.dds",
+            "testCube.dds",
+            "GI_Python004.dds",
+            "logo_orange.dds",
+            "FA_Corner_Crash.dds",
+            "Game_OXM_042_480.dds",
+            "hint13_racestats640x480.dds",
+            "wrecks2.dds",
+            "fontDebug.dds",
+            "SEGA.dds",
+            "OXM017.dds",
+            "hint08_lookback1280x720.dds",
+            "ContinueVulcan.dds",
+            "font_arialuni_40.dds",
+            "loadscreen.dds",
+            "wraith_TEST3_480.dds",
+            "GI_PhantomPlus001.dds",
+            "hint07_powerslide1280x720.dds",
+            "SEGA480.dds",
+            "fa011_480.dds",
+            "FA_Corner_Crash_480.dds",
+            "ContinuePython720.dds",
+            "fa004.dds",
+            "hint10_tacticalgauge1280x720.dds",
+            "hint15_mirrorrtags640x480.dds",
+            "piLogo.dds",
+            "hint15_mirrorrtags1280x720.dds",
+            "OXM017_480.dds",
+            "font_Harvest_46.dds",
+            "hint04_racemedals1280x720.dds",
+            "wrecks2_480.dds",
+            "FA_Demon_480.dds",
+            "hint03_racerecords1280x720.dds",
+            "hint14_trackmap640x480.dds",
+            "font_Stones_40.dds",
+            "fa004_480.dds",
+            "LevelLoadScreen.dds",
+            "end_480.dds",
+            "hint01_unwreck1280x720.dds",
+            "wraith_TEST2.dds",
+            "hint09_replay1280x720.dds",
+            "end.dds",
+            "LoadScreen0_480.dds",
+            "ESRB480.dds",
+            "pi.dds",
+            "spinner.dds",
+            "hint14_trackmap1280x720.dds",
+            "SEGA720.dds",
+            "GI_Streamline008.dds",
+            "GI_Ardent001.dds",
+            "title_screen1280x720.dds",
+            "hint11_armorgauge1280x720.dds",
+            "fa008.dds",
+            "loadbar2.dds",
+            "Game_OXM_047_480.dds",
+            "hint12_speedgauge1280x720.dds",
+            "LevelLoadScreenE3.dds",
+            "hint03_racerecords640x480.dds",
+            "GI_VulcanPlus005.dds",
+            "hint08_lookback640x480.dds",
+            "ESRB720.dds",
+            "loadbar.dds",
+            "LoadScreen1.dds",
+            "Game_OXM_042.dds",
+            "PressA.dds",
+            "MenuScreen.dds",
+            "title_screen640x480.dds",
+            "wraith_TEST3.dds",
+            "fa000_480.dds",
+            "fa000.dds",
+            "wrecks1_480.dds",
+            "font_Euromode_44.dds",
+            "wraith_TEST2_480.dds",
+            "GI_Ardent001_480.dds",
+            "fa005_480.dds",
+            "special_32.dds",
+            "hint07_powerslide640x480.dds",
+            "fa007_480.dds",
+            "fa005.dds",
+            "hint00_boost640x480.dds",
+            "wrecks3_480.dds",
+            "GI_Hitman009_480.dds",
+            "wrecks3.dds",
+            "hint12_speedgauge640x480.dds",
+            "LoadScreen0.dds",
+            "fa008_480.dds",
+            "hint02_wreckpoints1280x720.dds",
+            "hint09_replay640x480.dds",
+            "GI_Hitman009.dds",
+            "Game_OXM_047.dds",
+            "hint02_wreckpoints640x480.dds",
+            "FA_Demon.dds",
+            "WaitScreen16_9.dds",
+            "wrecks1.dds",
+            "hint00_boost1280x720.dds",
+            "FA_Black_Enforcer_480.dds",
+            "LoadScreen1_480.dds",
+            "WaitScreen4_3.dds",
+            "hint01_unwreck640x480.dds",
+            "FA_Wraith_Flight.dds",
+            "hint04_racemedals640x480.dds",
+            "hint05_frontweapons1280x720.dds",
+            "FA_Black_Enforcer.dds"
+        ],
+        "$SystemUpdate": []
+    },
+    "files": [
+        {
+            "path": "Media/lastmanstanding1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/stream.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/Pseudo720.wmv",
+            "type": "wmv"
+        },
+        {
+            "path": "Media/Credits.wmv",
+            "type": "wmv"
+        },
+        {
+            "path": "Media/scavenger1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/supercrazy1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/Euromode.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/msgothic.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/dieselhead0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/deliverance1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/stream.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/warlord1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/smackables.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/musnd.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/AttractLoop720.wmv",
+            "type": "wmv"
+        },
+        {
+            "path": "Media/nouturn0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/dieselanddestruct0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/fullyautomatic0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/vocal1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/chromehounds.wmv",
+            "type": "wmv"
+        },
+        {
+            "path": "Media/nouturn1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/fullyautomatic1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/propFX.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/petrolhead0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/predatoror1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/EuromodeBolditalic.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/world.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/pil.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/weap_prim.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/petrolheadremix1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/EuromodeExtraBolditalic.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/scrape.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/lastmanremix1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/zerotohero0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/world.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/pointofnoreturn0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/Stones.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/blackmonday0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/pointofnoreturn1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/vocal0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/car.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/blackmonday1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/deliverance0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/menu.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/car.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/hud.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/AttractLoopAlt_FINAL.wmv",
+            "type": "wmv"
+        },
+        {
+            "path": "Media/petrolhead1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/scavenger0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/Harvest_Regular.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/smackables.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/lastmanremix0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/warriorofthe0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/xmatest1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/xarialuni.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/supercrazy0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/music.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/lastmanstanding0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/blokrok0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/musnd.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/asphaltassassin0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/predatoror0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/EuromodeGExtraBolditalic.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/Zerotwos.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/music.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/messijlost0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/Radiosta.ttf",
+            "type": "ttf"
+        },
+        {
+            "path": "Media/menu.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/burningworld0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/dieselhead1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/propFX.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/warlord0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/hud.xsb",
+            "type": "xsb"
+        },
+        {
+            "path": "Media/zerotohero1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/scraping.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/burningworld1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/weap_prim.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "Media/xmatest0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/warriorofthe1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/asphaltassassin1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/dieselanddestruct1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/blokrok1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/messijlost1.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/petrolheadremix0.rxx",
+            "type": "rxx"
+        },
+        {
+            "path": "Media/pil0.xwb",
+            "type": "xwb"
+        },
+        {
+            "path": "rtdXenon/fa_t111.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T512.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/dw_piLX2.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t724.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T213.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T121.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t725.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T511.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T611.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t721.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t722.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t622.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T214.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T112.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_frontend.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T113.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t613.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_T215.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t216.pix",
+            "type": "pix"
+        },
+        {
+            "path": "rtdXenon/fa_t615.pix",
+            "type": "pix"
+        },
+        {
+            "path": "piLaunch/hint13_racestats1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa007.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint06_rearweapons1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint10_tacticalgauge640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Streamline008_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_VulcanPlus005_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa002.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_002.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint06_rearweapons640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Wraith_Flight_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint11_armorgauge640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint05_frontweapons640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa002_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint16_weaponaim1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_002_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa011.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ContinueVulcan720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ContinuePython.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Python004_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint16_weaponaim640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_PhantomPlus001_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/testCube.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Python004.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/logo_orange.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Corner_Crash.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_042_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint13_racestats640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks2.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fontDebug.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/SEGA.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/OXM017.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint08_lookback1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ContinueVulcan.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/font_arialuni_40.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/loadscreen.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wraith_TEST3_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_PhantomPlus001.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint07_powerslide1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/SEGA480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa011_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Corner_Crash_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ContinuePython720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa004.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint10_tacticalgauge1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint15_mirrorrtags640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/piLogo.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint15_mirrorrtags1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/OXM017_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/font_Harvest_46.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint04_racemedals1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks2_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Demon_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint03_racerecords1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint14_trackmap640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/font_Stones_40.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa004_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LevelLoadScreen.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/end_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint01_unwreck1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wraith_TEST2.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint09_replay1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/end.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LoadScreen0_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ESRB480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/pi.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/spinner.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint14_trackmap1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/SEGA720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Streamline008.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Ardent001.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/title_screen1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint11_armorgauge1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa008.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/loadbar2.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_047_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint12_speedgauge1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LevelLoadScreenE3.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint03_racerecords640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_VulcanPlus005.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint08_lookback640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/ESRB720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/loadbar.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LoadScreen1.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_042.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/PressA.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/MenuScreen.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/title_screen640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wraith_TEST3.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa000_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa000.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks1_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/font_Euromode_44.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wraith_TEST2_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Ardent001_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa005_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/special_32.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint07_powerslide640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa007_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa005.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint00_boost640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks3_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Hitman009_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks3.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint12_speedgauge640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LoadScreen0.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/fa008_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint02_wreckpoints1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint09_replay640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/GI_Hitman009.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/Game_OXM_047.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint02_wreckpoints640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Demon.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/WaitScreen16_9.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/wrecks1.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint00_boost1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Black_Enforcer_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/LoadScreen1_480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/WaitScreen4_3.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint01_unwreck640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Wraith_Flight.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint04_racemedals640x480.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/hint05_frontweapons1280x720.dds",
+            "type": "dds"
+        },
+        {
+            "path": "piLaunch/FA_Black_Enforcer.dds",
+            "type": "dds"
+        }
+    ]
+}
