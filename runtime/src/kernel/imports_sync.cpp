@@ -94,8 +94,13 @@ FA_IMPORT(ObReferenceObjectByHandle) {
     auto o = by_handle(arg32(ctx, 0));
     if (!o) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
     if (!o->guest_ptr) {
-        o->guest_ptr = g_mem.malloc(0x30);
+        bool is_thread = o->type == KObject::Type::Thread;
+        o->guest_ptr = g_mem.malloc(is_thread ? 0x400 : 0x30);
         g_kernel.register_dispatch(o->guest_ptr, o);
+        if (is_thread) {
+            std::lock_guard<std::mutex> lk(g_kmu);
+            sync_thread_header(*std::static_pointer_cast<KThread>(o));
+        }
     }
     if (arg32(ctx, 2)) st32(arg32(ctx, 2), o->guest_ptr);
     ret32(ctx, STATUS_SUCCESS);
