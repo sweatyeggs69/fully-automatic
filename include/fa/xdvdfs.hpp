@@ -1,7 +1,6 @@
 #pragma once
 // Minimal read-only XDVDFS (Xbox 360 game disc) reader.
 #include <cstdint>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,12 +29,21 @@ public:
     bool read(const IsoEntry& e, std::vector<uint8_t>& out);
     bool extract(const IsoEntry& e, const std::string& dest);
 
+    // Reads up to n bytes of a file starting at offset. Safe to call from
+    // several threads at once. Returns the number of bytes read.
+    size_t read_range(const IsoEntry& e, uint64_t offset, void* buf, size_t n) const;
+
+    XdvdfsImage() = default;
+    XdvdfsImage(const XdvdfsImage&) = delete;
+    XdvdfsImage& operator=(const XdvdfsImage&) = delete;
+    ~XdvdfsImage();
+
 private:
     void walk(uint64_t dir_off, uint32_t dir_size, const std::string& prefix,
               std::vector<IsoEntry>& out, int depth);
-    bool read_at(uint64_t off, void* buf, size_t n);
+    bool read_at(uint64_t off, void* buf, size_t n) const;
 
-    std::ifstream f_;
+    int fd_ = -1;
     uint64_t part_off_ = 0;
     uint32_t root_sector_ = 0, root_size_ = 0;
     std::string error_;

@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <fstream>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace fa {
 
@@ -19,16 +23,30 @@ static std::string lower(std::string s) {
     return s;
 }
 
-bool XdvdfsImage::read_at(uint64_t off, void* buf, size_t n) {
-    f_.clear();
-    f_.seekg(static_cast<std::streamoff>(off));
-    f_.read(static_cast<char*>(buf), static_cast<std::streamsize>(n));
-    return static_cast<size_t>(f_.gcount()) == n;
+XdvdfsImage::~XdvdfsImage() {
+    if (fd_ >= 0) ::close(fd_);
+}
+
+bool XdvdfsImage::read_at(uint64_t off, void* buf, size_t n) const {
+    auto* p = static_cast<uint8_t*>(buf);
+    while (n) {
+        ssize_t r = ::pread(fd_, p, n, static_cast<off_t>(off));
+        if (r <= 0) return false;
+        p += r; off += uint64_t(r); n -= size_t(r);
+    }
+    return true;
+}
+
+size_t XdvdfsImage::read_range(const IsoEntry& e, uint64_t offset, void* buf, size_t n) const {
+    if (e.is_dir || offset >= e.size) return 0;
+    n = size_t(std::min<uint64_t>(n, e.size - offset));
+    return read_at(e.offset + offset, buf, n) ? n : 0;
 }
 
 bool XdvdfsImage::open(const std::string& path) {
-    f_.open(path, std::ios::binary);
-    if (!f_) { error_ = "cannot open " + path; return false; }
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) { error_ = "cannot open " + path; return false; }
     for (uint64_t p : kPartitions) {
         uint8_t vd[28];
         if (!read_at(p + 32ull * kSector, vd, sizeof vd)) continue;

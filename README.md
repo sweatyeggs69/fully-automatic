@@ -13,6 +13,14 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
 ## Build and test
     cmake -S . -B build && cmake --build build && ctest --test-dir build
 
+Needs SDL2 and FFmpeg (libavcodec/libavutil): `sudo pacman -S --needed sdl2 ffmpeg` on CachyOS.
+
+## Files, input and audio
+See [docs/hle.md](docs/hle.md): `game:\` over the ISO, save folders, controllers and keyboard,
+XAudio output, the XMA decoder, and `fawave` for listing/decoding the game's wave banks.
+
+    ./build/fawave game.iso banks
+
 ## Tool
     faiso game.iso list
     faiso game.iso extract default.xex ./default.xex

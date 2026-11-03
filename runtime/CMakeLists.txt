@@ -17,6 +17,9 @@ set(FA_XENONRECOMP ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/XenonRecomp CACHE 
 set(FA_PPC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../ppc CACHE PATH "XenonRecomp output directory")
 set(THIRDPARTY_ROOT ${FA_XENONRECOMP}/thirdparty)
 
+# fa_core (ISO/XEX) and fa_hle (file system, input, audio, XMA): needs SDL2 + FFmpeg.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
+
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
     src/memory.cpp src/kernel.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
@@ -29,7 +32,7 @@ function(fa_rt_library name ppc_include)
         FA_XENON_CONTEXT_H="${FA_XENONRECOMP}/XenonUtils/ppc_context.h")
     target_compile_options(${name} PRIVATE -Wall -Wno-unused-parameter)
     find_package(Threads REQUIRED)
-    target_link_libraries(${name} PUBLIC Threads::Threads)
+    target_link_libraries(${name} PUBLIC Threads::Threads fa_hle)
 endfunction()
 
 # ---- unit test against a fake ppc/ directory ------------------------------------------------
@@ -38,6 +41,9 @@ add_executable(rt_test tests/rt_test.cpp)
 target_link_libraries(rt_test fa_rt_fake)
 enable_testing()
 add_test(NAME rt_test COMMAND rt_test)
+add_executable(hle_import_test tests/hle_import_test.cpp)
+target_link_libraries(hle_import_test fa_rt_fake)
+add_test(NAME hle_import_test COMMAND hle_import_test)
 
 # ---- the game, once XenonRecomp output exists --------------------------------------------------
 if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
@@ -59,7 +65,7 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
         DEPENDS ${FA_PPC_DIR}/ppc_func_mapping.cpp ${FA_RT_SOURCES}
         VERBATIM)
 
-    add_executable(fullauto src/main.cpp ../src/xdvdfs.cpp ../src/xex.cpp ${STUBS} ${PPC_SOURCES})
+    add_executable(fullauto src/main.cpp ${STUBS} ${PPC_SOURCES})
     target_link_libraries(fullauto PRIVATE fa_rt)
     target_include_directories(fullauto PRIVATE ${FA_PPC_DIR})
     # The recompiled code is huge; keep per-file compile cheap by default.
