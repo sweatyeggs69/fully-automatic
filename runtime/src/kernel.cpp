@@ -190,6 +190,7 @@ void Kernel::thread_main(std::shared_ptr<KThread> t) {
     {
         std::lock_guard<std::mutex> lk(g_kmu);
         t->finished = true;
+        sync_thread_header(*t);
     }
     g_kcv.notify_all();
 }
@@ -255,6 +256,7 @@ uint32_t Kernel::run_main_thread(uint32_t entry, uint32_t stack_size) {
     {
         std::lock_guard<std::mutex> lk(g_kmu);
         t->finished = true;
+        sync_thread_header(*t);
     }
     g_kcv.notify_all();
     return t->exit_code;
@@ -333,6 +335,15 @@ void trace_import(const char* name, PPCContext& ctx, bool entry) {
                      ctx.r5.u32, ctx.r6.u32);
     else
         std::fprintf(stderr, "[import] %s -> %08x\n", name, ctx.r3.u32);
+}
+
+// Mirrors a thread's state into its guest-visible KTHREAD (handed out by ObReferenceObjectByHandle):
+// dispatcher header type 6, signal state at +4, exit status at +0x140. Call with g_kmu held.
+void sync_thread_header(KThread& t) {
+    if (!t.guest_ptr) return;
+    st8(t.guest_ptr, 6);
+    st32(t.guest_ptr + 4, t.finished ? 1 : 0);
+    st32(t.guest_ptr + 0x140, t.exit_code);
 }
 
 void report_spin(const char* name, PPCContext& ctx, uint64_t count) {
