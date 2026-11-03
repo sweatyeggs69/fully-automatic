@@ -32,4 +32,5 @@ Full Auto uses a few PowerPC instructions XenonRecomp does not implement (16-bit
 Apply the patch before recompiling:
 
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-halfword.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-jumptables-and-more-vmx.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp

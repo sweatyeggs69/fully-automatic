@@ -1,0 +1,122 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 5b00684..0bddbc6 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -252,6 +252,54 @@ void Recompiler::Analyse()
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    // Functions containing jump tables are often cut short by the boundary analysis, because
++    // the first blr ends them. Merge every function up to the last jump table label.
++    for (auto& [tableBase, table] : config.switchTables)
++    {
++        if (table.labels.empty())
++            continue;
++
++        auto it = std::upper_bound(functions.begin(), functions.end(), size_t(tableBase),
++            [](size_t address, const Function& fn) { return address < fn.base; });
++        if (it == functions.begin())
++            continue;
++        --it;
++
++        size_t index = it - functions.begin();
++        size_t fnBase = functions[index].base;
++        size_t end = fnBase + functions[index].size;
++        if (tableBase < fnBase || tableBase >= end)
++            continue;
++
++        size_t maxLabel = *std::max_element(table.labels.begin(), table.labels.end());
++        if (maxLabel < end)
++            continue;
++
++        size_t next = index + 1;
++        while (next < functions.size() && functions[next].base <= maxLabel)
++        {
++            end = std::max(end, functions[next].base + functions[next].size);
++            ++next;
++        }
++        end = std::max(end, maxLabel + 4);
++
++        for (size_t k = index; k < next; k++)
++        {
++            auto range = image.symbols.equal_range(functions[k].base);
++            for (auto sym = range.first; sym != range.second;)
++            {
++                if (sym->address == functions[k].base && sym->type == Symbol_Function)
++                    sym = image.symbols.erase(sym);
++                else
++                    ++sym;
++            }
++        }
++
++        functions.erase(functions.begin() + index + 1, functions.begin() + next);
++        functions[index].size = end - fnBase;
++        image.symbols.emplace(fmt::format("sub_{:X}", fnBase), fnBase, functions[index].size, Symbol_Function);
++    }
+ }
+ 
+ bool Recompiler::Recompile(
+@@ -1003,6 +1051,11 @@ bool Recompiler::Recompile(
+         println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
++    case PPC_INST_FRSQRTE:
++        printSetFlushMode(false);
++        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
+     case PPC_INST_FRSP:
+         printSetFlushMode(false);
+         println("\t{}.f64 = double(float({}.f64));", f(insn.operands[0]), f(insn.operands[1]));
+@@ -1136,6 +1189,13 @@ bool Recompiler::Recompile(
+         println("{});", int32_t(insn.operands[1]));
+         break;
+ 
++    case PPC_INST_LHBRX:
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
+     case PPC_INST_LHZX:
+         print("\t{}.u64 = PPC_LOAD_U16(", r(insn.operands[0]));
+         if (insn.operands[1] != 0)
+@@ -1799,6 +1859,36 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_avg_epi16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_VADDSBS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s8, simde_mm_adds_epi8(simde_mm_load_si128((simde__m128i*){}.s8), simde_mm_load_si128((simde__m128i*){}.s8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.s64 = int64_t({}.s32[{}]) + int64_t({}.s32[{}]);", temp(), v(insn.operands[1]), i, v(insn.operands[2]), i);
++            println("\t{}.s32[{}] = {}.s64 > INT_MAX ? INT_MAX : {}.s64 < INT_MIN ? INT_MIN : {}.s64;", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
++    case PPC_INST_VPKSWSS:
++        // Host lanes are reversed relative to PPC element order, so the operands swap.
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSWUS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VCTUXS:
++        printSetFlushMode(true);
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.f32 = {}.f32[{}] * {}.0f;", temp(), v(insn.operands[1]), i, 1u << insn.operands[2]);
++            println("\t{}.u32[{}] = !({}.f32 > 0.0f) ? 0u : {}.f32 >= 4294967296.0f ? 0xFFFFFFFFu : uint32_t({}.f32);", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
+     case PPC_INST_VAVGUH:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_avg_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
