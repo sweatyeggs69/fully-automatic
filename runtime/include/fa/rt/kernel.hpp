@@ -145,6 +145,8 @@ void call_guest(PPCContext& ctx, uint32_t addr);
 void attach_guest_thread(const std::string& name);
 // Runs a guest function (r3 = arg) on the calling thread's guest context and returns r3.
 uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2 = 0);
+// Prints the calling thread's guest registers to stderr (used by the crash handler).
+void dump_guest_context();
 // Resolves a guest address to its recompiled function, or nullptr.
 PPCFunc* lookup_guest(uint32_t addr);
 

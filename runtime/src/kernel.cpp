@@ -322,6 +322,19 @@ void attach_guest_thread(const std::string& name) {
     g_kernel.register_external_thread(t);
 }
 
+void dump_guest_context() {
+    KThread* t = t_current;
+    if (!t || !t->ctx) return;
+    PPCContext& c = *t->ctx;
+    std::fprintf(stderr, "guest registers (thread %s):\n", t->name.c_str());
+    const PPCRegister* r[32] = {&c.r0,&c.r1,&c.r2,&c.r3,&c.r4,&c.r5,&c.r6,&c.r7,&c.r8,&c.r9,&c.r10,
+        &c.r11,&c.r12,&c.r13,&c.r14,&c.r15,&c.r16,&c.r17,&c.r18,&c.r19,&c.r20,&c.r21,&c.r22,&c.r23,
+        &c.r24,&c.r25,&c.r26,&c.r27,&c.r28,&c.r29,&c.r30,&c.r31};
+    for (int i = 0; i < 32; ++i)
+        std::fprintf(stderr, "  r%-2d=%08x%s", i, r[i]->u32, (i % 4 == 3) ? "\n" : "");
+    std::fprintf(stderr, "  lr=%08x ctr=%08x\n", unsigned(c.lr), unsigned(c.ctr.u32));
+}
+
 uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2) {
     KThread* t = t_current;
     if (!t || !t->ctx) {
