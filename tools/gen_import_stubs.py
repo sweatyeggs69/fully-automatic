@@ -14,7 +14,7 @@ mapping, src_dir, *tables = sys.argv[1:]
 exports = set()
 for t in tables:
     exports |= set(re.findall(r"XE_EXPORT\(\w+,\s*0x[0-9A-Fa-f]+,\s*(\w+),\s*kFunction\)", open(t).read()))
-used = set(re.findall(r"\{\s*0x[0-9A-Fa-f]+,\s*(\w+)\s*\}", open(mapping).read()))
+used = set(re.findall(r"\{\s*0x[0-9A-Fa-f]+,\s*(?:__imp__)?(\w+)\s*\}", open(mapping).read()))
 used = {n for n in used if n in exports}
 
 implemented = set()
