@@ -322,6 +322,16 @@ void attach_guest_thread(const std::string& name) {
     g_kernel.register_external_thread(t);
 }
 
+bool g_trace_imports = std::getenv("FA_TRACE_IMPORTS_CALLS") != nullptr;
+
+void trace_import(const char* name, PPCContext& ctx, bool entry) {
+    if (entry)
+        std::fprintf(stderr, "[import] %s(%08x, %08x, %08x, %08x)\n", name, ctx.r3.u32, ctx.r4.u32,
+                     ctx.r5.u32, ctx.r6.u32);
+    else
+        std::fprintf(stderr, "[import] %s -> %08x\n", name, ctx.r3.u32);
+}
+
 void dump_guest_context() {
     KThread* t = t_current;
     if (!t || !t->ctx) return;
