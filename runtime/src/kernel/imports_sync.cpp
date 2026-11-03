@@ -21,8 +21,19 @@ std::shared_ptr<T> as(std::shared_ptr<KObject> o, KObject::Type t) {
 // guest passed a pointer we have not seen (it initialised the header itself).
 std::shared_ptr<KObject> by_ptr(uint32_t p) {
     auto o = g_kernel.get_dispatch(p);
-    if (!o) std::fprintf(stderr, "warning: wait on unknown dispatcher object 0x%08X\n", p);
-    return o;
+    if (o || p < 0x10000) return o;
+    // The guest initialised the header itself: DISPATCHER_HEADER type at +0, signal state at +4.
+    uint8_t type = ld8(p);
+    std::shared_ptr<KObject> n;
+    if (type == 0 || type == 1) n = std::make_shared<KEvent>(type == 0, ld32(p + 4) != 0);
+    else if (type == 5) n = std::make_shared<KSemaphore>(int32_t(ld32(p + 4)), int32_t(ld32(p + 0x10)));
+    else if (type == 2) n = std::make_shared<KMutant>();
+    if (!n) {
+        std::fprintf(stderr, "warning: dispatcher object 0x%08X has unsupported header type %u\n", p, type);
+        return nullptr;
+    }
+    g_kernel.register_dispatch(p, n);
+    return g_kernel.get_dispatch(p);
 }
 
 uint32_t set_event(KEvent& e) {

@@ -144,7 +144,7 @@ void call_guest(PPCContext& ctx, uint32_t addr);
 // context (PCR, stack, TLS) so invoke_guest works on it. Safe to call once per thread.
 void attach_guest_thread(const std::string& name);
 // Runs a guest function (r3 = arg) on the calling thread's guest context and returns r3.
-uint32_t invoke_guest(uint32_t func, uint32_t arg);
+uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2 = 0);
 // Resolves a guest address to its recompiled function, or nullptr.
 PPCFunc* lookup_guest(uint32_t addr);
 
