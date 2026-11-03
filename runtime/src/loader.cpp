@@ -27,12 +27,13 @@ bool install_function_table() {
     return true;
 }
 
-bool map_image(const uint8_t* data, uint32_t base, uint32_t size) {
+bool map_image(const uint8_t* data, uint32_t base, uint32_t size, uint32_t avail) {
+    if (avail == 0 || avail > size) avail = size;
     if (!g_mem.commit_fixed(base, size)) {
         std::perror("commit image");
         return false;
     }
-    std::memcpy(host(base), data, size);
+    std::memcpy(host(base), data, avail);
     return install_function_table();
 }
 
@@ -104,7 +105,19 @@ bool load_xex(const std::vector<uint8_t>& file, LoadedImage& out) {
     if (out.base != PPC_IMAGE_BASE || out.size != PPC_IMAGE_SIZE)
         std::fprintf(stderr, "warning: image 0x%X/0x%X differs from recompiled 0x%llX/0x%llX\n",
                      out.base, out.size, (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
-    if (!map_image(img.data.get(), out.base, out.size)) return false;
+    // With basic compression XenonUtils only allocates the sum of the data and zero blocks,
+    // which can be shorter than the image size recorded in the header.
+    uint32_t avail = out.size;
+    auto ff = info.optional_headers.find(0x3FF);
+    if (info.compression == 1 && ff != info.optional_headers.end() && ff->second + 8 <= file.size()) {
+        const uint8_t* f = file.data() + ff->second;
+        uint32_t info_size = be32(f);
+        uint64_t total = 0;
+        for (uint32_t o = 8; o + 8 <= info_size && ff->second + o + 8 <= file.size(); o += 8)
+            total += uint64_t(be32(f + o)) + be32(f + o + 4);
+        if (total && total < avail) avail = uint32_t(total);
+    }
+    if (!map_image(img.data.get(), out.base, out.size, avail)) return false;
 
     link_variables(file, info, out.base);
 
