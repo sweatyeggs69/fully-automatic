@@ -14,4 +14,10 @@
 // no-op for every import that has no implementation.
 #include "fa/rt/guest.hpp"
 
-#define FA_IMPORT(name) PPC_FUNC(name)
+// XenonRecomp's generated code resolves imports through __imp__<name> (the weak <name> is an
+// alias of it), so the implementation is defined under that name; <name> forwards to it for
+// callers that use the plain name.
+#define FA_IMPORT(name)                                  \
+    PPC_FUNC(__imp__##name);                             \
+    PPC_FUNC(name) { __imp__##name(ctx, base); }         \
+    PPC_FUNC(__imp__##name)
