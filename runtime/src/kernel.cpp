@@ -2,6 +2,7 @@
 #include "fa/rt/memory.hpp"
 
 #include <cstdio>
+#include <execinfo.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cstdlib>
@@ -332,6 +333,14 @@ void trace_import(const char* name, PPCContext& ctx, bool entry) {
                      ctx.r5.u32, ctx.r6.u32);
     else
         std::fprintf(stderr, "[import] %s -> %08x\n", name, ctx.r3.u32);
+}
+
+void report_spin(const char* name, PPCContext& ctx, uint64_t count) {
+    std::fprintf(stderr, "[spin] %s called %llu times; lr=%08x r3=%08x r4=%08x r5=%08x\n", name,
+                 (unsigned long long)count, unsigned(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    void* frames[24];
+    int n = backtrace(frames, 24);
+    backtrace_symbols_fd(frames, n, 2);
 }
 
 void dump_guest_context_short() {
