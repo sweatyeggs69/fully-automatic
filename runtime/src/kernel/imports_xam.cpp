@@ -77,3 +77,7 @@ FA_IMPORT(ExGetXConfigSetting) {
     if (req) st16(req, 4);
     ret32(ctx, STATUS_SUCCESS);
 }
+
+// Returns a pointer to an XEX optional header field, or 0 if absent. The headers are not
+// kept in guest memory, so everything reports "not present" and the game falls back to defaults.
+FA_IMPORT(RtlImageXexHeaderField) { ret32(ctx, 0); }

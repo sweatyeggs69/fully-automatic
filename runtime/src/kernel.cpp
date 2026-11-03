@@ -322,13 +322,14 @@ void attach_guest_thread(const std::string& name) {
     g_kernel.register_external_thread(t);
 }
 
-uint32_t invoke_guest(uint32_t func, uint32_t arg) {
+uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2) {
     KThread* t = t_current;
     if (!t || !t->ctx) {
         std::fprintf(stderr, "invoke_guest: thread has no guest context (call attach_guest_thread)\n");
         return 0;
     }
     t->ctx->r3.u64 = arg;
+    t->ctx->r4.u64 = arg2;
     call_guest(*t->ctx, func);
     return t->ctx->r3.u32;
 }
