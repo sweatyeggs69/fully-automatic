@@ -13,3 +13,4 @@ extracted/
 third_party/
 private/
 ppc/
+runtime/out/
