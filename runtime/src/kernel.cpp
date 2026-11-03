@@ -2,6 +2,8 @@
 #include "fa/rt/memory.hpp"
 
 #include <cstdio>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <new>
 
@@ -343,6 +345,23 @@ void dump_guest_context() {
     for (int i = 0; i < 32; ++i)
         std::fprintf(stderr, "  r%-2d=%08x%s", i, r[i]->u32, (i % 4 == 3) ? "\n" : "");
     std::fprintf(stderr, "  lr=%08x ctr=%08x\n", unsigned(c.lr), unsigned(c.ctr.u32));
+    // Hex dump 0x60 bytes around every register that points at readable guest memory.
+    uint32_t done[64]; int nd = 0;
+    for (int i = 0; i < 32; ++i) {
+        uint32_t v = r[i]->u32;
+        if (v < 0x10000 || v >= 0x80000000u || nd >= 40) continue;
+        uint32_t a = (v - 0x20) & ~0xFu;
+        bool dup = false;
+        for (int k = 0; k < nd; ++k) if (done[k] == a) dup = true;
+        if (dup) continue;
+        uint8_t buf[0x60];
+        struct iovec li{buf, sizeof buf}, ri{host(a), sizeof buf};
+        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != ssize_t(sizeof buf)) continue;
+        done[nd++] = a;
+        std::fprintf(stderr, "mem[%08x] (r%d=%08x):", a, i, v);
+        for (size_t k = 0; k < sizeof buf; ++k) std::fprintf(stderr, "%s%02x", k % 16 ? "" : "\n  ", buf[k]);
+        std::fprintf(stderr, "\n");
+    }
 }
 
 uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2) {
