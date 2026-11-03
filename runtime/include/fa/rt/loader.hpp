@@ -15,7 +15,9 @@ struct LoadedImage {
 bool install_function_table();
 
 // Maps an already-decoded image (guest layout) at `base` and commits the function table.
-bool map_image(const uint8_t* data, uint32_t base, uint32_t size);
+// `size` is the image size; only the first `avail` bytes (default: all) exist in `data`, the
+// rest (zero-filled tail, bss) is left as zero pages.
+bool map_image(const uint8_t* data, uint32_t base, uint32_t size, uint32_t avail = 0);
 
 // Decrypts/decompresses a raw default.xex, maps it, links kernel variable imports, and
 // reads the TLS and stack headers. Requires GuestMemory::init() first.
