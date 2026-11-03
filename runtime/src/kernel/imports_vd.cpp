@@ -85,3 +85,24 @@ FA_IMPORT(VdRetrainEDRAM) { ret32(ctx, 0); }
 FA_IMPORT(VdRetrainEDRAMWorker) { ret32(ctx, 0); }
 FA_IMPORT(VdPersistDisplay) { ret32(ctx, 0); }
 FA_IMPORT(KiApcNormalRoutineNop) { }
+
+FA_IMPORT(VdGetCurrentDisplayGamma) {
+    // (type_ptr, gamma_ptr)
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), 2);
+    float g = 2.22222233f;
+    uint32_t bits;
+    std::memcpy(&bits, &g, 4);
+    if (arg32(ctx, 1)) st32(arg32(ctx, 1), bits);
+}
+
+FA_IMPORT(VdGetCurrentDisplayInformation) {
+    uint32_t p = arg32(ctx, 0);
+    if (!p) return;
+    for (uint32_t i = 0; i < 0x58; i += 4) st32(p + i, 0);
+    st16(p + 0x00, 1280);   // front buffer width
+    st16(p + 0x02, 720);    // front buffer height
+}
+
+FA_IMPORT(VdSetDisplayMode) { ret32(ctx, 0); }
+FA_IMPORT(VdInitializeScalerCommandBuffer) { ret32(ctx, 0); }
+FA_IMPORT(VdSwap) { ret32(ctx, 0); }

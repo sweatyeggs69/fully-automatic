@@ -139,15 +139,15 @@ FA_IMPORT(NtCreateEvent) {
     ret32(ctx, STATUS_SUCCESS);
 }
 
-static void nt_event_op(PPCContext& ctx, uint32_t (*op)(KEvent&)) {
+static void nt_event_op(PPCContext& ctx, uint32_t (*op)(KEvent&), bool has_prev = true) {
     auto e = as<KEvent>(by_handle(arg32(ctx, 0)), KObject::Type::Event);
     if (!e) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
     uint32_t prev = op(*e);
-    if (arg32(ctx, 1)) st32(arg32(ctx, 1), prev);
+    if (has_prev && arg32(ctx, 1)) st32(arg32(ctx, 1), prev);
     ret32(ctx, STATUS_SUCCESS);
 }
 FA_IMPORT(NtSetEvent) { nt_event_op(ctx, set_event); }
-FA_IMPORT(NtClearEvent) { nt_event_op(ctx, reset_event); }
+FA_IMPORT(NtClearEvent) { nt_event_op(ctx, reset_event, false); }  // (handle) only
 FA_IMPORT(NtResetEvent) { nt_event_op(ctx, reset_event); }
 FA_IMPORT(NtPulseEvent) { nt_event_op(ctx, pulse_event); }
 
