@@ -65,7 +65,7 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
                 ${FA_PPC_DIR}/ppc_func_mapping.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src
                 ${FA_XENONRECOMP}/XenonUtils/xbox/xboxkrnl_table.inc ${FA_XENONRECOMP}/XenonUtils/xbox/xam_table.inc
                 > ${STUBS}
-        DEPENDS ${FA_PPC_DIR}/ppc_func_mapping.cpp ${FA_RT_SOURCES}
+        DEPENDS ${FA_PPC_DIR}/ppc_func_mapping.cpp ${FA_RT_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_import_stubs.py
         VERBATIM)
 
     add_executable(fullauto src/main.cpp ${STUBS} ${PPC_SOURCES})
