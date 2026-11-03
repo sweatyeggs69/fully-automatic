@@ -334,6 +334,14 @@ void trace_import(const char* name, PPCContext& ctx, bool entry) {
         std::fprintf(stderr, "[import] %s -> %08x\n", name, ctx.r3.u32);
 }
 
+void dump_guest_context_short() {
+    KThread* t = t_current;
+    if (!t || !t->ctx) return;
+    PPCContext& c = *t->ctx;
+    std::fprintf(stderr, "  guest: lr=%08x r1=%08x r3=%08x r4=%08x r5=%08x r6=%08x r11=%08x\n", unsigned(c.lr),
+                 c.r1.u32, c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32, c.r11.u32);
+}
+
 void dump_guest_context() {
     KThread* t = t_current;
     if (!t || !t->ctx) return;

@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     if (!read_game(argv[1], xex)) return 1;
     std::fprintf(stderr, "[boot] reserving guest memory\n");
     if (!g_mem.init()) return 1;
+    install_write_watch();
     // XMA/APU register page: plain memory the audio layer polls.
     g_mem.commit_fixed(0x7FEA0000, 0x10000);
     // GPU register page: plain memory for now (reads as zero) until the GPU layer takes it over.

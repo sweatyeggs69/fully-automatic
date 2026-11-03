@@ -147,6 +147,8 @@ void attach_guest_thread(const std::string& name);
 uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2 = 0);
 // Prints the calling thread's guest registers to stderr (used by the crash handler).
 void dump_guest_context();
+// One line: lr and r1, r3..r6 of the calling thread.
+void dump_guest_context_short();
 // Resolves a guest address to its recompiled function, or nullptr.
 PPCFunc* lookup_guest(uint32_t addr);
 
