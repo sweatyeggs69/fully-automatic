@@ -46,13 +46,19 @@ FA_IMPORT(NtAllocateVirtualMemory) {
     if (size == 0) { ret32(ctx, STATUS_INVALID_PARAMETER); return; }
     uint32_t start, asize;
     uint32_t result = 0;
+    // Everything but the 0x90000000 view range uses 64 KiB pages: bases round down and sizes
+    // round up, and the rounded values are reported back (the game's heap relies on them).
+    bool small_pages = want >= 0x90000000 && want < 0xA0000000;
+    uint32_t pg = small_pages ? kPageSize : kAllocGranularity;
     if (want && g_mem.find_allocation(want, start, asize)) {
         // Committing inside an earlier reservation: already backed.
-        result = want;
-        size = ((size + kPageSize - 1) & ~(kPageSize - 1));
+        uint32_t base_r = want & ~(pg - 1);
+        result = base_r;
+        size = (size + (want - base_r) + pg - 1) & ~(pg - 1);
     } else {
+        size = (size + pg - 1) & ~(pg - 1);
         Heap h = (want >= 0xA0000000 && want < 0xE0000000) ? Heap::Physical
-               : (want >= 0x90000000 && want < 0xA0000000) ? Heap::View : Heap::User;
+               : small_pages ? Heap::View : Heap::User;
         result = g_mem.alloc(h, size, kAllocGranularity, want);
         if (!result) std::fprintf(stderr, "NtAllocateVirtualMemory failed: base=%08x size=%08x type=%x\n", want, size, type);
         if (!result && want == 0) result = 0;
@@ -76,9 +82,10 @@ FA_IMPORT(NtFreeVirtualMemory) {
                      size_ptr ? ld32(size_ptr) : 0, type);
     if ((type & MEM_DECOMMIT) && !(type & MEM_RELEASE)) {
         // Decommitted pages come back zeroed when committed again.
-        uint32_t a = addr & ~(kPageSize - 1);
+        uint32_t pg = (addr >= 0x90000000 && addr < 0xA0000000) ? kPageSize : kAllocGranularity;
+        uint32_t a = addr & ~(pg - 1);
         uint32_t sz = size_ptr ? ld32(size_ptr) : 0;
-        uint32_t end = (addr + sz + kPageSize - 1) & ~(kPageSize - 1);
+        uint32_t end = (addr + sz + pg - 1) & ~(pg - 1);
         uint32_t st, as;
         if (end > a && g_mem.find_allocation(a, st, as) && uint64_t(end) <= uint64_t(st) + as) {
             std::memset(host(a), 0, end - a);
