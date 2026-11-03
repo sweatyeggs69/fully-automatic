@@ -17,4 +17,4 @@ add_library(fa_recomp STATIC ${PPC_SOURCES})
 set_target_properties(fa_recomp PROPERTIES CXX_STANDARD 20)
 target_include_directories(fa_recomp PUBLIC ${PPC_DIR} ${SIMDE})
 target_compile_options(fa_recomp PRIVATE -O1 -msse4.1 -mssse3 -fno-strict-aliasing
-                       -Wno-unused-variable -Wno-unused-but-set-variable -Wno-parentheses-equality)
+                       -Wno-unused-variable -Wno-unused-but-set-variable -Wno-parentheses-equality -Wno-pass-failed)

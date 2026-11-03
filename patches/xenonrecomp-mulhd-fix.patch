@@ -1,0 +1,18 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index ae653b6..92062a1 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1404,11 +1404,11 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MULHD:
+-        println("\t{}.s64 = int64_t((__int128({}.s64) * __int128({}.s64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = int64_t((((__int128){}.s64) * ((__int128){}.s64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_MULHDU:
+-        println("\t{}.u64 = uint64_t((unsigned __int128({}.u64) * unsigned __int128({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = uint64_t((((unsigned __int128){}.u64) * ((unsigned __int128){}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_MULHW:

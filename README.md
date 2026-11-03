@@ -37,6 +37,7 @@ Apply the patch before recompiling:
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-round3.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-diag.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-overlap.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-mulhd-fix.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp
 
 ## Check that the generated C++ compiles (slow, needs clang)
