@@ -8,7 +8,13 @@
 
 #include <execinfo.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 #include <cstdio>
 #include <initializer_list>
@@ -26,7 +32,69 @@ static void write_hex(const char* label, uint64_t v) {
     (void)r;
 }
 
-static void handler(int sig, siginfo_t* info, void*) {
+// ---- guest write watch (debug aid): FA_WATCH=<hexaddr>:<hexlen> -------------------------------
+// The watched pages are kept read-only by a poller thread; a write faults, is logged with a
+// backtrace, then the instruction is single-stepped with the page writable.
+static uint32_t g_watch_lo = 0, g_watch_hi = 0;
+static std::atomic<bool> g_watch_on{false}, g_stepping{false};
+static std::atomic<int> g_watch_logs{0};
+static uint8_t* g_step_page = nullptr;
+
+static bool watch_fault(siginfo_t* info, void* uc) {
+    if (!g_watch_on) return false;
+    uint64_t a = reinterpret_cast<uint64_t>(info->si_addr);
+    uint64_t b = reinterpret_cast<uint64_t>(g_base);
+    if (a < b || a >= b + kGuestWindow) return false;
+    uint32_t ga = uint32_t(a - b);
+    if (ga < (g_watch_lo & ~0xFFFu) || ga >= ((g_watch_hi + 0xFFF) & ~0xFFFu)) return false;
+    g_step_page = g_base + (ga & ~0xFFFu);
+    g_stepping = true;
+    mprotect(g_step_page, 0x1000, PROT_READ | PROT_WRITE);
+    if (ga >= g_watch_lo && ga < g_watch_hi && g_watch_logs.fetch_add(1) < 60) {
+        char buf[96];
+        int n = std::snprintf(buf, sizeof buf, "[watch] write to guest %08x, backtrace:\n", ga);
+        ssize_t r = ::write(2, buf, n); (void)r;
+        void* frames[16];
+        int nf = backtrace(frames, 16);
+        backtrace_symbols_fd(frames + 2, nf - 2, 2);
+        dump_guest_context_short();
+    }
+    static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_EFL] |= 0x100;  // trap flag
+    return true;
+}
+
+static void trap_handler(int, siginfo_t*, void* uc) {
+    static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_EFL] &= ~0x100ull;
+    if (g_step_page) mprotect(g_step_page, 0x1000, PROT_READ);
+    g_stepping = false;
+}
+
+void install_write_watch() {
+    const char* e = std::getenv("FA_WATCH");
+    if (!e) return;
+    unsigned long lo = 0, len = 0x10;
+    if (std::sscanf(e, "%lx:%lx", &lo, &len) < 1) return;
+    g_watch_lo = uint32_t(lo);
+    g_watch_hi = uint32_t(lo + len);
+    g_watch_on = true;
+    struct sigaction sa{};
+    sa.sa_sigaction = trap_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGTRAP, &sa, nullptr);
+    std::fprintf(stderr, "write watch on guest %08x-%08x\n", g_watch_lo, g_watch_hi);
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (g_stepping) continue;
+            uint32_t a = g_watch_lo & ~0xFFFu, e2 = (g_watch_hi + 0xFFF) & ~0xFFFu;
+            if (!g_stepping) mprotect(g_base + a, e2 - a, PROT_READ);
+        }
+    }).detach();
+}
+
+static void handler(int sig, siginfo_t* info, void* uc) {
+    if (sig == SIGSEGV && watch_fault(info, uc)) return;
+    signal(sig, SIG_DFL);
     write_str("\n*** fullauto crashed: ");
     write_str(sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL"
               : sig == SIGFPE ? "SIGFPE" : "SIGABRT");
@@ -51,7 +119,7 @@ void install_crash_handler() {
     sigaltstack(&ss, nullptr);
     struct sigaction sa{};
     sa.sa_sigaction = handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
 }
 
