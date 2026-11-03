@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 extern PPCFuncMapping PPCFuncMappings[];
@@ -86,8 +87,12 @@ static void link_variables(const std::vector<uint8_t>& f, const XexInfo& info, u
                              swapped & 0xFFFF, n == table.end() ? "?" : n->second);
             // Records that are not thunks are only data imports when the export really is a
             // variable; other records (function pointer slots, xam function ordinals) are left alone.
-            if (n == table.end() || !is_kernel_variable(n->second)) continue;
-            st32(slot, kernel_variable(n->second));
+            if (n == table.end()) continue;
+            // Export tables name the symbols with an "__imp__" prefix.
+            std::string vname = n->second;
+            if (vname.rfind("__imp__", 0) == 0) vname = vname.substr(7);
+            if (!is_kernel_variable(vname)) continue;
+            st32(slot, kernel_variable(vname));
             ++linked;
         }
         lib = desc + count * 4;
