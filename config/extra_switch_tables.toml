@@ -1,0 +1,24 @@
+# Extra switch tables XenonAnalyse missed (append to private/switch_tables.toml)
+[[switch]]
+base = 0x82148AEC
+r = 5
+labels = [
+    0x82148AF0,
+    0x82148B10,
+    0x82148B3C,
+    0x82148B54,
+    0x82148BBC,
+    0x82148BD8,
+    0x82148C18,
+    0x82148CBC,
+    0x82148D38,
+    0x82148D88,
+    0x82148DE8,
+    0x82148E1C,
+    0x82148E60,
+    0x82148E90,
+    0x82148EBC,
+    0x82148EE8,
+    0x82148F1C,
+    0x82148CAC,
+]

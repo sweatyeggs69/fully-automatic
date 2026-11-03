@@ -24,6 +24,7 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
     cmake -S third_party/XenonRecomp -B third_party/XenonRecomp/out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
     cmake --build third_party/XenonRecomp/out --target XenonAnalyse XenonRecomp
     ./third_party/XenonRecomp/out/XenonAnalyse/XenonAnalyse private/default.xex private/switch_tables.toml
+    cat config/extra_switch_tables.toml >> private/switch_tables.toml
     mkdir -p ppc
     ./third_party/XenonRecomp/out/XenonRecomp/XenonRecomp config/fullauto.toml third_party/XenonRecomp/XenonUtils/ppc_context.h
 
@@ -35,4 +36,5 @@ Apply the patch before recompiling:
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-jumptables-and-more-vmx.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-round3.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-diag.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-overlap.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp
