@@ -57,10 +57,12 @@ FA_IMPORT(VdSetSystemCommandBufferGpuIdentifierAddress) { g_vd.gpu_id_addr = arg
 static uint32_t phys_to_guest(uint32_t a) { return a < 0x20000000 ? a + 0xA0000000u : a; }
 
 namespace {
+// The GPU addresses memory physically: physical p lives at 0xA0000000 + p in the guest window.
 struct RtGuestMemory : fa::gpu::GuestMemory {
-    uint32_t Read32(uint32_t a) const override { return ld32(a); }
-    void Write32(uint32_t a, uint32_t v) override { st32(a, v); }
-    const uint8_t* HostPtr(uint32_t a, uint32_t) const override { return host(a); }
+    static uint32_t tr(uint32_t a) { return a < 0x20000000 ? a + 0xA0000000u : a; }
+    uint32_t Read32(uint32_t a) const override { return ld32(tr(a)); }
+    void Write32(uint32_t a, uint32_t v) override { st32(tr(a), v); }
+    const uint8_t* HostPtr(uint32_t a, uint32_t) const override { return host(tr(a)); }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
