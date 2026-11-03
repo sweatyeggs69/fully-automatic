@@ -34,4 +34,5 @@ Apply the patch before recompiling:
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-halfword.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-jumptables-and-more-vmx.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-round3.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-diag.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp

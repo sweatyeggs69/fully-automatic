@@ -3,6 +3,7 @@
 // XenonRecomp's TOML config needs.
 //
 //   xexscan default.xex [dump-image.bin]
+//   xexscan default.xex --dump16 0xADDR COUNT     (print big-endian halfwords)
 //   xexscan default.xex --disasm 0xSTART 0xEND     (print instructions in a range)
 #include <cstdio>
 #include <cstdint>
@@ -40,6 +41,14 @@ int main(int argc, char** argv) {
     Image img = Image::ParseImage(file.data(), file.size());
     if (!img.data) { std::fprintf(stderr, "failed to parse image\n"); return 1; }
 
+    if (argc == 5 && std::strcmp(argv[2], "--dump16") == 0) {
+        size_t a = std::strtoull(argv[3], nullptr, 16), n = std::strtoull(argv[4], nullptr, 10);
+        const uint8_t* p = static_cast<const uint8_t*>(img.Find(a));
+        if (!p) { std::printf("unmapped\n"); return 1; }
+        for (size_t i = 0; i < n; ++i)
+            std::printf("%zu: %04X\n", i, p[i * 2] << 8 | p[i * 2 + 1]);
+        return 0;
+    }
     if (argc == 5 && std::strcmp(argv[2], "--disasm") == 0) {
         size_t a = std::strtoull(argv[3], nullptr, 16), b = std::strtoull(argv[4], nullptr, 16);
         for (size_t addr = a & ~size_t(3); addr < b; addr += 4) {

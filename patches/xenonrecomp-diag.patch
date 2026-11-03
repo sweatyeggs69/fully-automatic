@@ -1,0 +1,32 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index bc4131e..f82ad01 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -300,6 +300,27 @@ void Recompiler::Analyse()
+         functions[index].size = end - fnBase;
+         image.symbols.emplace(fmt::format("sub_{:X}", fnBase), fnBase, functions[index].size, Symbol_Function);
+     }
++
++    // Diagnostics: report jump tables whose labels are still not covered by a single function.
++    for (auto& [tableBase, table] : config.switchTables)
++    {
++        auto it = std::upper_bound(functions.begin(), functions.end(), size_t(tableBase),
++            [](size_t address, const Function& fn) { return address < fn.base; });
++        if (it == functions.begin())
++        {
++            fmt::println("DIAG: switch at {:X} is not inside any function", tableBase);
++            continue;
++        }
++        --it;
++        for (auto label : table.labels)
++        {
++            if (label < it->base || label >= it->base + it->size)
++            {
++                fmt::println("DIAG: switch at {:X} is in function {:X}-{:X} but label {:X} is outside", tableBase, it->base, it->base + it->size, label);
++                break;
++            }
++        }
++    }
+ }
+ 
+ bool Recompiler::Recompile(
