@@ -26,3 +26,10 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
     ./third_party/XenonRecomp/out/XenonAnalyse/XenonAnalyse private/default.xex private/switch_tables.toml
     mkdir -p ppc
     ./third_party/XenonRecomp/out/XenonRecomp/XenonRecomp config/fullauto.toml third_party/XenonRecomp/XenonUtils/ppc_context.h
+
+## Patching XenonRecomp
+Full Auto uses a few PowerPC instructions XenonRecomp does not implement (16-bit vector ops, `cror`/`crorc`, `bso`/`bns`).
+Apply the patch before recompiling:
+
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-halfword.patch
+    cmake --build third_party/XenonRecomp/out --target XenonRecomp
