@@ -43,6 +43,8 @@ int main(int argc, char** argv) {
     if (!g_mem.init()) return 1;
     // XMA/APU register page: plain memory the audio layer polls.
     g_mem.commit_fixed(0x7FEA0000, 0x10000);
+    // GPU register page: plain memory for now (reads as zero) until the GPU layer takes it over.
+    g_mem.commit_fixed(0x7FC80000, 0x80000);
 
     // File system (game:, d:, hdd:, cache:), controllers, audio output and XMA.
     // FA_NO_AUDIO=1 runs the audio clock silently (headless/CI).
