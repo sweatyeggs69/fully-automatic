@@ -1,0 +1,314 @@
+// Events, semaphores, mutants, critical sections, spin locks, waits and handles.
+#include "fa/rt/kernel.hpp"
+#include "fa/rt/import.hpp"
+#include "fa/rt/memory.hpp"
+
+#include <cstdio>
+
+using namespace fa::rt;
+
+namespace {
+
+std::shared_ptr<KObject> by_handle(uint32_t h) { return g_kernel.get_handle(h); }
+
+template <class T>
+std::shared_ptr<T> as(std::shared_ptr<KObject> o, KObject::Type t) {
+    if (!o || o->type != t) return nullptr;
+    return std::static_pointer_cast<T>(o);
+}
+
+// Wait on a dispatcher object pointer, creating an event wrapper on first sight if the
+// guest passed a pointer we have not seen (it initialised the header itself).
+std::shared_ptr<KObject> by_ptr(uint32_t p) {
+    auto o = g_kernel.get_dispatch(p);
+    if (!o) std::fprintf(stderr, "warning: wait on unknown dispatcher object 0x%08X\n", p);
+    return o;
+}
+
+uint32_t set_event(KEvent& e) {
+    std::lock_guard<std::mutex> lk(g_kmu);
+    bool prev = e.set;
+    e.set = true;
+    g_kcv.notify_all();
+    return prev;
+}
+uint32_t reset_event(KEvent& e) {
+    std::lock_guard<std::mutex> lk(g_kmu);
+    bool prev = e.set;
+    e.set = false;
+    return prev;
+}
+uint32_t pulse_event(KEvent& e) {
+    bool prev;
+    {
+        std::lock_guard<std::mutex> lk(g_kmu);
+        prev = e.set;
+        e.set = true;
+        g_kcv.notify_all();
+    }
+    std::this_thread::yield();
+    std::lock_guard<std::mutex> lk(g_kmu);
+    e.set = false;
+    return prev;
+}
+uint32_t release_sem(KSemaphore& s, int32_t n, bool& overflow) {
+    std::lock_guard<std::mutex> lk(g_kmu);
+    int32_t prev = s.count;
+    overflow = int64_t(s.count) + n > s.limit;
+    if (!overflow) s.count += n;
+    g_kcv.notify_all();
+    return uint32_t(prev);
+}
+
+}  // namespace
+
+// ---- handles -------------------------------------------------------------------------
+
+FA_IMPORT(NtClose) {
+    ret32(ctx, g_kernel.close_handle(arg32(ctx, 0)) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE);
+}
+
+FA_IMPORT(NtDuplicateObject) {
+    // (handle, new_handle_ptr, options)
+    auto o = by_handle(arg32(ctx, 0));
+    if (!o) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    uint32_t h = g_kernel.add_handle(o);
+    // add_handle overwrites o->handle; keep the original for the first handle's owner.
+    if (arg32(ctx, 1)) st32(arg32(ctx, 1), h);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+FA_IMPORT(ObReferenceObjectByHandle) {
+    // (handle, object_type_ptr, out_object_ptr)
+    auto o = by_handle(arg32(ctx, 0));
+    if (!o) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    if (!o->guest_ptr) {
+        o->guest_ptr = g_mem.malloc(0x30);
+        g_kernel.register_dispatch(o->guest_ptr, o);
+    }
+    if (arg32(ctx, 2)) st32(arg32(ctx, 2), o->guest_ptr);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+FA_IMPORT(ObDereferenceObject) { }
+
+// ---- events --------------------------------------------------------------------------
+
+FA_IMPORT(KeInitializeEvent) {
+    // (event_ptr, type, state)  type 0 = notification (manual reset), 1 = synchronization
+    uint32_t p = arg32(ctx, 0);
+    st8(p, uint8_t(arg32(ctx, 1)));
+    st32(p + 4, arg32(ctx, 2));
+    g_kernel.register_dispatch(p, std::make_shared<KEvent>(arg32(ctx, 1) == 0, arg32(ctx, 2) != 0));
+}
+
+FA_IMPORT(KeSetEvent) {
+    auto e = as<KEvent>(by_ptr(arg32(ctx, 0)), KObject::Type::Event);
+    ret32(ctx, e ? set_event(*e) : 0);
+}
+FA_IMPORT(KeResetEvent) {
+    auto e = as<KEvent>(by_ptr(arg32(ctx, 0)), KObject::Type::Event);
+    ret32(ctx, e ? reset_event(*e) : 0);
+}
+FA_IMPORT(KePulseEvent) {
+    auto e = as<KEvent>(by_ptr(arg32(ctx, 0)), KObject::Type::Event);
+    ret32(ctx, e ? pulse_event(*e) : 0);
+}
+
+FA_IMPORT(NtCreateEvent) {
+    // (handle_ptr, object_attributes_ptr, event_type, initial_state)
+    auto e = std::make_shared<KEvent>(arg32(ctx, 2) == 0, arg32(ctx, 3) != 0);
+    uint32_t h = g_kernel.add_handle(e);
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), h);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+static void nt_event_op(PPCContext& ctx, uint32_t (*op)(KEvent&)) {
+    auto e = as<KEvent>(by_handle(arg32(ctx, 0)), KObject::Type::Event);
+    if (!e) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    uint32_t prev = op(*e);
+    if (arg32(ctx, 1)) st32(arg32(ctx, 1), prev);
+    ret32(ctx, STATUS_SUCCESS);
+}
+FA_IMPORT(NtSetEvent) { nt_event_op(ctx, set_event); }
+FA_IMPORT(NtClearEvent) { nt_event_op(ctx, reset_event); }
+FA_IMPORT(NtResetEvent) { nt_event_op(ctx, reset_event); }
+FA_IMPORT(NtPulseEvent) { nt_event_op(ctx, pulse_event); }
+
+// ---- semaphores ------------------------------------------------------------------------
+
+FA_IMPORT(KeInitializeSemaphore) {
+    // (sem_ptr, count, limit)
+    g_kernel.register_dispatch(arg32(ctx, 0),
+        std::make_shared<KSemaphore>(int32_t(arg32(ctx, 1)), int32_t(arg32(ctx, 2))));
+}
+
+FA_IMPORT(KeReleaseSemaphore) {
+    // (sem_ptr, increment, adjustment, wait)
+    auto s = as<KSemaphore>(by_ptr(arg32(ctx, 0)), KObject::Type::Semaphore);
+    if (!s) { ret32(ctx, 0); return; }
+    bool overflow;
+    ret32(ctx, release_sem(*s, int32_t(arg32(ctx, 2)), overflow));
+}
+
+FA_IMPORT(NtCreateSemaphore) {
+    // (handle_ptr, object_attributes_ptr, count, limit)
+    auto s = std::make_shared<KSemaphore>(int32_t(arg32(ctx, 2)), int32_t(arg32(ctx, 3)));
+    uint32_t h = g_kernel.add_handle(s);
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), h);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+FA_IMPORT(NtReleaseSemaphore) {
+    // (handle, release_count, previous_count_ptr)
+    auto s = as<KSemaphore>(by_handle(arg32(ctx, 0)), KObject::Type::Semaphore);
+    if (!s) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    bool overflow;
+    uint32_t prev = release_sem(*s, int32_t(arg32(ctx, 1)), overflow);
+    if (arg32(ctx, 2)) st32(arg32(ctx, 2), prev);
+    ret32(ctx, overflow ? STATUS_SEMAPHORE_LIMIT_EXCEEDED : STATUS_SUCCESS);
+}
+
+// ---- mutants -----------------------------------------------------------------------------
+
+FA_IMPORT(NtCreateMutant) {
+    // (handle_ptr, object_attributes_ptr, initial_owner)
+    auto m = std::make_shared<KMutant>();
+    if (arg32(ctx, 2) && g_kernel.current()) {
+        m->owner = g_kernel.current();
+        m->recursion = 1;
+    }
+    uint32_t h = g_kernel.add_handle(m);
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), h);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+FA_IMPORT(NtReleaseMutant) {
+    auto m = as<KMutant>(by_handle(arg32(ctx, 0)), KObject::Type::Mutant);
+    if (!m) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    std::lock_guard<std::mutex> lk(g_kmu);
+    if (m->owner != g_kernel.current()) { ret32(ctx, STATUS_MUTANT_NOT_OWNED); return; }
+    if (--m->recursion == 0) m->owner = nullptr;
+    g_kcv.notify_all();
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+// ---- waits ---------------------------------------------------------------------------------
+
+FA_IMPORT(KeWaitForSingleObject) {
+    // (object_ptr, wait_reason, processor_mode, alertable, timeout_ptr)
+    auto o = by_ptr(arg32(ctx, 0));
+    if (!o) { ret32(ctx, STATUS_INVALID_PARAMETER); return; }
+    ret32(ctx, g_kernel.wait({o}, false, arg32(ctx, 4)));
+}
+
+FA_IMPORT(NtWaitForSingleObjectEx) {
+    // (handle, wait_mode, alertable, timeout_ptr)
+    auto o = by_handle(arg32(ctx, 0));
+    if (!o) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    ret32(ctx, g_kernel.wait({o}, false, arg32(ctx, 3)));
+}
+
+FA_IMPORT(KeWaitForMultipleObjects) {
+    // (count, objects_ptr, wait_type, wait_reason, wait_mode, alertable, timeout_ptr, wait_block)
+    std::vector<std::shared_ptr<KObject>> objs;
+    for (uint32_t i = 0; i < arg32(ctx, 0); ++i) {
+        auto o = by_ptr(ld32(arg32(ctx, 1) + i * 4));
+        if (!o) { ret32(ctx, STATUS_INVALID_PARAMETER); return; }
+        objs.push_back(o);
+    }
+    ret32(ctx, g_kernel.wait(objs, arg32(ctx, 2) == 0, arg32(ctx, 6)));
+}
+
+FA_IMPORT(NtWaitForMultipleObjectsEx) {
+    // (count, handles_ptr, wait_type, wait_mode, alertable, timeout_ptr)
+    std::vector<std::shared_ptr<KObject>> objs;
+    for (uint32_t i = 0; i < arg32(ctx, 0); ++i) {
+        auto o = by_handle(ld32(arg32(ctx, 1) + i * 4));
+        if (!o) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+        objs.push_back(o);
+    }
+    ret32(ctx, g_kernel.wait(objs, arg32(ctx, 2) == 0, arg32(ctx, 5)));
+}
+
+FA_IMPORT(NtSignalAndWaitForSingleObjectEx) {
+    // (signal_handle, wait_handle, alertable, unknown, timeout_ptr)
+    auto sig = by_handle(arg32(ctx, 0));
+    auto w = by_handle(arg32(ctx, 1));
+    if (!sig || !w) { ret32(ctx, STATUS_INVALID_HANDLE); return; }
+    if (sig->type == KObject::Type::Event) set_event(static_cast<KEvent&>(*sig));
+    else if (sig->type == KObject::Type::Semaphore) { bool o; release_sem(static_cast<KSemaphore&>(*sig), 1, o); }
+    ret32(ctx, g_kernel.wait({w}, false, arg32(ctx, 4)));
+}
+
+// ---- critical sections ---------------------------------------------------------------------
+// Guest layout (X_RTL_CRITICAL_SECTION): 0x10 byte dispatcher header, then
+// +0x10 lock_count, +0x14 recursion_count, +0x18 owning thread id.
+
+namespace {
+uint32_t me() { return g_kernel.current() ? g_kernel.current()->tid : 1; }
+
+void cs_init(uint32_t p) {
+    st32(p + 0x00, 1);
+    st32(p + 0x10, 0xFFFFFFFF);
+    st32(p + 0x14, 0);
+    st32(p + 0x18, 0);
+}
+}  // namespace
+
+FA_IMPORT(RtlInitializeCriticalSection) { cs_init(arg32(ctx, 0)); }
+FA_IMPORT(RtlInitializeCriticalSectionAndSpinCount) { cs_init(arg32(ctx, 0)); }
+FA_IMPORT(RtlDeleteCriticalSection) { }
+
+FA_IMPORT(RtlEnterCriticalSection) {
+    uint32_t p = arg32(ctx, 0), t = me();
+    std::unique_lock<std::mutex> lk(g_kmu);
+    while (ld32(p + 0x18) != 0 && ld32(p + 0x18) != t) g_kcv.wait(lk);
+    st32(p + 0x18, t);
+    st32(p + 0x14, ld32(p + 0x14) + 1);
+    st32(p + 0x10, ld32(p + 0x14) - 1);
+}
+
+FA_IMPORT(RtlTryEnterCriticalSection) {
+    uint32_t p = arg32(ctx, 0), t = me();
+    std::lock_guard<std::mutex> lk(g_kmu);
+    if (ld32(p + 0x18) != 0 && ld32(p + 0x18) != t) { ret32(ctx, 0); return; }
+    st32(p + 0x18, t);
+    st32(p + 0x14, ld32(p + 0x14) + 1);
+    st32(p + 0x10, ld32(p + 0x14) - 1);
+    ret32(ctx, 1);
+}
+
+FA_IMPORT(RtlLeaveCriticalSection) {
+    uint32_t p = arg32(ctx, 0);
+    std::lock_guard<std::mutex> lk(g_kmu);
+    uint32_t rc = ld32(p + 0x14);
+    if (rc == 0) return;
+    --rc;
+    st32(p + 0x14, rc);
+    st32(p + 0x10, rc - 1);
+    if (rc == 0) {
+        st32(p + 0x18, 0);
+        g_kcv.notify_all();
+    }
+}
+
+// ---- IRQL and spin locks (single address space, so these only need mutual exclusion) --------
+
+FA_IMPORT(KeRaiseIrqlToDpcLevel) { ret32(ctx, 0); }
+FA_IMPORT(KfRaiseIrql) { ret32(ctx, 0); }
+FA_IMPORT(KfLowerIrql) { }
+
+static void spin_acquire(uint32_t p) {
+    auto* w = reinterpret_cast<uint32_t*>(host(p));
+    uint32_t t = me();
+    while (!__sync_bool_compare_and_swap(w, 0u, t)) std::this_thread::yield();
+}
+FA_IMPORT(KfAcquireSpinLock) { spin_acquire(arg32(ctx, 0)); ret32(ctx, 0); }
+FA_IMPORT(KfReleaseSpinLock) { __sync_lock_release(reinterpret_cast<uint32_t*>(host(arg32(ctx, 0)))); }
+FA_IMPORT(KeAcquireSpinLockAtRaisedIrql) { spin_acquire(arg32(ctx, 0)); }
+FA_IMPORT(KeReleaseSpinLockFromRaisedIrql) { __sync_lock_release(reinterpret_cast<uint32_t*>(host(arg32(ctx, 0)))); }
+FA_IMPORT(KeTryToAcquireSpinLockAtRaisedIrql) {
+    auto* w = reinterpret_cast<uint32_t*>(host(arg32(ctx, 0)));
+    ret32(ctx, __sync_bool_compare_and_swap(w, 0u, me()) ? 1 : 0);
+}
