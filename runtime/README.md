@@ -5,7 +5,7 @@ Runs the XenonRecomp output natively: guest memory, XEX loading, kernel layer, t
 ## Build and test
 
     cmake -S runtime -B runtime/out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-    cmake --build runtime/out --target rt_test && ctest --test-dir runtime/out   # unit test, no game needed
+    cmake --build runtime/out && ctest --test-dir runtime/out                     # unit tests, no game needed
     cmake --build runtime/out --target fullauto                                   # needs ppc/ from XenonRecomp
     ./runtime/out/fullauto /path/to/Full.Auto.iso      # or private/default.xex
 
@@ -39,4 +39,10 @@ Other layers add files under `src/gpu/`, `src/audio/`, `src/input/`, `src/vfs/`;
 - One global lock for all waits (fine for now, split if profiling shows contention).
 - `NtSuspendThread` cannot stop an already running thread, only tracks the count (suspended-at-create works).
 - Named kernel objects are not shared by name; the SEH/unwind imports are not implemented.
-- No file imports yet (`NtCreateFile` and friends): to be wired to `fa::hle::Vfs` from the audio/input/file thread.
+- No file imports yet (`NtCreateFile` and friends): to be wired to `fa::hle::services().vfs` (see `docs/hle.md`).
+
+## HLE services
+
+`main.cpp` starts `fa::hle` services (files, input, audio, XMA) after guest memory is up, with hooks
+from `include/fa/rt/hle_hooks.hpp`. XAudio/XMA imports are in `src/audio/`, XamInput imports in
+`src/input/`. Needs SDL2 and FFmpeg dev packages. `hle_import_test` exercises them without the game.
