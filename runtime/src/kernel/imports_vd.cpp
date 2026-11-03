@@ -57,12 +57,35 @@ FA_IMPORT(VdSetSystemCommandBufferGpuIdentifierAddress) { g_vd.gpu_id_addr = arg
 static uint32_t phys_to_guest(uint32_t a) { return a < 0x20000000 ? a + 0xA0000000u : a; }
 
 namespace {
-// The GPU addresses memory physically: physical p lives at 0xA0000000 + p in the guest window.
+// The GPU addresses memory physically: physical p lives at 0xA0000000 + p in the guest window,
+// and 0xC0000000 / 0xE0000000 are aliases of the same memory. Accesses to memory the game never
+// allocated are ignored (and reported once) instead of faulting the GPU thread.
 struct RtGuestMemory : fa::gpu::GuestMemory {
-    static uint32_t tr(uint32_t a) { return a < 0x20000000 ? a + 0xA0000000u : a; }
-    uint32_t Read32(uint32_t a) const override { return ld32(tr(a)); }
-    void Write32(uint32_t a, uint32_t v) override { st32(tr(a), v); }
-    const uint8_t* HostPtr(uint32_t a, uint32_t) const override { return host(tr(a)); }
+    static uint32_t tr(uint32_t a) {
+        if (a < 0x20000000) return a + 0xA0000000u;
+        if (a >= 0xC0000000u) return 0xA0000000u | (a & 0x1FFFFFFFu);
+        return a;
+    }
+    static bool mapped(uint32_t g, uint32_t orig) {
+        uint32_t st, sz;
+        if (g_mem.find_allocation(g, st, sz)) return true;
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 20)
+            std::fprintf(stderr, "[gpu] access to unmapped memory %08x (guest %08x)\n", orig, g);
+        return false;
+    }
+    uint32_t Read32(uint32_t a) const override {
+        uint32_t g = tr(a);
+        return mapped(g, a) ? ld32(g) : 0;
+    }
+    void Write32(uint32_t a, uint32_t v) override {
+        uint32_t g = tr(a);
+        if (mapped(g, a)) st32(g, v);
+    }
+    const uint8_t* HostPtr(uint32_t a, uint32_t) const override {
+        uint32_t g = tr(a);
+        return mapped(g, a) ? host(g) : nullptr;
+    }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
