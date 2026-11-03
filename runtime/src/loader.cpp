@@ -4,6 +4,7 @@
 #include "fa/xex.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -70,6 +71,7 @@ static void link_variables(const std::vector<uint8_t>& f, const XexInfo& info, u
         uint16_t count = be16(lib + 38);
         const uint8_t* desc = lib + 40;
         auto& table = names[i] == "xam.xex" ? XamExports : XboxKernelExports;
+        std::fprintf(stderr, "import library %s: %u records\n", names[i].c_str(), unsigned(count));
         for (uint16_t k = 0; k < count; ++k) {
             uint32_t slot = be32(desc + k * 4);
             if (slot < base) continue;
@@ -79,6 +81,9 @@ static void link_variables(const std::vector<uint8_t>& f, const XexInfo& info, u
             uint32_t swapped;
             std::memcpy(&swapped, p, 4);
             auto n = table.find(swapped & 0xFFFF);
+            if (std::getenv("FA_TRACE_IMPORTS"))
+                std::fprintf(stderr, "  data record slot=%08x raw=%08x ordinal=%04x name=%s\n", slot, swapped,
+                             swapped & 0xFFFF, n == table.end() ? "?" : n->second);
             // Records that are not thunks are only data imports when the export really is a
             // variable; other records (function pointer slots, xam function ordinals) are left alone.
             if (n == table.end() || !is_kernel_variable(n->second)) continue;
