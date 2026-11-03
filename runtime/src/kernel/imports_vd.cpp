@@ -6,9 +6,13 @@
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/memory.hpp"
 
+#include "fa/gpu/command_processor.hpp"
+#include "fa/gpu/null_backend.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -17,7 +21,7 @@ using namespace fa::rt;
 namespace fa::rt {
 struct VdState {
     std::atomic<uint32_t> callback{0}, callback_ctx{0};
-    uint32_t ring_base = 0, ring_size_log2 = 0;
+    uint32_t ring_base = 0, ring_size_log2 = 0, ring_size_bytes = 0;
     uint32_t rptr_writeback = 0, rptr_block_log2 = 0;
     uint32_t gpu_id_addr = 0;
 };
@@ -49,14 +53,75 @@ FA_IMPORT(VdSetGraphicsInterruptCallback) {
 
 FA_IMPORT(VdSetSystemCommandBufferGpuIdentifierAddress) { g_vd.gpu_id_addr = arg32(ctx, 0); }
 
+// The kernel hands these around as physical addresses; physical p lives at 0xA0000000 + p.
+static uint32_t phys_to_guest(uint32_t a) { return a < 0x20000000 ? a + 0xA0000000u : a; }
+
+namespace {
+struct RtGuestMemory : fa::gpu::GuestMemory {
+    uint32_t Read32(uint32_t a) const override { return ld32(a); }
+    void Write32(uint32_t a, uint32_t v) override { st32(a, v); }
+    const uint8_t* HostPtr(uint32_t a, uint32_t) const override { return host(a); }
+};
+
+constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
+constexpr uint32_t kCpRbWptr = 0x7FC80000 + 0x1C5 * 4;
+
+RtGuestMemory g_gpu_mem;
+fa::gpu::NullBackend g_gpu_backend;
+fa::gpu::CommandProcessor* g_cp = nullptr;
+std::atomic<bool> g_gpu_started{false};
+
+void gpu_thread() {
+    attach_guest_thread("gpu");
+    g_cp->SetInterruptHandler([](uint32_t) {
+        uint32_t cb = g_vd.callback.load();
+        if (cb) invoke_guest(cb, 1, g_vd.callback_ctx.load());  // source 1 = command processor
+    });
+    uint32_t last_wptr = 0;
+    for (;;) {
+        uint32_t w = ld32(kCpRbWptr);
+        g_cp->SetWritePtr(w);
+        g_cp->Pump();
+        st32(kCpRbRptr, g_cp->ReadPtr());
+        if (w != last_wptr) {
+            last_wptr = w;
+            if (std::getenv("FA_TRACE_GPU"))
+                std::fprintf(stderr, "[gpu] wptr=%u rptr=%u packets=%llu draws=%llu swaps=%llu unknown=%llu\n", w,
+                             g_cp->ReadPtr(), (unsigned long long)g_cp->GetStats().packets,
+                             (unsigned long long)g_cp->GetStats().draws, (unsigned long long)g_cp->GetStats().swaps,
+                             (unsigned long long)g_cp->GetStats().unknown);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+}
+
+void start_gpu() {
+    if (g_gpu_started.exchange(true)) return;
+    g_cp = new fa::gpu::CommandProcessor(g_gpu_mem, g_gpu_backend);
+    g_cp->SetRingBuffer(g_vd.ring_base, g_vd.ring_size_bytes);
+    if (g_vd.rptr_writeback) g_cp->SetReadPtrWriteback(g_vd.rptr_writeback);
+    std::thread(gpu_thread).detach();
+}
+}  // namespace
+
 FA_IMPORT(VdInitializeRingBuffer) {
-    g_vd.ring_base = arg32(ctx, 0);
+    // (physical base, log2 of the size in 8-byte units)
+    g_vd.ring_base = phys_to_guest(arg32(ctx, 0));
     g_vd.ring_size_log2 = arg32(ctx, 1);
+    g_vd.ring_size_bytes = 8u << g_vd.ring_size_log2;
+    std::fprintf(stderr, "[gpu] ring buffer at %08x, %u bytes\n", g_vd.ring_base, g_vd.ring_size_bytes);
+    start_gpu();
 }
 
 FA_IMPORT(VdEnableRingBufferRPtrWriteBack) {
-    g_vd.rptr_writeback = arg32(ctx, 0);
+    g_vd.rptr_writeback = phys_to_guest(arg32(ctx, 0));
     g_vd.rptr_block_log2 = arg32(ctx, 1);
+    if (g_cp) g_cp->SetReadPtrWriteback(g_vd.rptr_writeback);
+}
+
+FA_IMPORT(VdGetSystemCommandBuffer) {
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), 0xBEEF0000);
+    if (arg32(ctx, 1)) st32(arg32(ctx, 1), 0xBEEF0001);
 }
 
 FA_IMPORT(VdQueryVideoMode) {
