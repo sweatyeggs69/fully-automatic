@@ -10,3 +10,6 @@ build/
 *.wmv
 FullAuto_Extracted*/
 extracted/
+third_party/
+private/
+ppc/
