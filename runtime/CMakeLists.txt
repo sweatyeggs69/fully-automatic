@@ -44,6 +44,9 @@ add_test(NAME rt_test COMMAND rt_test)
 add_executable(hle_import_test tests/hle_import_test.cpp)
 target_link_libraries(hle_import_test fa_rt_fake)
 add_test(NAME hle_import_test COMMAND hle_import_test)
+add_executable(nt_file_test tests/nt_file_test.cpp)
+target_link_libraries(nt_file_test fa_rt_fake)
+add_test(NAME nt_file_test COMMAND nt_file_test)
 
 # ---- the game, once XenonRecomp output exists --------------------------------------------------
 if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
