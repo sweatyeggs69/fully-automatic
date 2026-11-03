@@ -22,7 +22,7 @@ constexpr uint64_t kGuestSpace = 0x100000000ull;
 constexpr uint32_t kPageSize = 0x1000;
 constexpr uint32_t kAllocGranularity = 0x10000;
 
-enum class Heap { User, System, Malloc, Physical };
+enum class Heap { User, System, Malloc, Physical, View };
 
 class GuestMemory {
 public:
