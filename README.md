@@ -38,3 +38,7 @@ Apply the patch before recompiling:
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-diag.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-overlap.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp
+
+## Check that the generated C++ compiles (slow, needs clang)
+    cmake -S tools/recomp-build -B tools/recomp-build/out -G Ninja -DCMAKE_CXX_COMPILER=clang++
+    cmake --build tools/recomp-build/out -j4
