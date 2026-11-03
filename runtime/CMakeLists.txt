@@ -23,6 +23,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
     src/memory.cpp src/kernel.cpp src/crash.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
+# The GPU command processor lives in the top-level src/gpu.
+list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp)
 
 function(fa_rt_library name ppc_include)
     add_library(${name} STATIC ${FA_RT_SOURCES} src/loader.cpp)
@@ -77,3 +79,8 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
 else()
     message(STATUS "No ${FA_PPC_DIR}/ppc_config.h: skipping the fullauto target (run XenonRecomp first)")
 endif()
+
+# Links the Vd/GPU glue into an executable so a missing GPU source fails here, not on the PC.
+add_executable(vd_link_test tests/vd_link_test.cpp)
+target_link_libraries(vd_link_test fa_rt_fake)
+add_test(NAME vd_link_test COMMAND vd_link_test)
