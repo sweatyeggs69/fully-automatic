@@ -79,8 +79,10 @@ static void link_variables(const std::vector<uint8_t>& f, const XexInfo& info, u
             uint32_t swapped;
             std::memcpy(&swapped, p, 4);
             auto n = table.find(swapped & 0xFFFF);
-            std::string name = n != table.end() ? n->second : "ordinal_" + std::to_string(swapped & 0xFFFF);
-            st32(slot, kernel_variable(name));
+            // Records that are not thunks are only data imports when the export really is a
+            // variable; other records (function pointer slots, xam function ordinals) are left alone.
+            if (n == table.end() || !is_kernel_variable(n->second)) continue;
+            st32(slot, kernel_variable(n->second));
             ++linked;
         }
         lib = desc + count * 4;

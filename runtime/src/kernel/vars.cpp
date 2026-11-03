@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <cstring>
 #include <thread>
@@ -27,6 +28,21 @@ static void ticker() {
         st32(g_bundle + 0x10, uint32_t(el));
         std::this_thread::sleep_for(milliseconds(1));
     }
+}
+
+bool is_kernel_variable(const std::string& name) {
+    static const std::set<std::string> vars = {
+        "ExConsoleGameRegion", "ExEventObjectType", "ExMutantObjectType", "ExSemaphoreObjectType",
+        "ExThreadObjectType", "ExTimerObjectType", "IoCompletionObjectType", "IoDeviceObjectType",
+        "IoFileObjectType", "KeDebugMonitorData", "KeTimeStampBundle", "KiBugCheckData",
+        "Nls844UnicodeCaseTable", "ObDirectoryObjectType", "ObSymbolicLinkObjectType",
+        "XboxHardwareInfo", "XboxKrnlBaseVersion", "XboxKrnlVersion", "XexExecutableModuleHandle",
+        "ExLoadedCommandLine", "ExLoadedImageName", "VdGlobalDevice", "VdGlobalXamDevice",
+        "VdGpuClockInMHz", "VdHSIOCalibrationLock", "HalFsbInterruptCount", "KeCertMonitorData",
+        "VdHSIOTrainCount", "VdHSIOTrainingStatus", "RgcBindInfo", "HalFsbResetCount",
+        "UsbdBootEnumerationDoneEvent", "StfsDeviceErrorEvent", "UsbdDriverLoadRequiredEvent",
+        "XboxKrnlVersion4Digit", "g_XuiAutomation", "XamSwapDiscPatchAddress"};
+    return vars.count(name) != 0;
 }
 
 uint32_t kernel_variable(const std::string& name) {
