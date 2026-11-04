@@ -2,6 +2,7 @@
 // address returned here into each variable's import slot.
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/memory.hpp"
+#include "fa/rt/timebase.hpp"
 #include "fa/rt/vars.hpp"
 
 #include <chrono>
@@ -18,12 +19,12 @@ static uint32_t g_bundle = 0;
 
 static void ticker() {
     using namespace std::chrono;
-    auto start = steady_clock::now();
     constexpr uint64_t kEpochDelta = 116444736000000000ull;
     for (;;) {
-        auto el = duration_cast<milliseconds>(steady_clock::now() - start).count();
+        uint64_t up = guest_uptime_100ns();
+        uint64_t el = up / 10000;
         auto ns = duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
-        st64(g_bundle + 0, uint64_t(el) * 10000);
+        st64(g_bundle + 0, up);
         st64(g_bundle + 8, kEpochDelta + uint64_t(ns) / 100);
         st32(g_bundle + 0x10, uint32_t(el));
         std::this_thread::sleep_for(milliseconds(1));

@@ -28,4 +28,8 @@ size_t patch_rdtsc_sites(uint8_t* begin, uint8_t* end, size_t* skipped = nullptr
 // The current guest timebase value, as the patched code sees it.
 uint64_t guest_timebase_now();
 
+// Time since the runtime started, in 100 ns units. The one base for KeQueryInterruptTime and the
+// InterruptTime/TickCount fields of KeTimeStampBundle, so the game never mixes two origins.
+uint64_t guest_uptime_100ns();
+
 }  // namespace fa::rt

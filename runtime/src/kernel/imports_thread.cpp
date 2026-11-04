@@ -1,5 +1,6 @@
 // Threads, TLS, delays and time.
 #include "fa/rt/kernel.hpp"
+#include "fa/rt/timebase.hpp"
 #include "fa/rt/import.hpp"
 #include "fa/rt/memory.hpp"
 
@@ -86,7 +87,4 @@ uint64_t filetime_now() {
 
 FA_IMPORT(KeQuerySystemTime) { st64(arg32(ctx, 0), filetime_now()); }
 FA_IMPORT(KeQueryPerformanceFrequency) { ctx.r3.u64 = 50000000; }
-FA_IMPORT(KeQueryInterruptTime) {
-    using namespace std::chrono;
-    ctx.r3.u64 = uint64_t(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 100);
-}
+FA_IMPORT(KeQueryInterruptTime) { ctx.r3.u64 = guest_uptime_100ns(); }
