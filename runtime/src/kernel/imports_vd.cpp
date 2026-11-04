@@ -81,8 +81,7 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
         return a;
     }
     static bool mapped(uint32_t g, uint32_t orig) {
-        uint32_t st, sz;
-        if (g_mem.find_allocation(g, st, sz)) return true;
+        if (g_mem.is_committed(g)) return true;
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 20)
             std::fprintf(stderr, "[gpu] access to unmapped memory %08x (guest %08x)\n", orig, g);
@@ -137,6 +136,7 @@ void gpu_thread() {
         set_current_processor(0);
     });
     uint32_t last_wptr = 0;
+    const bool trace = std::getenv("FA_TRACE_GPU") != nullptr;
     for (;;) {
         uint32_t w = ld32(kCpRbWptr);
         g_cp->SetWritePtr(w);
@@ -144,13 +144,13 @@ void gpu_thread() {
         st32(kCpRbRptr, g_cp->ReadPtr());
         if (w != last_wptr) {
             last_wptr = w;
-            if (std::getenv("FA_TRACE_GPU"))
+            if (trace)
                 std::fprintf(stderr, "[gpu] wptr=%u rptr=%u packets=%llu draws=%llu swaps=%llu unknown=%llu\n", w,
                              g_cp->ReadPtr(), (unsigned long long)g_cp->GetStats().packets,
                              (unsigned long long)g_cp->GetStats().draws, (unsigned long long)g_cp->GetStats().swaps,
                              (unsigned long long)g_cp->GetStats().unknown);
             static auto last_hist = std::chrono::steady_clock::now();
-            if (std::getenv("FA_TRACE_GPU") && std::chrono::steady_clock::now() - last_hist > std::chrono::seconds(5)) {
+            if (trace && std::chrono::steady_clock::now() - last_hist > std::chrono::seconds(5)) {
                 last_hist = std::chrono::steady_clock::now();
                 std::fprintf(stderr, "[gpu] unknown type-3 opcodes:");
                 for (int op = 0; op < 128; op++)

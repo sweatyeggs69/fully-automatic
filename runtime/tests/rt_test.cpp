@@ -6,6 +6,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace fa::rt;
 
@@ -19,6 +22,7 @@ PPC_EXTERN_FUNC(NtReleaseSemaphore);
 PPC_EXTERN_FUNC(RtlInitializeCriticalSection);
 PPC_EXTERN_FUNC(RtlEnterCriticalSection);
 PPC_EXTERN_FUNC(RtlLeaveCriticalSection);
+PPC_EXTERN_FUNC(RtlTryEnterCriticalSection);
 PPC_EXTERN_FUNC(KeTlsAlloc);
 PPC_EXTERN_FUNC(KeTlsSetValue);
 PPC_EXTERN_FUNC(KeTlsGetValue);
@@ -103,6 +107,37 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
     K(ctx, RtlLeaveCriticalSection, cs);
     K(ctx, RtlLeaveCriticalSection, cs);
     CHECK(ld32(cs + 0x18) == 0);
+
+    // Contended critical section: four host threads bump one unprotected counter.
+    {
+        uint32_t counter = s + 0xA0;
+        st32(counter, 0);
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 4; ++i)
+            ts.emplace_back([cs, counter, i] {
+                attach_guest_thread("cs" + std::to_string(i));
+                PPCContext c{};
+                for (int k = 0; k < 20000; ++k) {
+                    K(c, RtlEnterCriticalSection, cs);
+                    st32(counter, ld32(counter) + 1);
+                    if (k % 1000 == 0) std::this_thread::yield();  // hold it a while sometimes
+                    K(c, RtlLeaveCriticalSection, cs);
+                }
+            });
+        for (auto& t : ts) t.join();
+        CHECK(ld32(counter) == 80000);
+        CHECK(ld32(cs + 0x18) == 0);
+        CHECK(K(ctx, RtlTryEnterCriticalSection, cs) == 1);
+        K(ctx, RtlLeaveCriticalSection, cs);
+    }
+
+    // The committed-page map follows allocations and physical aliases.
+    {
+        uint32_t ph = K(ctx, MmAllocatePhysicalMemoryEx, 0, 0x10000, 4, 0, 0xFFFFFFFF, 0x10000);
+        CHECK(g_mem.is_committed(ph) && g_mem.is_committed(ph + 0xFFFF));
+        CHECK(g_mem.is_committed(0xC0000000u + (ph & 0x1FFFFFFF)));
+        CHECK(!g_mem.is_committed(0x50000000u));
+    }
 
     // Memory: pool, physical, virtual.
     K(ctx, ExFreePool, s);
