@@ -52,6 +52,7 @@ private:
     std::function<void(uint32_t)> interrupt_;
     struct IndirectBuffer { bool active = false; uint32_t base = 0, size = 0, pos = 0; } ib_;
     Stats stats_;
+    std::vector<uint32_t> payload_;  // scratch for the packet being executed
 };
 
 }  // namespace fa::gpu

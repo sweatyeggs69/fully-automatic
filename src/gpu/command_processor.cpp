@@ -72,7 +72,9 @@ CommandProcessor::Result CommandProcessor::ExecutePacket(uint32_t& pos, uint32_t
                                                          uint32_t availDwords, int depth) {
     uint32_t header = ReadDword(base, sizeDwords, pos);
     uint32_t total = 1;
-    std::vector<uint32_t> d;
+    // Reused across packets: a fresh vector per packet was a heap allocation for every packet.
+    std::vector<uint32_t>& d = payload_;
+    d.clear();
     switch (pm4::TypeOf(header)) {
         case pm4::kType0: total = 1 + pm4::T0Count(header); break;
         case pm4::kType1: total = 3; break;
@@ -80,7 +82,8 @@ CommandProcessor::Result CommandProcessor::ExecutePacket(uint32_t& pos, uint32_t
         case pm4::kType3: total = 1 + pm4::T3Count(header); break;
     }
     if (total > availDwords) return Result::Incomplete;
-    for (uint32_t i = 1; i < total; ++i) d.push_back(ReadDword(base, sizeDwords, pos + i));
+    d.resize(total - 1);
+    for (uint32_t i = 1; i < total; ++i) d[i - 1] = ReadDword(base, sizeDwords, pos + i);
 
     switch (pm4::TypeOf(header)) {
         case pm4::kType0: {
