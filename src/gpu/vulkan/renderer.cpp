@@ -2385,10 +2385,10 @@ struct VulkanRenderer::Impl {
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
-                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
+                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s bias %d "
                                  "| src %03x/%u surf %08x wo %08x sc %08x vtx %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
                                  (unsigned long long)frame, isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
-                                 d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
+                                 d.endian, d.swapRB ? " swapRB" : "", d.expBias, srcInfo & 0xFFF, srcFormat, surf,
                                  regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
                 DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
                 }
