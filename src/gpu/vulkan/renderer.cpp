@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -411,6 +412,10 @@ struct VulkanRenderer::Impl {
     std::unordered_map<uint64_t, Shader> shaders;
     VkShaderModule rectGs = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    struct TexKey { uint32_t binding; VkSampler smp; VkImageView view; };
+    VkDescriptorSet lastTexSet = VK_NULL_HANDLE;  // texture set of the previous draw in this batch
+    std::vector<TexKey> lastTexKey;
+    HostDraw hostDraw;  // reused across draws so its index buffer keeps its capacity
     std::map<uint64_t, RenderTarget> rts;
     std::unordered_map<uint64_t, Texture> textures;
     std::unordered_map<uint64_t, VkSampler> samplers;
@@ -606,6 +611,7 @@ struct VulkanRenderer::Impl {
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
+        lastTexSet = VK_NULL_HANDLE;
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
@@ -613,6 +619,7 @@ struct VulkanRenderer::Impl {
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
         stats.submits++;
+        prof::Add(prof::kSubmits, 1);
     }
 
     // Linear allocation from the upload ring; flushes the batch when it runs out.
@@ -1232,8 +1239,11 @@ struct VulkanRenderer::Impl {
         Shader* vs = GetShader(ShaderStage::Vertex, dc.vsUcode, dc.vsDwords, dc.vsHash);
         Shader* ps = GetShader(ShaderStage::Pixel, dc.psUcode, dc.psDwords, dc.psHash);
         if (!vs->ok || !ps->ok) { stats.drawsSkipped++; return; }
-        HostDraw hd;
-        if (!BuildHostDraw(dc, regs, mem, hd)) { stats.drawsSkipped++; return; }
+        std::optional<prof::Scope> sec;
+        sec.emplace(prof::kDrawBuild);
+        if (!BuildHostDraw(dc, regs, mem, hostDraw)) { stats.drawsSkipped++; return; }
+        HostDraw& hd = hostDraw;
+        prof::Add(prof::kIdxCount, hd.indices.size());
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 
@@ -1262,6 +1272,7 @@ struct VulkanRenderer::Impl {
         if (!depth && !colorMask) { stats.drawsSkipped++; return; }
 
         // Textures (uploads happen outside rendering, so before BeginRendering).
+        sec.emplace(prof::kDrawTex);
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
@@ -1281,6 +1292,11 @@ struct VulkanRenderer::Impl {
                 w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 nw++;
             }
+            // Same samplers and views as the previous draw of this batch: reuse its descriptor set.
+            bool sameSet = lastTexSet != VK_NULL_HANDLE && lastTexKey.size() == nw;
+            for (uint32_t i = 0; i < nw && sameSet; i++)
+                sameSet = lastTexKey[i].binding == w[i].dstBinding && lastTexKey[i].smp == ii[i].sampler && lastTexKey[i].view == ii[i].imageView;
+            if (!sameSet) {
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
@@ -1297,9 +1313,16 @@ struct VulkanRenderer::Impl {
                 w[i].pImageInfo = &ii[i];
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
+            lastTexSet = texSet;
+            lastTexKey.resize(nw);
+            for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
+            } else {
+                texSet = lastTexSet;
+            }
         }
 
         // Uniforms and vertex data.
+        sec.emplace(prof::kDrawUpload);
         const VkDeviceSize uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
         bool flushed;
         VkDeviceSize constsOff;
@@ -1307,6 +1330,7 @@ struct VulkanRenderer::Impl {
         if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && !std::memcmp(lastConsts.data(), consts, 8192)) {
             constsOff = lastConstsOff;
         } else {
+            prof::Add(prof::kConstUploads, 1);
             constsOff = RingAlloc(8192, uboAlign, flushed);
             std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
             lastConsts.assign(consts, consts + 2048);
@@ -1355,11 +1379,32 @@ struct VulkanRenderer::Impl {
         if (sys.misc[1] <= 0.0f) sys.misc[1] = 1.0f;
 
         // Vertex buffers used by the vertex shader.
+        uint32_t maxIdx = ~0u;  // largest vertex index of this draw, computed on first use
         for (uint32_t s = 0; s < 96; s++) {
             if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32)))) continue;
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             uint32_t words = std::min<uint32_t>(vf.sizeWords, 4u << 20);
             if (vf.type != 3 || !words) continue;
+            // Games often give the fetch constant a whole pool as its size; only the part the draw's
+            // indices can reach needs copying (when the shader indexes straight from the vertex index).
+            if (vs->info.vfetchStride[s]) {
+                if (maxIdx == ~0u) {
+                    maxIdx = 0;
+                    for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
+                }
+                uint64_t need = uint64_t(maxIdx) * vs->info.vfetchStride[s] + vs->info.vfetchEnd[s];
+                words = uint32_t(std::min<uint64_t>(words, need));
+            }
+            if (prof::g_enabled) {
+                static int logged = 0;
+                static uint64_t seen = 0;
+                if (logged < 60 && seen++ % 700 == 0) {
+                    logged++;
+                    std::fprintf(stderr, "[vbprof] vs %016llx slot %u: fetch words %u, copy %u, stride %u end %u, indices %zu max %d\n",
+                                 (unsigned long long)dc.vsHash, s, vf.sizeWords, words, vs->info.vfetchStride[s],
+                                 vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
+                }
+            }
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
             VkDeviceSize at;
@@ -1371,6 +1416,7 @@ struct VulkanRenderer::Impl {
                 at = RingAlloc(words * 4, 16, flushed);
                 if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
                 std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
+                prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                 vbCache[key] = at;
             }
             sys.vf[s][0] = uint32_t(at / 4);
@@ -1392,6 +1438,7 @@ struct VulkanRenderer::Impl {
         std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
 
         // Pipeline.
+        sec.emplace(prof::kDrawRecord);
         PipelineKey key{};
         key.vs = dc.vsHash;
         key.ps = dc.psHash;

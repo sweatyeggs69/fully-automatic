@@ -25,16 +25,28 @@ enum Section : int {
     kResolveCpu,   // converting and tiling resolved pixels into guest memory
     kOtherWait,    // other GPU waits (swap, batch full)
     kFrameDecode,  // decoding the front buffer for the window
+    kDrawBuild,    // Draw: building host indices
+    kDrawTex,      // Draw: texture lookups and descriptor sets
+    kDrawUpload,   // Draw: constants, vertex buffers, indices copied into the ring
+    kDrawRecord,   // Draw: pipeline lookup and command recording
     kCount
 };
 
 inline const char* const kNames[kCount] = {"busy",         "draw",        "tex check",  "tex upload",
                                            "shader",       "pipeline",    "resolve",    "resolve wait",
-                                           "resolve cpu",  "other wait",  "frame decode"};
+                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record"};
 
 inline const bool g_enabled = std::getenv("FA_PROFILE") != nullptr;
 inline std::atomic<uint64_t> g_ns[kCount];
 inline std::atomic<uint64_t> g_count[kCount];
+
+// Plain counters (bytes, items) printed per frame after the timed sections.
+enum Stat : int { kVbBytes, kIdxCount, kConstUploads, kSubmits, kStatCount };
+inline const char* const kStatNames[kStatCount] = {"vb KB", "indices", "const uploads", "submits"};
+inline std::atomic<uint64_t> g_stat[kStatCount];
+inline void Add(Stat s, uint64_t n) {
+    if (g_enabled) g_stat[s].fetch_add(n, std::memory_order_relaxed);
+}
 
 inline uint64_t NowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -70,13 +82,18 @@ inline void OnSwap() {
         ns[i] = g_ns[i].exchange(0, std::memory_order_relaxed);
         n[i] = g_count[i].exchange(0, std::memory_order_relaxed);
     }
-    char line[1024];
+    char line[1536];
     int len = std::snprintf(line, sizeof line, "[gpuprof] %.1f s: %.1f swaps/s, gpu thread busy %.0f%% | ms per frame:", dt,
                             double(swaps) / dt, 100.0 * double(ns[kPump]) / 1e9 / dt);
     for (int i = 1; i < kCount && len > 0 && len < int(sizeof line); i++) {
         if (!n[i]) continue;
         len += std::snprintf(line + len, sizeof line - len, " %s %.2f (x%.1f)", kNames[i], double(ns[i]) / 1e6 / double(swaps),
                              double(n[i]) / double(swaps));
+    }
+    for (int i = 0; i < kStatCount && len > 0 && len < int(sizeof line); i++) {
+        double v = double(g_stat[i].exchange(0, std::memory_order_relaxed)) / double(swaps);
+        if (i == kVbBytes) v /= 1024.0;
+        len += std::snprintf(line + len, sizeof line - len, " | %s %.1f", kStatNames[i], v);
     }
     std::fprintf(stderr, "%s\n", line);
     start = now;
