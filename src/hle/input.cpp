@@ -262,6 +262,97 @@ void Input::handle_event(const SDL_Event& e) {
     else if (e.type == SDL_CONTROLLERDEVICEREMOVED) close_pad(e.cdevice.which);
 }
 
+namespace {
+// Virtual keys in a fixed order; the first 16 map to gamepad button bits, then triggers and sticks.
+struct VkDef { uint16_t vk; uint16_t mask; };
+constexpr VkDef kVkButtons[] = {
+    {xinput::kVkPadA, xinput::kA}, {xinput::kVkPadB, xinput::kB}, {xinput::kVkPadX, xinput::kX},
+    {xinput::kVkPadY, xinput::kY}, {xinput::kVkPadRShoulder, xinput::kRightShoulder},
+    {xinput::kVkPadLShoulder, xinput::kLeftShoulder}, {xinput::kVkPadDpadUp, xinput::kDpadUp},
+    {xinput::kVkPadDpadDown, xinput::kDpadDown}, {xinput::kVkPadDpadLeft, xinput::kDpadLeft},
+    {xinput::kVkPadDpadRight, xinput::kDpadRight}, {xinput::kVkPadStart, xinput::kStart},
+    {xinput::kVkPadBack, xinput::kBack}, {xinput::kVkPadLThumbPress, xinput::kLeftThumb},
+    {xinput::kVkPadRThumbPress, xinput::kRightThumb},
+};
+constexpr uint16_t kVkOthers[] = {
+    xinput::kVkPadLTrigger, xinput::kVkPadRTrigger,
+    xinput::kVkPadLThumbUp, xinput::kVkPadLThumbDown, xinput::kVkPadLThumbRight, xinput::kVkPadLThumbLeft,
+    xinput::kVkPadRThumbUp, xinput::kVkPadRThumbDown, xinput::kVkPadRThumbRight, xinput::kVkPadRThumbLeft,
+};
+constexpr int kNumVk = 14 + 10;
+constexpr int kStickThreshold = 20000, kTriggerThreshold = 30;
+constexpr uint32_t kRepeatDelayMs = 400, kRepeatRateMs = 100;
+}  // namespace
+
+void Input::generate_keystrokes(int user, Slot& s, uint32_t now) {
+    const XInputGamepad& g = s.state.gamepad;
+    bool down[kNumVk] = {};
+    uint16_t vks[kNumVk];
+    for (int i = 0; i < 14; ++i) {
+        vks[i] = kVkButtons[i].vk;
+        down[i] = (g.buttons & kVkButtons[i].mask) != 0;
+    }
+    for (int i = 0; i < 10; ++i) vks[14 + i] = kVkOthers[i];
+    down[14] = g.left_trigger > kTriggerThreshold;
+    down[15] = g.right_trigger > kTriggerThreshold;
+    down[16] = g.thumb_ly > kStickThreshold;
+    down[17] = g.thumb_ly < -kStickThreshold;
+    down[18] = g.thumb_lx > kStickThreshold;
+    down[19] = g.thumb_lx < -kStickThreshold;
+    down[20] = g.thumb_ry > kStickThreshold;
+    down[21] = g.thumb_ry < -kStickThreshold;
+    down[22] = g.thumb_rx > kStickThreshold;
+    down[23] = g.thumb_rx < -kStickThreshold;
+    auto push = [&](int i, uint16_t flags) {
+        if (s.keystrokes.size() >= 64) s.keystrokes.pop_front();
+        s.keystrokes.push_back({vks[i], 0, flags, uint8_t(user), 0});
+    };
+    for (int i = 0; i < kNumVk; ++i) {
+        bool was = (s.held_keys >> i) & 1;
+        if (down[i] && !was) {
+            push(i, xinput::kKeyDown);
+            s.held_keys |= 1u << i;
+            s.held_since_ms[i] = now + kRepeatDelayMs;
+        } else if (!down[i] && was) {
+            push(i, xinput::kKeyUp);
+            s.held_keys &= ~(1u << i);
+        } else if (down[i] && now >= s.held_since_ms[i]) {
+            push(i, xinput::kKeyDown | xinput::kKeyRepeat);
+            s.held_since_ms[i] = now + kRepeatRateMs;
+        }
+    }
+}
+
+void Input::maybe_self_pump() {
+    if (self_pump_ && sdl_ok_) {
+        uint32_t now = SDL_GetTicks();
+        if (now - last_self_pump_ms_ >= 4) {
+            last_self_pump_ms_ = now;
+            // Event pumping belongs to the window thread once video is up.
+            if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_PumpEvents();
+            pump();
+        }
+    }
+}
+
+uint32_t Input::get_keystroke(uint32_t user, XInputKeystroke& out) {
+    maybe_self_pump();
+    bool any = user == xinput::kUserAny || user == 0xFE;
+    if (!any && user >= xinput::kMaxUsers) return xinput::kErrorDeviceNotConnected;
+    if (any && !connected(0) && !connected(1) && !connected(2) && !connected(3)) return xinput::kErrorDeviceNotConnected;
+    if (!any && !connected(user)) return xinput::kErrorDeviceNotConnected;
+    std::lock_guard lk(mu_);
+    for (int u = 0; u < xinput::kMaxUsers; ++u) {
+        if (!any && uint32_t(u) != user) continue;
+        auto& q = slots_[u].keystrokes;
+        if (q.empty()) continue;
+        out = q.front();
+        q.pop_front();
+        return xinput::kErrorSuccess;
+    }
+    return xinput::kErrorEmpty;
+}
+
 void Input::refresh() {
     // Caller holds mu_.
     uint32_t now = SDL_GetTicks();
@@ -316,6 +407,7 @@ void Input::refresh() {
             s.state.gamepad = g;
             s.state.packet_number++;
         }
+        generate_keystrokes(u, s, now);
     }
 }
 
@@ -340,15 +432,7 @@ bool Input::connected(uint32_t user) {
 }
 
 uint32_t Input::get_state(uint32_t user, XInputState& out) {
-    if (self_pump_ && sdl_ok_) {
-        uint32_t now = SDL_GetTicks();
-        if (now - last_self_pump_ms_ >= 4) {
-            last_self_pump_ms_ = now;
-            // Event pumping belongs to the window thread once video is up.
-            if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_PumpEvents();
-            pump();
-        }
-    }
+    maybe_self_pump();
     if (user == xinput::kUserAny) user = 0;
     if (!connected(user)) return xinput::kErrorDeviceNotConnected;
     std::lock_guard lk(mu_);
