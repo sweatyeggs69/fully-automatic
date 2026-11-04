@@ -455,12 +455,33 @@ struct VulkanRenderer::Impl {
     const char* dumpDir = nullptr;
     bool dbgNoAtest = false, dbgNoBlend = false;
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
-    bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount)); }
+    // FA_RENDER_DUMP_FRAME=N dumps swap N (all resolves, textures and targets), restricted to draws
+    // A..B of that frame with FA_RENDER_DUMP_DRAWS=A-B (draw numbers count from 0 in each frame).
+    // FA_RENDER_DUMP=dir is still required. This reaches the 3D menu without dumping GBs.
+    int64_t dumpFrameSel = -1;
+    uint64_t dumpDrawLo = 0, dumpDrawHi = ~0ull, drawInFrame = 0;
+    std::set<uint32_t> dumpedTexBases;
+    bool DumpFrame() const {
+        if (!dumpDir) return false;
+        if (dumpFrameSel >= 0) return uint64_t(dumpFrameSel) == frame;
+        return frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount);
+    }
+    bool DumpDraw() const {
+        if (!DumpFrame()) return false;
+        if (dumpFrameSel >= 0) return drawInFrame >= dumpDrawLo && drawInFrame <= dumpDrawHi;
+        return true;
+    }
 
     Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {
         const char* d = std::getenv("FA_RENDER_DUMP");
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_FRAME")) dumpFrameSel = std::strtoll(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_DRAWS")) {
+            char* e = nullptr;
+            dumpDrawLo = std::strtoull(c, &e, 10);
+            dumpDrawHi = (e && *e == '-') ? std::strtoull(e + 1, nullptr, 10) : dumpDrawLo;
+        }
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
         if (const char* c = std::getenv("FA_DBG_RENDER")) {
             dbgNoAtest = std::strstr(c, "noatest") != nullptr;
@@ -1535,19 +1556,20 @@ struct VulkanRenderer::Impl {
         vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
         stats.draws++;
+        drawInFrame++;
 
-        if (drawsTraced < opt.traceDraws || DumpFrame()) {
+        if (drawsTraced < opt.traceDraws || DumpDraw()) {
             drawsTraced++;
             std::fprintf(stderr,
-                         "[render] frame %llu draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
+                         "[render] frame %llu draw %llu (#%llu in frame): prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), hd.indices.size(),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
-            if (DumpFrame()) TraceInputs(regs, vs, ps, sys);
+            if (DumpDraw()) TraceInputs(regs, vs, ps, sys);
         }
-        if (DumpFrame()) {
+        if (DumpDraw()) {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
         }
@@ -1621,7 +1643,7 @@ struct VulkanRenderer::Impl {
                     std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
                                   t.base, t.format, t.width, t.height);
                     for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
-                    if (texDumps < 400) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
+                    if (texDumps < 400 && dumpedTexBases.insert(t.base).second) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
                     uint32_t constRows = 0;
                     for (uint32_t y = 0; y < t.height; y++) {
                         const uint8_t* row = &rgba[size_t(y) * t.width * 4];
@@ -1632,6 +1654,23 @@ struct VulkanRenderer::Impl {
                     std::fprintf(stderr, "[render]     decoded: %u of %u rows are one colour; raw:", constRows, t.height);
                     for (int i = 0; i < 32; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", src[i]);
                     std::fprintf(stderr, "\n");
+                }
+            } else if (t.IsTexture() && t.base && GetHostFormatInfo(t.format).supported) {
+                // Cube, 3D, stacked and the float / compressed-normal formats: mean of the host decode.
+                const uint8_t* src = mem.HostPtr(t.base, HostTextureByteSize(t));
+                HostTexture ht;
+                if (!src) {
+                    std::fprintf(stderr, "[render]     (guest memory not mapped for %u bytes)\n", HostTextureByteSize(t));
+                } else if (DecodeTextureHost(t, src, ht)) {
+                    double sum[4] = {};
+                    const size_t n = size_t(ht.width) * ht.height * ht.layers;
+                    for (size_t i = 0; i < n; i++)
+                        for (int c = 0; c < 4; c++) {
+                            if (ht.isFloat) { float f; std::memcpy(&f, &ht.data[(i * 4 + c) * 4], 4); sum[c] += f; }
+                            else sum[c] += ht.data[i * 4 + c] / 255.0;
+                        }
+                    std::fprintf(stderr, "[render]     host mean rgba %.3f %.3f %.3f %.3f (%u layers%s)\n", sum[0] / n, sum[1] / n, sum[2] / n,
+                                 sum[3] / n, ht.layers, ht.isFloat ? ", float" : "");
                 }
             }
         }
@@ -2002,6 +2041,8 @@ struct VulkanRenderer::Impl {
         Begin();
         generation++;
         frame++;
+        drawInFrame = 0;
+        dumpedTexBases.clear();
     }
 };
 

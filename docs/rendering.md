@@ -43,6 +43,8 @@ the window shows the texture debug view.
 | `FA_VK_DEVICE=N` | Pick the Vulkan device (default: first discrete GPU) |
 | `FA_VK_VALIDATION=1` | Enable the Khronos validation layer |
 | `FA_RENDER_DUMP=dir` | Debug dumps for frames 0-5 and every 30th frame: every draw logged with its textures, vertex buffers, blend state and constants; PNGs of the colour target after each draw, each resolve (as rendered and as it decodes from memory), each bound texture and the front buffer |
+| `FA_RENDER_DUMP_FRAME=N` | With `FA_RENDER_DUMP`: dump only swap N (all its resolves, targets and textures) instead of the early frames; the 3D menu is around swap 600+ |
+| `FA_RENDER_DUMP_DRAWS=A-B` | With `FA_RENDER_DUMP_FRAME`: trace and dump only draws A..B of that frame (numbered from 0). Texture lines carry a mean colour for every format, including cube, 3D and compressed ones |
 
 The window title adds `rendered N, skipped N, shader errors N`. Skipped draws are ones the
 renderer cannot handle yet (missing shader, unsupported primitive, no render target).
