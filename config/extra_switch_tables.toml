@@ -22,3 +22,18 @@ labels = [
     0x82148F1C,
     0x82148CAC,
 ]
+
+# sub_8230D4B8 (crashed at runtime after the title screen loads)
+[[switch]]
+base = 0x8230D518
+r = 28
+labels = [
+    0x8230D53C,
+    0x8230D60C,
+    0x8230D678,
+    0x8230D830,
+    0x8230DA10,
+    0x8230DBE0,
+    0x8230DDFC,
+    0x8230DE7C,
+]
