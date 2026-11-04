@@ -348,6 +348,8 @@ struct Buffer {
 struct Image {
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkDeviceSize memOff = 0, memSize = 0;  // suballocation in a pooled block (memSize 0: a dedicated allocation)
+    uint32_t memType = 0;
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t w = 0, h = 0, layers = 1, levels = 1;
@@ -848,6 +850,45 @@ struct VulkanRenderer::Impl {
         b = Buffer{};
     }
 
+    // Image memory comes from big device-local blocks, carved into size classes whose freed chunks are
+    // reused. One vkAllocateMemory per texture made a first-use burst of ~700 textures take seconds.
+    struct PoolBlock { VkDeviceMemory mem; VkDeviceSize size, used; uint32_t type; };
+    std::vector<PoolBlock> poolBlocks;
+    struct PoolChunk { VkDeviceMemory mem; VkDeviceSize off; };
+    std::map<uint64_t, std::vector<PoolChunk>> poolFree;
+    static uint64_t PoolKey(uint32_t type, VkDeviceSize cls) { return (uint64_t(type) << 48) ^ cls; }
+    bool PoolAlloc(Image& im, const VkMemoryRequirements& req, uint32_t type) {
+        constexpr VkDeviceSize kBlock = 64ull << 20, kMaxChunk = 16ull << 20, kGrain = 65536;
+        if (req.alignment > kGrain || req.size > kMaxChunk) return false;
+        // Classes: four steps per power of two, in multiples of 64 KB.
+        VkDeviceSize cls = kGrain;
+        while (cls < req.size) cls += std::max(kGrain, VkDeviceSize(1) << (63 - __builtin_clzll(cls) - 2));
+        cls = (cls + kGrain - 1) / kGrain * kGrain;
+        auto& fl = poolFree[PoolKey(type, cls)];
+        if (!fl.empty()) {
+            PoolChunk c = fl.back();
+            fl.pop_back();
+            im.mem = c.mem; im.memOff = c.off;
+        } else {
+            PoolBlock* b = nullptr;
+            for (auto& pb : poolBlocks) if (pb.type == type && pb.size - pb.used >= cls) { b = &pb; break; }
+            if (!b) {
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = kBlock;
+                ai.memoryTypeIndex = type;
+                VkDeviceMemory m;
+                if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return false;
+                poolBlocks.push_back({m, kBlock, 0, type});
+                b = &poolBlocks.back();
+            }
+            im.mem = b->mem; im.memOff = b->used;
+            b->used += cls;
+        }
+        im.memSize = cls;
+        im.memType = type;
+        return true;
+    }
+
     bool CreateImage(Image& im, VkFormat fmt, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags usage, bool cube,
                      VkImageAspectFlags aspect, const VkComponentMapping* swz = nullptr, uint32_t levels = 1) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -869,8 +910,12 @@ struct VulkanRenderer::Impl {
         int mt = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (mt < 0) mt = FindMemory(req.memoryTypeBits, 0);
         ai.memoryTypeIndex = uint32_t(mt);
-        if (vkAllocateMemory(dev, &ai, nullptr, &im.mem) != VK_SUCCESS) return false;
-        vkBindImageMemory(dev, im.img, im.mem, 0);
+        if (!PoolAlloc(im, req, uint32_t(mt))) {
+            if (vkAllocateMemory(dev, &ai, nullptr, &im.mem) != VK_SUCCESS) return false;
+            im.memOff = 0;
+            im.memSize = 0;
+        }
+        vkBindImageMemory(dev, im.img, im.mem, im.memOff);
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = im.img;
         vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
@@ -888,7 +933,10 @@ struct VulkanRenderer::Impl {
     void DestroyImage(Image& im) {
         if (im.view) vkDestroyImageView(dev, im.view, nullptr);
         if (im.img) vkDestroyImage(dev, im.img, nullptr);
-        if (im.mem) vkFreeMemory(dev, im.mem, nullptr);
+        if (im.mem) {
+            if (im.memSize) poolFree[PoolKey(im.memType, im.memSize)].push_back({im.mem, im.memOff});
+            else vkFreeMemory(dev, im.mem, nullptr);
+        }
         im = Image{};
     }
 
@@ -1207,6 +1255,9 @@ struct VulkanRenderer::Impl {
             if (set1Layout) vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
             if (fence) vkDestroyFence(dev, fence, nullptr);
             if (cmdPool) vkDestroyCommandPool(dev, cmdPool, nullptr);
+            for (auto& pb : poolBlocks) vkFreeMemory(dev, pb.mem, nullptr);
+            poolBlocks.clear();
+            poolFree.clear();
             vkDestroyDevice(dev, nullptr);
         }
         if (inst) vkDestroyInstance(inst, nullptr);
