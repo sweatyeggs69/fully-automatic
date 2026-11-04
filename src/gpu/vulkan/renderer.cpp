@@ -752,6 +752,11 @@ struct VulkanRenderer::Impl {
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
+    // Fetches whose extent cannot be bounded copy from their address to the end of the fetch constant's range.
+    // Meshes of one vertex pool start at different offsets but end at the same place, so one copy per range end
+    // (from the lowest start seen so far) serves all of them.
+    struct UnbCopy { uint32_t start; VkDeviceSize at; };
+    std::unordered_map<uint64_t, UnbCopy> unbCache;
     std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     int drawsTraced = 0;
@@ -983,6 +988,7 @@ struct VulkanRenderer::Impl {
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
+        unbCache.clear();
         lastConstsOff = ~0ull;
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
@@ -1955,6 +1961,27 @@ struct VulkanRenderer::Impl {
                 if (seenUnb.size() < 60 && seenUnb.insert(dc.vsHash ^ (uint64_t(s) << 56)).second)
                     std::fprintf(stderr, "[vbunb] vs %016llx slot %u: why 0x%x fetch words %u, indices %zu\n",
                                  (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, hd.indices.size());
+            }
+            if (!vs->info.vfetchStride[s]) {
+                const uint64_t endKey = uint64_t(vf.address) + uint64_t(words) * 4;
+                auto uit = unbCache.find(endKey);
+                VkDeviceSize at;
+                if (uit != unbCache.end() && uit->second.start <= vf.address) {
+                    at = uit->second.at + (vf.address - uit->second.start);
+                } else {
+                    const uint8_t* src = mem.HostPtr(vf.address, words * 4);
+                    if (!src) continue;
+                    at = RingAlloc(words * 4, 16, flushed);
+                    if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
+                    std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
+                    prof::Add(prof::kVbBytes, uint64_t(words) * 4);
+                    prof::Add(prof::kVbUnbounded, uint64_t(words) * 4);
+                    unbCache[endKey] = {vf.address, at};
+                }
+                sys.vf[s][0] = uint32_t(at / 4);
+                sys.vf[s][1] = vf.endian;
+                sys.vf[s][2] = words;
+                continue;
             }
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
