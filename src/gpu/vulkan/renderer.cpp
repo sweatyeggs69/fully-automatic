@@ -17,6 +17,7 @@
 #include <map>
 #include <set>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -335,7 +336,7 @@ struct Image {
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t w = 0, h = 0, layers = 1;
+    uint32_t w = 0, h = 0, layers = 1, levels = 1;
 };
 
 struct RenderTarget {
@@ -698,12 +699,33 @@ struct VulkanRenderer::Impl {
     std::vector<uint64_t> probeLastDraw;           // per point: that draw's number
     std::set<std::pair<uint64_t, uint64_t>> probeTraced;  // (vs, ps) pairs whose full trace was already printed
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
-    bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount)); }
+    // FA_RENDER_DUMP_FRAME=N dumps swap N (all resolves, textures and targets), restricted to draws
+    // A..B of that frame with FA_RENDER_DUMP_DRAWS=A-B (draw numbers count from 0 in each frame).
+    // FA_RENDER_DUMP=dir is still required. This reaches the 3D menu without dumping GBs.
+    int64_t dumpFrameSel = -1;
+    uint64_t dumpDrawLo = 0, dumpDrawHi = ~0ull, drawInFrame = 0;
+    std::set<uint32_t> dumpedTexBases;
+    bool DumpFrame() const {
+        if (!dumpDir) return false;
+        if (dumpFrameSel >= 0) return uint64_t(dumpFrameSel) == frame;
+        return frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount);
+    }
+    bool DumpDraw() const {
+        if (!DumpFrame()) return false;
+        if (dumpFrameSel >= 0) return drawInFrame >= dumpDrawLo && drawInFrame <= dumpDrawHi;
+        return true;
+    }
 
     Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {
         const char* d = std::getenv("FA_RENDER_DUMP");
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_FRAME")) dumpFrameSel = std::strtoll(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_DRAWS")) {
+            char* e = nullptr;
+            dumpDrawLo = std::strtoull(c, &e, 10);
+            dumpDrawHi = (e && *e == '-') ? std::strtoull(e + 1, nullptr, 10) : dumpDrawLo;
+        }
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
         if (const char* c = std::getenv("FA_RENDER_PROBE")) {
             char* e = nullptr;
@@ -777,13 +799,13 @@ struct VulkanRenderer::Impl {
     }
 
     bool CreateImage(Image& im, VkFormat fmt, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags usage, bool cube,
-                     VkImageAspectFlags aspect, const VkComponentMapping* swz = nullptr) {
+                     VkImageAspectFlags aspect, const VkComponentMapping* swz = nullptr, uint32_t levels = 1) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = fmt;
         ci.extent = {w, h, 1};
-        ci.mipLevels = 1;
+        ci.mipLevels = levels;
         ci.arrayLayers = layers;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -804,12 +826,13 @@ struct VulkanRenderer::Impl {
         vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
         vi.format = fmt;
         if (swz) vi.components = *swz;
-        vi.subresourceRange = {aspect, 0, 1, 0, layers};
+        vi.subresourceRange = {aspect, 0, levels, 0, layers};
         if (vkCreateImageView(dev, &vi, nullptr, &im.view) != VK_SUCCESS) return false;
         im.format = fmt;
         im.w = w;
         im.h = h;
         im.layers = layers;
+        im.levels = levels;
         return true;
     }
     void DestroyImage(Image& im) {
@@ -836,7 +859,7 @@ struct VulkanRenderer::Impl {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
     }
-    void ImageToGeneral(VkImage img, VkImageAspectFlags aspect, uint32_t layers) {
+    void ImageToGeneral(VkImage img, VkImageAspectFlags aspect, uint32_t layers, uint32_t levels = 1) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = 0;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -844,7 +867,7 @@ struct VulkanRenderer::Impl {
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = img;
-        b.subresourceRange = {aspect, 0, 1, 0, layers};
+        b.subresourceRange = {aspect, 0, levels, 0, layers};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
     }
@@ -1287,18 +1310,21 @@ struct VulkanRenderer::Impl {
     // ---- textures ----------------------------------------------------------------------------
     VkSampler GetSampler(const TextureFetch& t) {
         uint64_t key = uint64_t(t.magFilter & 1) | (uint64_t(t.minFilter & 1) << 1) | (uint64_t(t.clamp[0]) << 2) |
-                       (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11);
+                       (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11) |
+                       (uint64_t(t.mipFilter & 3) << 14);
         auto it = samplers.find(key);
         if (it != samplers.end()) return it->second;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = (t.magFilter & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         si.minFilter = (t.minFilter & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        // Mip filter 0 point, 1 linear, 2 base map only. Images only hold the levels that were decoded,
+        // so the LOD clamps to their last level.
+        si.mipmapMode = t.mipFilter == 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         si.addressModeU = AddressMode(t.clamp[0], mirrorClampEdge);
         si.addressModeV = AddressMode(t.clamp[1], mirrorClampEdge);
         si.addressModeW = AddressMode(t.clamp[2], mirrorClampEdge);
         si.borderColor = t.borderColor == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-        si.maxLod = 0.0f;
+        si.maxLod = t.mipFilter == 2 ? 0.0f : 16.0f;
         VkSampler s = VK_NULL_HANDLE;
         Check(vkCreateSampler(dev, &si, nullptr, &s), "vkCreateSampler");
         samplers[key] = s;
@@ -1312,14 +1338,31 @@ struct VulkanRenderer::Impl {
         TextureFetch t = ParseTextureFetch(d);
         sampler = GetSampler(t);
         Image& fallback = cube ? dummyCube : dummy2D;
-        if (!t.IsTexture() || !t.base || !GetHostFormatInfo(t.format).supported) return fallback.view;
+        // Every fall back to the black dummy texture is logged once per (reason, format, size),
+        // since a black building or shadow means a texture that never made it to the GPU.
+        auto fell = [&](const char* why) -> VkImageView {
+            static std::set<uint64_t> seen;
+            static int logged = 0;
+            uint64_t k = (uint64_t(t.format) << 40) ^ (uint64_t(t.width) << 20) ^ t.height ^ (uint64_t(t.dimension) << 56) ^
+                         (uint64_t(why[0]) << 48) ^ (uint64_t(why[1]) << 32);
+            if (logged < 80 && seen.insert(k).second) {
+                logged++;
+                std::fprintf(stderr, "[render] texture slot %u falls back to black (%s): type %u fmt %u %ux%u dim %u base %08x %s | %08x %08x %08x %08x %08x %08x\n",
+                             slot, why, t.type, t.format, t.width, t.height, t.dimension, t.base, t.tiled ? "tiled" : "linear",
+                             d[0], d[1], d[2], d[3], d[4], d[5]);
+            }
+            return fallback.view;
+        };
+        if (!t.IsTexture()) return fell("not a texture fetch");
+        if (!t.base) return fell("no base address");
+        if (!GetHostFormatInfo(t.format).supported) return fell("unsupported format");
         if (cube != (t.dimension == 3)) {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
-            if (cube || t.dimension == 3) return fallback.view;
+            if (cube || t.dimension == 3) return fell("dimension mismatch");
         }
         if (snapEnabled && !cube && !snaps.empty())
             if (VkImageView sv = SnapView(t)) return sv;
-        uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
+        uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
         uint32_t size = HostTextureByteSize(t);
@@ -1328,22 +1371,49 @@ struct VulkanRenderer::Impl {
         tex.guestSize = size;
         if (!pendingKeys.empty() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
         const uint8_t* src = mem.HostPtr(t.base, size);
+        std::vector<uint8_t> padded;
+        if (!src) {
+            // The padded tile footprint can run past the end of the allocation holding the
+            // texture: use what is mapped and zero fill the rest.
+            for (uint32_t part = size; part > 4096 && !src;) {
+                part = (part / 2) & ~4095u;
+                if (!part) break;
+                const uint8_t* q = mem.HostPtr(t.base, part);
+                if (q) {
+                    // Grow back toward the full size to find the largest mapped prefix.
+                    uint32_t lo = part, hi = size;
+                    while (hi - lo > 4096) {
+                        uint32_t mid = (lo + (hi - lo) / 2) & ~4095u;
+                        if (mid == lo) break;
+                        if (mem.HostPtr(t.base, mid)) lo = mid; else hi = mid;
+                    }
+                    padded.assign(size, 0);
+                    std::memcpy(padded.data(), mem.HostPtr(t.base, lo), lo);
+                    src = padded.data();
+                }
+            }
+        }
         if (!src) {
             tex.validatedGen = generation;
-            return tex.ok ? tex.image.view : fallback.view;
+            return tex.ok ? tex.image.view : fell("guest memory not mapped");
         }
         uint64_t h;
         {
             prof::Scope ps_(prof::kTexCheck);
             h = HashBytes(src, size);
         }
+        // Mip levels 1.. live at the mip address. They are optional: when that memory is not
+        // readable the texture is uploaded with its base level only.
+        const uint32_t mipBytes = HostMipByteSize(t);
+        const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
+        if (mipSrc) h = h * 0x9E3779B97F4A7C15ull + HashBytes(mipSrc, mipBytes) + 1;
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
 
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
-        if (!DecodeTextureHost(t, src, ht)) return fallback.view;
+        if (!DecodeTextureHost(t, src, ht, mipSrc)) return fell("decode failed");
         if (prof::g_enabled) {
             static uint64_t n = 0;
             static uint64_t decNs[64] = {};
@@ -1357,7 +1427,7 @@ struct VulkanRenderer::Impl {
         }
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
-                       tex.image.layers != ht.layers;
+                       tex.image.layers != ht.layers || tex.image.levels != ht.levels;
         EndRendering();
         if (needNew) {
             if (tex.ok) garbageImages.push_back(tex.image);
@@ -1372,12 +1442,12 @@ struct VulkanRenderer::Impl {
             }
             if (!CreateImage(tex.image, fmt, ht.width, ht.height, ht.layers,
                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, ht.layers == 6,
-                             VK_IMAGE_ASPECT_COLOR_BIT, &cm))
+                             VK_IMAGE_ASPECT_COLOR_BIT, &cm, ht.levels))
                 return fallback.view;
-            ImageToGeneral(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, ht.layers);
+            ImageToGeneral(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, ht.layers, ht.levels);
         }
         // Stage the texels (RGBA32F -> RGBA16F when that is the host format).
-        size_t texels = size_t(ht.width) * ht.height * ht.layers;
+        size_t texels = ht.data.size() / (ht.isFloat ? 16 : 4);  // all layers and levels
         size_t bytes = texels * (fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16);
         if (bytes > ring.size / 2) return fallback.view;
         bool flushed;
@@ -1394,11 +1464,30 @@ struct VulkanRenderer::Impl {
             std::memcpy(dst, ht.data.data(), bytes);
         }
         Barrier();
-        VkBufferImageCopy bic{};
-        bic.bufferOffset = at;
-        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, ht.layers};
-        bic.imageExtent = {ht.width, ht.height, 1};
-        vkCmdCopyBufferToImage(cmd, ring.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
+        {
+            const VkDeviceSize texelBytes = fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16;
+            VkBufferImageCopy regions[16];
+            uint32_t nr = 0;
+            if (ht.levels <= 1) {
+                regions[nr] = VkBufferImageCopy{};
+                regions[nr].bufferOffset = at;
+                regions[nr].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, ht.layers};
+                regions[nr].imageExtent = {ht.width, ht.height, 1};
+                nr++;
+            } else {  // mip chains are 2D, one layer: levels are stored back to back
+                VkDeviceSize off = at;
+                for (uint32_t m = 0; m < ht.levels && nr < 16; m++) {
+                    const uint32_t lw = std::max(1u, ht.width >> m), lh = std::max(1u, ht.height >> m);
+                    regions[nr] = VkBufferImageCopy{};
+                    regions[nr].bufferOffset = off;
+                    regions[nr].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1};
+                    regions[nr].imageExtent = {lw, lh, 1};
+                    nr++;
+                    off += VkDeviceSize(lw) * lh * texelBytes;
+                }
+            }
+            vkCmdCopyBufferToImage(cmd, ring.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
+        }
         Barrier();
         tex.contentHash = h;
         tex.guestBase = t.base;
@@ -1783,19 +1872,20 @@ struct VulkanRenderer::Impl {
         vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
         stats.draws++;
+        drawInFrame++;
 
-        if (drawsTraced < opt.traceDraws || DumpFrame()) {
+        if (drawsTraced < opt.traceDraws || DumpDraw()) {
             drawsTraced++;
             std::fprintf(stderr,
-                         "[render] frame %llu draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
+                         "[render] frame %llu draw %llu (#%llu in frame): prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), hd.indices.size(),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
-            if (DumpFrame()) TraceInputs(regs, vs, ps, sys);
+            if (DumpDraw()) TraceInputs(regs, vs, ps, sys);
         }
-        if (DumpFrame()) {
+        if (DumpDraw()) {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
         }
@@ -1916,6 +2006,28 @@ struct VulkanRenderer::Impl {
                          s, t.type, t.format, t.width, t.height, t.depth, t.dimension, t.base, t.pitch,
                          t.tiled ? "tiled" : "linear", t.endian, t.swizzle, t.clamp[0], t.clamp[1], t.magFilter, t.minFilter,
                          d[0], d[1], d[2], d[3], d[4], d[5]);
+            if (t.IsTexture() && t.mipMax) {
+                const uint32_t levels = HostMipLevels(t), mb = HostMipByteSize(t);
+                std::fprintf(stderr, "[render]     mips: filter %u min %u max %u packed %d mip addr %08x -> %u host levels, %u bytes", t.mipFilter,
+                             t.mipMin, t.mipMax, t.packedMips ? 1 : 0, t.mipBase, levels, mb);
+                const uint8_t* ms = mb ? mem.HostPtr(t.mipBase, mb) : nullptr;
+                const uint8_t* bs = levels > 1 ? mem.HostPtr(t.base, HostTextureByteSize(t)) : nullptr;
+                HostTexture ht;
+                if (ms && bs && DecodeTextureHost(t, bs, ht, ms) && !ht.isFloat && ht.levels > 1) {
+                    for (uint32_t m = 0, off = 0; m < ht.levels; m++) {
+                        const uint32_t lw = std::max(1u, ht.width >> m), lh = std::max(1u, ht.height >> m);
+                        double sum[4] = {};
+                        for (size_t i = 0; i < size_t(lw) * lh; i++)
+                            for (int c = 0; c < 4; c++) sum[c] += ht.data[off + i * 4 + c];
+                        const double n = double(lw) * lh * 255.0;
+                        std::fprintf(stderr, " | L%u %ux%u mean %.3f %.3f %.3f %.3f", m, lw, lh, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+                        off += lw * lh * 4;
+                    }
+                } else if (mb && !ms) {
+                    std::fprintf(stderr, " (mip memory not mapped)");
+                }
+                std::fprintf(stderr, "\n");
+            }
             // The texture as the CPU decoder sees it in guest memory, plus whether each row of
             // blocks is made of identical blocks (a sign of degenerate source data).
             static int texDumps = 0;
@@ -1931,7 +2043,7 @@ struct VulkanRenderer::Impl {
                     std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir ? dumpDir : ".", (unsigned long long)frame,
                                   t.base, t.format, t.width, t.height);
                     for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
-                    if (dumpDir && texDumps < 400) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
+                    if (dumpDir && texDumps < 400 && dumpedTexBases.insert(t.base).second) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
                     uint32_t constRows = 0;
                     for (uint32_t y = 0; y < t.height; y++) {
                         const uint8_t* row = &rgba[size_t(y) * t.width * 4];
@@ -1942,6 +2054,23 @@ struct VulkanRenderer::Impl {
                     std::fprintf(stderr, "[render]     decoded: %u of %u rows are one colour; raw:", constRows, t.height);
                     for (int i = 0; i < 32; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", src[i]);
                     std::fprintf(stderr, "\n");
+                }
+            } else if (t.IsTexture() && t.base && GetHostFormatInfo(t.format).supported) {
+                // Cube, 3D, stacked and the float / compressed-normal formats: mean of the host decode.
+                const uint8_t* src = mem.HostPtr(t.base, HostTextureByteSize(t));
+                HostTexture ht;
+                if (!src) {
+                    std::fprintf(stderr, "[render]     (guest memory not mapped for %u bytes)\n", HostTextureByteSize(t));
+                } else if (DecodeTextureHost(t, src, ht)) {
+                    double sum[4] = {};
+                    const size_t n = size_t(ht.width) * ht.height * ht.layers;
+                    for (size_t i = 0; i < n; i++)
+                        for (int c = 0; c < 4; c++) {
+                            if (ht.isFloat) { float f; std::memcpy(&f, &ht.data[(i * 4 + c) * 4], 4); sum[c] += f; }
+                            else sum[c] += ht.data[i * 4 + c] / 255.0;
+                        }
+                    std::fprintf(stderr, "[render]     host mean rgba %.3f %.3f %.3f %.3f (%u layers%s)\n", sum[0] / n, sum[1] / n, sum[2] / n,
+                                 sum[3] / n, ht.layers, ht.isFloat ? ", float" : "");
                 }
             }
         }
@@ -2335,6 +2464,8 @@ struct VulkanRenderer::Impl {
             std::fprintf(stderr, "\n");
         }
         frame++;
+        drawInFrame = 0;
+        dumpedTexBases.clear();
     }
 };
 
