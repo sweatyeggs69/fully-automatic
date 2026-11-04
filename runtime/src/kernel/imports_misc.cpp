@@ -66,3 +66,40 @@ FA_IMPORT(HalReturnToFirmware) { std::fflush(stderr); std::_Exit(0); }
 FA_IMPORT(XamLoaderTerminateTitle) { std::fflush(stderr); std::_Exit(0); }
 
 FA_IMPORT(XexCheckExecutablePrivilege) { ret32(ctx, 0); }
+
+// ---- code page conversion (the game only uses ASCII/Latin-1 text) -----------------------
+
+// (wchar_t* out, max_bytes, ULONG* bytes_written, const char* in, in_bytes)
+FA_IMPORT(RtlMultiByteToUnicodeN) {
+    uint32_t out = arg32(ctx, 0), max_bytes = arg32(ctx, 1), written = arg32(ctx, 2);
+    uint32_t in = arg32(ctx, 3), in_bytes = arg32(ctx, 4);
+    uint32_t n = in_bytes < max_bytes / 2 ? in_bytes : max_bytes / 2;
+    for (uint32_t i = 0; i < n; ++i) st16(out + i * 2, ld8(in + i));
+    if (written) st32(written, n * 2);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+// (ULONG* bytes_needed, const char* in, in_bytes)
+FA_IMPORT(RtlMultiByteToUnicodeSize) {
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), arg32(ctx, 2) * 2);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+// (char* out, max_bytes, ULONG* bytes_written, const wchar_t* in, in_bytes); non-Latin-1 becomes '?'
+FA_IMPORT(RtlUnicodeToMultiByteN) {
+    uint32_t out = arg32(ctx, 0), max_bytes = arg32(ctx, 1), written = arg32(ctx, 2);
+    uint32_t in = arg32(ctx, 3), in_bytes = arg32(ctx, 4);
+    uint32_t n = in_bytes / 2 < max_bytes ? in_bytes / 2 : max_bytes;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t c = ld16(in + i * 2);
+        st8(out + i, c < 0x100 ? uint8_t(c) : '?');
+    }
+    if (written) st32(written, n);
+    ret32(ctx, STATUS_SUCCESS);
+}
+
+// (ULONG* bytes_needed, const wchar_t* in, in_bytes)
+FA_IMPORT(RtlUnicodeToMultiByteSize) {
+    if (arg32(ctx, 0)) st32(arg32(ctx, 0), arg32(ctx, 2) / 2);
+    ret32(ctx, STATUS_SUCCESS);
+}

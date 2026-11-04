@@ -47,6 +47,9 @@ PPC_EXTERN_FUNC(XamContentCreateEnumerator);
 PPC_EXTERN_FUNC(XamShowDeviceSelectorUI);
 PPC_EXTERN_FUNC(XamContentCreateDeviceEnumerator);
 PPC_EXTERN_FUNC(XamEnumerate);
+PPC_EXTERN_FUNC(XamUserWriteProfileSettings);
+PPC_EXTERN_FUNC(RtlMultiByteToUnicodeN);
+PPC_EXTERN_FUNC(RtlUnicodeToMultiByteN);
 PPC_EXTERN_FUNC(XamNotifyCreateListener);
 PPC_EXTERN_FUNC(XNotifyGetNext);
 PPC_EXTERN_FUNC(XamContentGetDeviceData);
@@ -202,6 +205,19 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
         CHECK(ld32(buf + 4) == 1 && ld16(buf + 8) == 'S' && std::memcmp(host(buf + 0x108), "slot0", 6) == 0);
         CHECK(K(ctx, XamContentDelete, 0, data, 0) == 0);
         CHECK(K(ctx, XamContentCreate, 0, root, data, 3, disp, 0, 0) == 2);
+    }
+
+    CHECK(K(ctx, XamUserWriteProfileSettings, 0x534507D5, 0, 1, s + 0x500, 0) == 0);
+    // ---- code page conversion
+    {
+        uint32_t in = s + 0x500, out = s + 0x520, w = s + 0x540;
+        std::memcpy(host(in), "Hi!", 4);
+        CHECK(K(ctx, RtlMultiByteToUnicodeN, out, 64, w, in, 3) == 0);
+        CHECK(ld32(w) == 6 && ld16(out) == 'H' && ld16(out + 4) == '!');
+        CHECK(K(ctx, RtlMultiByteToUnicodeN, out, 4, w, in, 3) == 0 && ld32(w) == 4);  // truncated to buffer
+        st16(out, 'o'); st16(out + 2, 0x20AC);
+        CHECK(K(ctx, RtlUnicodeToMultiByteN, in, 16, w, out, 4) == 0 && ld32(w) == 2);
+        CHECK(ld8(in) == 'o' && ld8(in + 1) == '?');
     }
 
     // ---- wide printf: %d %s (wide) %hs (narrow) %x %5.2f %I64d, args in 8-byte slots.
