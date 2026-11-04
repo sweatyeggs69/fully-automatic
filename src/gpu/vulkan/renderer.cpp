@@ -254,6 +254,7 @@ struct RenderTarget {
     Image image;
     bool depth = false;
     uint32_t xeFormat = 0;
+    uint32_t base = 0;  // EDRAM tile
 };
 
 struct Shader {
@@ -499,6 +500,7 @@ struct VulkanRenderer::Impl {
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
+        curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
         lastConstsOff = ~0ull;
@@ -839,6 +841,7 @@ struct VulkanRenderer::Impl {
         RenderTarget& rt = rts[key];
         rt.depth = depth;
         rt.xeFormat = xeFormat;
+        rt.base = base & 0xFFF;
         uint32_t bpp = depth ? 4 : (IsRt64bpp(xeFormat) ? 8 : 4);
         uint32_t rows = std::clamp<uint32_t>(kEdramBytes / (pitch * bpp), 16, 2048);
         rows = (rows + 15) & ~15u;
@@ -1146,6 +1149,22 @@ struct VulkanRenderer::Impl {
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
+            // Views first: an upload can flush the batch, which resets the descriptor pool.
+            VkDescriptorImageInfo ii[64];
+            VkWriteDescriptorSet w[64];
+            uint32_t nw = 0;
+            for (uint32_t s = 0; s < 32; s++) {
+                if (!(texUsed & (1u << s))) continue;
+                bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
+                VkSampler smp;
+                VkImageView view = GetTexture(regs, s, cube, smp);
+                ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
+                w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w[nw].dstBinding = cube ? 32 + s : s;
+                w[nw].descriptorCount = 1;
+                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                nw++;
+            }
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
@@ -1157,22 +1176,9 @@ struct VulkanRenderer::Impl {
                 vkAllocateDescriptorSets(dev, &ai, &texSet);
             }
             texSetsUsed++;
-            VkDescriptorImageInfo ii[64];
-            VkWriteDescriptorSet w[64];
-            uint32_t nw = 0;
-            for (uint32_t s = 0; s < 32; s++) {
-                if (!(texUsed & (1u << s))) continue;
-                bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
-                VkSampler smp;
-                VkImageView view = GetTexture(regs, s, cube, smp);
-                ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
-                w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                w[nw].dstSet = texSet;
-                w[nw].dstBinding = cube ? 32 + s : s;
-                w[nw].descriptorCount = 1;
-                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                w[nw].pImageInfo = &ii[nw];
-                nw++;
+            for (uint32_t i = 0; i < nw; i++) {
+                w[i].dstSet = texSet;
+                w[i].pImageInfo = &ii[i];
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
         }
@@ -1338,6 +1344,49 @@ struct VulkanRenderer::Impl {
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
             if (DumpFrame()) TraceInputs(regs, vs, ps, sys);
         }
+        if (DumpFrame()) {
+            for (int i = 0; i < 4; i++)
+                if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
+        }
+    }
+
+    // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
+    void DumpTarget(RenderTarget* rt, VkRect2D r, const char* what) {
+        static int count = 0;
+        if (count >= 300 || !r.extent.width || !r.extent.height) return;
+        uint32_t bpp = VkFormatBytes(rt->image.format);
+        VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
+        EndRendering();
+        if (bytes > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Barrier();
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        bic.imageOffset = {r.offset.x, r.offset.y, 0};
+        bic.imageExtent = {r.extent.width, r.extent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, rt->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        Barrier();
+        SubmitAndWait();
+        Begin();
+        std::vector<uint8_t> rgba(size_t(r.extent.width) * r.extent.height * 4);
+        const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
+        for (size_t i = 0; i < size_t(r.extent.width) * r.extent.height; i++) {
+            float f[4];
+            ReadbackToFloat(rt->image.format, rb + i * bpp, f);
+            for (int c = 0; c < 3; c++) rgba[i * 4 + c] = uint8_t(std::lround(std::clamp(f[c], 0.0f, 1.0f) * 255.0f));
+            rgba[i * 4 + 3] = 255;
+        }
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/f%04llu_%s%05llu_tile%03x_%ux%u.png", dumpDir, (unsigned long long)frame, what,
+                      (unsigned long long)stats.draws.load(), rt->base & 0xFFF, r.extent.width, r.extent.height);
+        WritePng(path, r.extent.width, r.extent.height, rgba.data());
+        count++;
+        for (auto& c : curColor) c = nullptr;
+        curDepth = nullptr;
     }
 
     // Dump frames: what the draw reads (textures, vertex buffers, a few vertices).
