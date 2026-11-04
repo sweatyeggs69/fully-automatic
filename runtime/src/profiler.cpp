@@ -73,13 +73,19 @@ void prof_handler(int, siginfo_t*, void* uc) {
     Sample& s = g_samples[i % kSlots];
     s.seq.store(0, std::memory_order_relaxed);
     s.tid = int32_t(::syscall(SYS_gettid));
-    void* raw[kFrames + 2];
-    int n = backtrace(raw, kFrames + 2);
-    // raw[0] is this handler and raw[1] the signal trampoline; the interrupted pc comes from
-    // the signal context (the trampoline frame's caller entry can be off by one call).
-    s.pc[0] = reinterpret_cast<void*>(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RIP]);
+    // Only unwind from our own code. A tick that lands in a foreign library (SDL, the GPU driver) can sit on
+    // frames without unwind info, where backtrace() faults inside the handler: record just the pc there.
+    extern char __executable_start, etext;
+    const void* rip = reinterpret_cast<void*>(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RIP]);
+    s.pc[0] = const_cast<void*>(rip);
     int k = 1;
-    for (int j = 3; j < n && k < kFrames; ++j) s.pc[k++] = raw[j];
+    if (rip >= static_cast<const void*>(&__executable_start) && rip < static_cast<const void*>(&etext)) {
+        void* raw[kFrames + 2];
+        int n = backtrace(raw, kFrames + 2);
+        // raw[0] is this handler and raw[1] the signal trampoline; the interrupted pc comes from
+        // the signal context (the trampoline frame's caller entry can be off by one call).
+        for (int j = 3; j < n && k < kFrames; ++j) s.pc[k++] = raw[j];
+    }
     s.n = k;
     s.seq.store(i + 1, std::memory_order_release);
     errno = saved;
