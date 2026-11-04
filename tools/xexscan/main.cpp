@@ -72,12 +72,25 @@ int main(int argc, char** argv) {
             for (std::sregex_iterator l(body.begin(), body.end(), re_hex), e2; l != e2; ++l)
                 labels.push_back(uint32_t(std::strtoull(l->str().c_str(), nullptr, 16)));
             ++total;
+            // Where the table is. XenonAnalyse entries put `base` at the lis of the lis/addi pair
+            // that loads the table address (a few instructions before the bctr); hand written
+            // entries put it at the bctr, with the table right behind it (base + 4).
+            size_t table = base + 4;
+            for (size_t a = base; a <= base + 0x20; a += 4) {
+                uint32_t i1, i2;
+                if (!be32(a, i1) || !be32(a + 4, i2)) break;
+                if ((i1 >> 26) == 15 && ((i1 >> 16) & 0x1F) == 0 && (i2 >> 26) == 14 &&
+                    ((i2 >> 21) & 0x1F) == ((i1 >> 21) & 0x1F) && ((i2 >> 16) & 0x1F) == ((i1 >> 21) & 0x1F)) {
+                    table = uint32_t((i1 & 0xFFFF) << 16) + int32_t(int16_t(i2 & 0xFFFF));
+                    break;
+                }
+            }
             bool ok = true;
             for (size_t i = 0; i < labels.size(); i++) {
                 uint32_t w;
-                if (!be32(base + 4 + i * 4, w) || w != labels[i]) {
-                    std::printf("MISMATCH switch 0x%zX entry %zu: toml %08X image %08X\n", base, i, labels[i],
-                                be32(base + 4 + i * 4, w) ? w : 0);
+                if (!be32(table + i * 4, w) || w != labels[i]) {
+                    std::printf("MISMATCH switch 0x%zX (table 0x%zX) entry %zu: toml %08X image %08X\n", base, table, i,
+                                labels[i], be32(table + i * 4, w) ? w : 0);
                     ok = false;
                 }
             }
@@ -87,8 +100,8 @@ int main(int argc, char** argv) {
             size_t extra = 0;
             for (size_t i = labels.size(); i < labels.size() + 32; i++) {
                 uint32_t w;
-                if (!be32(base + 4 + i * 4, w) || !is_code(w) || w + 0x1000 < lo || w > hi + 0x1000) break;
-                std::printf("LONGER? switch 0x%zX: word %zu after the labels is %08X (near the other labels)\n", base, i, w);
+                if (!be32(table + i * 4, w) || !is_code(w) || w + 0x1000 < lo || w > hi + 0x1000) break;
+                std::printf("LONGER? switch 0x%zX (table 0x%zX): word %zu after the labels is %08X (near the other labels)\n", base, table, i, w);
                 ++extra;
             }
             if (extra || !ok) ++bad;
