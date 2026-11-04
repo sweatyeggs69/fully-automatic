@@ -174,6 +174,15 @@ uint16_t FloatToHalf(float f) {
     return uint16_t(sign | (uint32_t(e) << 10) | (m >> 13));
 }
 
+// The fixed-point 16_16 render targets (k_16_16, k_16_16_16_16) hold values in [-32, 32): the shader
+// output is stored as value / 32 in an int16. The host target keeps the real value in a float, so a
+// resolve into a 16-bit texture has to divide by 32 to put the same bits in guest memory.
+// FA_RT1616=0 turns this off (values are then stored as is, clamped to [-1, 1]).
+bool Rt1616Scaled() {
+    static const bool on = [] { const char* e = std::getenv("FA_RT1616"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 VkFormat ColorRtVkFormat(uint32_t f) {
     switch (f) {
         case xe::kRt8888: case xe::kRt8888Gamma: return VK_FORMAT_R8G8B8A8_UNORM;
@@ -237,6 +246,7 @@ void ClearColorFloat(uint32_t rtFormat, uint32_t hi, uint32_t lo, float out[4]) 
             break;
         case xe::kRt16_16:
             out[0] = float(int16_t(hi)) / 32767.0f; out[1] = float(int16_t(hi >> 16)) / 32767.0f;
+            if (Rt1616Scaled()) { out[0] *= 32.0f; out[1] *= 32.0f; }
             break;
         case xe::kRt16_16_16_16Float:
             out[0] = HalfToFloat(uint16_t(lo)); out[1] = HalfToFloat(uint16_t(lo >> 16));
@@ -245,6 +255,7 @@ void ClearColorFloat(uint32_t rtFormat, uint32_t hi, uint32_t lo, float out[4]) 
         case xe::kRt16_16_16_16:
             out[0] = float(int16_t(lo)) / 32767.0f; out[1] = float(int16_t(lo >> 16)) / 32767.0f;
             out[2] = float(int16_t(hi)) / 32767.0f; out[3] = float(int16_t(hi >> 16)) / 32767.0f;
+            if (Rt1616Scaled()) for (int c = 0; c < 4; c++) out[c] *= 32.0f;
             break;
         case xe::kRt32Float: out[0] = xe::AsFloat(hi); break;
         case xe::kRt32_32Float: out[0] = xe::AsFloat(lo); out[1] = xe::AsFloat(hi); break;
@@ -2282,6 +2293,8 @@ struct VulkanRenderer::Impl {
                 // Destination offset: the resolve rectangle's position in EDRAM.
                 std::vector<float>& px = resolvePx;  // reused: a fresh 15 MB vector per resolve was costly
                 px.resize(size_t(w) * h * 4);
+                const bool fix1616 = !isDepth && Rt1616Scaled() && (srcFormat == xe::kRt16_16 || srcFormat == xe::kRt16_16_16_16) &&
+                                     d.format >= 24 && d.format <= 26;
                 auto toFloat = [&](size_t i) {
                     if (isDepth) {
                         float z;
@@ -2293,6 +2306,8 @@ struct VulkanRenderer::Impl {
                         px[i * 4 + 3] = 1.0f;
                     } else {
                         ReadbackToFloat(src->image.format, rb + i * bpp, &px[i * 4]);
+                        if (fix1616)
+                            for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
                     }
                 };
                 uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);

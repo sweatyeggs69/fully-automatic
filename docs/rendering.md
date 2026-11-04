@@ -47,6 +47,7 @@ the window shows the texture debug view.
 | `FA_RENDER_PROBE=trigger,x,y,...` | Like `FA_RENDER_PROBE` but armed by `FA_RENDER_DUMP_TRIGGER`: probes the frame the trigger dumps |
 | `FA_RENDER_DUMP_MAXPNG=N` | Raise the cap (default 300) on per-draw target PNGs in a dump |
 | `FA_RENDER_DUMP_AFTER=secs` | With `FA_RENDER_DUMP`: dump the first frame at least that many seconds after start |
+| `FA_RT1616=0` | Store the fixed-point 16_16 render targets as is on resolve. Default: resolves into 16-bit texture formats divide by 32 (the hardware range of these targets is [-32, 32)) |
 | `FA_MIPS=0` | Sample only the base level of every texture (default: mip levels 1.. are read from the fetch constant's mip address) |
 | `FA_RENDER_DUMP_FRAME=N` | With `FA_RENDER_DUMP`: dump only swap N (all its resolves, targets and textures) instead of the early frames; the 3D menu is around swap 600+ |
 | `FA_RENDER_DUMP_DRAWS=A-B` | With `FA_RENDER_DUMP_FRAME`: trace and dump only draws A..B of that frame (numbered from 0). Texture lines carry a mean colour for every format, including cube, 3D and compressed ones |
