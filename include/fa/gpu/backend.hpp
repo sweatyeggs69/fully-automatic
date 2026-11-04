@@ -46,6 +46,9 @@ public:
     // Present: the game finished a frame (VdSwap / PM4 XE_SWAP). VdSwap loads the front
     // buffer's texture fetch constant into fetch slot 0 (regs 0x4800..0x4805) first.
     virtual void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height, const RegisterFile& regs) = 0;
+    // The command stream is about to make GPU progress visible to the guest (fence, memory write,
+    // interrupt): backends that defer writes into guest memory must finish them now.
+    virtual void Sync() {}
 };
 
 }  // namespace fa::gpu

@@ -171,6 +171,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         }
 
         case pm4::kInterrupt:
+            backend_.Sync();
             if (interrupt_) interrupt_(n ? d[0] : 0);
             break;
 
@@ -203,6 +204,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (n < 6) break;
             uint32_t value = (d[0] & 0x10) ? mem_.Read32(d[1] & ~3u) : (d[1] < kRegisterCount ? regs_[d[1]] : 0);
             if (Compare(d[0], value & d[3], d[2])) {
+                backend_.Sync();
                 if (d[0] & 0x100) mem_.Write32(d[4] & ~3u, d[5]);
                 else SetReg(d[4], d[5]);
             }
@@ -210,10 +212,12 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         }
 
         case pm4::kMemWrite:
+            backend_.Sync();
             for (uint32_t i = 1; i < n; ++i) mem_.Write32((d[0] & ~3u) + (i - 1) * 4, d[i]);
             break;
 
         case pm4::kEventWriteShd:  // fence / timestamp write
+            backend_.Sync();
             if (n >= 3) mem_.Write32(d[1] & ~3u, d[2]);
             break;
 

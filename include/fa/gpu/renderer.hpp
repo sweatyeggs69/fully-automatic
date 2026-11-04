@@ -46,6 +46,7 @@ public:
     void Draw(const DrawCall& draw, const RegisterFile& regs) override;
     void Resolve(const RegisterFile& regs) override;
     void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height, const RegisterFile& regs) override;
+    void Sync() override;
 
     // Submits pending GPU work and waits for it (tests).
     void Flush();
