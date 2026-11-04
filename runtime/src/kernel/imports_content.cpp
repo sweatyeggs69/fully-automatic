@@ -11,6 +11,7 @@
 #include "fa/hle/vfs.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -319,6 +320,12 @@ FA_IMPORT(XamShowDeviceSelectorUI) {
 // Guest va_list is a pointer to 8-byte big-endian slots; 32-bit values sit in the low half.
 namespace {
 
+// FA_TRACE_PRINTF=1 logs every vswprintf format and result.
+bool printf_trace() {
+    static const bool on = std::getenv("FA_TRACE_PRINTF") != nullptr;
+    return on;
+}
+
 struct VaList {
     uint32_t p;
     uint64_t next() { uint64_t v = ld64(p); p += 8; return v; }
@@ -459,6 +466,12 @@ FA_IMPORT(vswprintf) {
     uint32_t dst = arg32(ctx, 0);
     std::u16string s;
     if (!dst || !format_wide(arg32(ctx, 1), arg32(ctx, 2), s)) { ret32(ctx, uint32_t(-1)); return; }
+    if (printf_trace()) {
+        std::string f, o;
+        for (uint32_t i = arg32(ctx, 1); ld16(i); i += 2) f += char(ld16(i) < 128 ? ld16(i) : '?');
+        for (char16_t c : s) o += char(c < 128 ? c : '?');
+        std::fprintf(stderr, "vswprintf fmt=\"%s\" -> \"%s\"\n", f.c_str(), o.c_str());
+    }
     for (size_t i = 0; i < s.size(); ++i) st16(dst + uint32_t(i) * 2, s[i]);
     st16(dst + uint32_t(s.size()) * 2, 0);
     ret32(ctx, uint32_t(s.size()));
