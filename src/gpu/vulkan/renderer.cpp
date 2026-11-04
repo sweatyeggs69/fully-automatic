@@ -1449,8 +1449,10 @@ struct VulkanRenderer::Impl {
             const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
             if (!reuse) WatchBytes("texture bind", t.base, HostTextureByteSize(t), "(will recheck memory)");  // reused binds are not logged
         }
-        if (snapEnabled && !cube && !snaps.empty())
+        if (snapEnabled && !cube && !snaps.empty()) {
+            prof::Scope pn_(prof::kDtSnap);
             if (VkImageView sv = SnapView(t)) return sv;
+        }
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
@@ -1773,7 +1775,11 @@ struct VulkanRenderer::Impl {
                 if (!(texUsed & (1u << s))) continue;
                 bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
                 VkSampler smp;
-                VkImageView view = GetTexture(regs, s, cube, smp);
+                VkImageView view;
+                {
+                    prof::Scope pg_(prof::kDtGet);
+                    view = GetTexture(regs, s, cube, smp);
+                }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 w[nw].dstBinding = cube ? 32 + s : s;
@@ -1786,6 +1792,7 @@ struct VulkanRenderer::Impl {
             for (uint32_t i = 0; i < nw && sameSet; i++)
                 sameSet = lastTexKey[i].binding == w[i].dstBinding && lastTexKey[i].smp == ii[i].sampler && lastTexKey[i].view == ii[i].imageView;
             if (!sameSet) {
+            prof::Scope pd_(prof::kDtDesc);
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
