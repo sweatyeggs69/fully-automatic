@@ -90,7 +90,10 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
     haveBest_ = false;
 
     // Skip the decode while the window still has not shown the previous frame.
-    if (!enabled_.load(std::memory_order_relaxed) || mailbox_.Pending()) return;
+    // FA_RENDER_DUMP: the front buffer after every 30th frame (matches the renderer's dump frames).
+    static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
+    const bool dumpThis = dumpDir && *dumpDir && (seq - 1) % 30 == 0 && seq <= 30 * 12;
+    if (!enabled_.load(std::memory_order_relaxed) || (mailbox_.Pending() && !dumpThis)) return;
 
     Frame f;
     f.seq = seq;
@@ -119,19 +122,14 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
                          fb.swizzle);
         }
         fbOk = DecodeFetch(fb, f);
-        // FA_RENDER_DUMP=<dir>: the decoded front buffer of every 30th presented swap (first 20).
-        static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
-        static int dumped = 0;
-        static uint64_t lastDump = 0;
-        if (fbOk && dumpDir && *dumpDir && dumped < 20 && (dumped == 0 || seq >= lastDump + 30)) {
+        if (fbOk && dumpThis) {
             char path[512];
-            std::snprintf(path, sizeof path, "%s/frontbuffer_swap%05llu_%08x.png", dumpDir, (unsigned long long)seq, fb.base);
+            std::snprintf(path, sizeof path, "%s/f%04llu_frontbuffer_%08x.png", dumpDir, (unsigned long long)(seq - 1), fb.base);
             std::vector<uint8_t> opaque = f.rgba;
             for (size_t i = 3; i < opaque.size(); i += 4) opaque[i] = 255;
             WritePng(path, f.width, f.height, opaque.data());
-            dumped++;
-            lastDump = seq;
         }
+        if (dumpThis && mailbox_.Pending()) return;
         if (fbOk) {
             f.source = "frontbuffer";
             if (mode_ == Mode::Auto && !HasContent(f.rgba)) fbOk = false;

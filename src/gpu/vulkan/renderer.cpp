@@ -344,8 +344,16 @@ struct VulkanRenderer::Impl {
     std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     int drawsTraced = 0;
+    uint64_t frame = 0;  // swaps seen
+    // FA_RENDER_DUMP=<dir>: every 30th frame (12 of them) gets all its draws logged and all its
+    // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
+    const char* dumpDir = nullptr;
+    bool DumpFrame() const { return dumpDir && frame % 30 == 0 && frame / 30 < 12; }
 
-    Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {}
+    Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {
+        const char* d = std::getenv("FA_RENDER_DUMP");
+        if (d && *d) dumpDir = d;
+    }
 
     bool Fail(std::string& err, const char* what, VkResult r) {
         char b[256];
@@ -817,16 +825,22 @@ struct VulkanRenderer::Impl {
     // ---- render targets ----------------------------------------------------------------------
     RenderTarget* GetRt(uint32_t base, uint32_t xeFormat, uint32_t pitch, uint32_t msaa, bool depth) {
         pitch = std::clamp<uint32_t>(pitch ? pitch : 1280, 16, 8192);
+        // Formats with the same bits share one image, so a pass that writes k_2_10_10_10 and a
+        // later one that reads the tile as k_2_10_10_10_AS_10_10_10_10 see the same pixels.
+        if (!depth && xeFormat == xe::kRt2_10_10_10As10) xeFormat = xe::kRt2_10_10_10;
+        if (!depth && xeFormat == xe::kRt2_10_10_10FloatAs16) xeFormat = xe::kRt2_10_10_10Float;
+        // Targets are single sampled, and MSAA does not change the key: the game's 4x tiled
+        // scene passes and the 1x passes that follow on the same EDRAM tile share pixels.
+        (void)msaa;
         uint64_t key = uint64_t(base & 0xFFF) | (uint64_t(xeFormat & 0xF) << 12) | (uint64_t(pitch) << 16) |
-                       (uint64_t(msaa & 3) << 32) | (uint64_t(depth) << 34);
+                       (uint64_t(depth) << 34);
         auto it = rts.find(key);
         if (it != rts.end()) return &it->second;
         RenderTarget& rt = rts[key];
         rt.depth = depth;
         rt.xeFormat = xeFormat;
         uint32_t bpp = depth ? 4 : (IsRt64bpp(xeFormat) ? 8 : 4);
-        uint32_t samples = 1u << std::min<uint32_t>(msaa, 2);
-        uint32_t rows = std::clamp<uint32_t>(kEdramBytes / (pitch * bpp * samples), 16, 2048);
+        uint32_t rows = std::clamp<uint32_t>(kEdramBytes / (pitch * bpp), 16, 2048);
         rows = (rows + 15) & ~15u;
         VkFormat fmt = depth ? depthFormat : ColorRtVkFormat(xeFormat);
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1313,12 +1327,12 @@ struct VulkanRenderer::Impl {
         vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
         stats.draws++;
 
-        if (drawsTraced < opt.traceDraws) {
+        if (drawsTraced < opt.traceDraws || DumpFrame()) {
             drawsTraced++;
             std::fprintf(stderr,
-                         "[render] draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
+                         "[render] frame %llu draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
@@ -1488,14 +1502,14 @@ struct VulkanRenderer::Impl {
                 }
                 generation++;
                 static int logged = 0;
-                if (logged++ < std::max(16, opt.traceDraws * 4))
+                if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
-                                 "[render] resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
+                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
                                  "| src %03x/%u surf %08x wo %08x sc %08x vtx %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
-                                 isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
+                                 (unsigned long long)frame, isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
                                  d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
                                  regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
-                DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat);
+                DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
             }
         }
 
@@ -1510,20 +1524,38 @@ struct VulkanRenderer::Impl {
 
     // FA_RENDER_DUMP=<dir>: PNGs of the first resolves (clamped to 0..1), for debugging.
     void DumpResolve(const std::vector<float>& px, uint32_t w, uint32_t h, const ResolveDest& d, uint32_t tile,
-                     uint32_t fmt) {
-        static const char* dir = std::getenv("FA_RENDER_DUMP");
+                     uint32_t fmt, uint32_t dx, uint32_t dy) {
+        if (!DumpFrame()) return;
         static int count = 0;
-        if (!dir || !*dir || count >= 200) return;
+        if (count >= 400) return;
         std::vector<uint8_t> rgba(size_t(w) * h * 4);
         for (size_t i = 0; i < rgba.size(); i++) {
             float v = (i % 4 == 3) ? 1.0f : px[i];  // force opaque so colour shows
             rgba[i] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
         }
         char path[512];
-        std::snprintf(path, sizeof path, "%s/resolve%03d_%08x_fmt%u_from%03x_rt%u_%ux%u.png", dir, count, d.base, d.format,
-                      tile, fmt, w, h);
-        count++;
+        std::snprintf(path, sizeof path, "%s/f%04llu_resolve%03d_%08x_fmt%u_from%03x_rt%u_%ux%u.png", dumpDir,
+                      (unsigned long long)frame, count, d.base, d.format, tile, fmt, w, h);
         WritePng(path, w, h, rgba.data());
+        // What actually landed in guest memory, decoded the way a texture fetch would read it.
+        TextureFetch t;
+        t.type = 2;
+        t.format = d.format;
+        t.endian = d.endian & 3;
+        t.base = d.base;
+        t.pitch = (std::max(d.pitch, 32u) + 31) & ~31u;
+        t.width = std::min(t.pitch, dx + w);
+        t.height = std::max(d.height, dy + h);
+        t.tiled = true;
+        std::vector<uint8_t> dec;
+        const uint8_t* src = mem.HostPtr(d.base, TextureByteSize(t));
+        if (src && GetFormatInfo(t.format).supported && DecodeTexture(t, src, dec)) {
+            for (size_t i = 3; i < dec.size(); i += 4) dec[i] = 255;
+            std::snprintf(path, sizeof path, "%s/f%04llu_resolve%03d_%08x_inmemory_%ux%u.png", dumpDir,
+                          (unsigned long long)frame, count, d.base, t.width, t.height);
+            WritePng(path, t.width, t.height, dec.data());
+        }
+        count++;
     }
 
     void ClearRect(RenderTarget* rt, const RegisterFile& regs, int32_t x, int32_t y, uint32_t w, uint32_t h, bool depth) {
@@ -1558,6 +1590,7 @@ struct VulkanRenderer::Impl {
         SubmitAndWait();
         Begin();
         generation++;
+        frame++;
     }
 };
 
