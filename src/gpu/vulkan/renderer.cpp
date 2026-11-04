@@ -694,6 +694,7 @@ struct VulkanRenderer::Impl {
     // FA_RENDER_PROBE=frame[-last],x,y[,x,y...]: in those frames, after every draw, read back those screen pixels and log
     // the draws that changed it, with their full trace ("who painted this pixel").
     bool probeOn = false;
+    bool probeOnTrigger = false;  // probe the frame the dump trigger fires on
     uint64_t probeFrame = 0, probeFrameEnd = 0;  // inclusive range
     std::vector<std::pair<int, int>> probePts;
     std::vector<std::array<float, 4>> probeLast;   // per point: value after the latest draw covering it
@@ -738,9 +739,15 @@ struct VulkanRenderer::Impl {
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
         if (const char* c = std::getenv("FA_RENDER_PROBE")) {
             char* e = nullptr;
-            probeFrame = std::strtoull(c, &e, 10);
-            probeFrameEnd = probeFrame;
-            if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            if (std::strncmp(c, "trigger", 7) == 0) {  // FA_RENDER_PROBE=trigger,x,y,...: armed by FA_RENDER_DUMP_TRIGGER
+                probeOnTrigger = true;
+                probeFrame = probeFrameEnd = ~0ull;
+                e = const_cast<char*>(c + 7);
+            } else {
+                probeFrame = std::strtoull(c, &e, 10);
+                probeFrameEnd = probeFrame;
+                if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            }
             while (e && *e == ',') {
                 long x = std::strtol(e + 1, &e, 10);
                 if (!e || *e != ',') break;
@@ -1965,7 +1972,8 @@ struct VulkanRenderer::Impl {
     // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
     void DumpTarget(RenderTarget* rt, VkRect2D r, const char* what) {
         static int count = 0;
-        if (count >= 300 || !r.extent.width || !r.extent.height) return;
+        static const int maxPng = [] { const char* e = std::getenv("FA_RENDER_DUMP_MAXPNG"); return e ? std::atoi(e) : 300; }();
+        if (count >= maxPng || !r.extent.width || !r.extent.height) return;
         uint32_t bpp = VkFormatBytes(rt->image.format);
         VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
         EndRendering();
@@ -2483,6 +2491,11 @@ struct VulkanRenderer::Impl {
                 dumpDrawLo = 0;
                 dumpDrawHi = ~0ull;
                 std::fprintf(stderr, "[render] dump trigger: dumping frame %llu\n", (unsigned long long)frame);
+                if (probeOnTrigger && probeOn) {
+                    probeFrame = probeFrameEnd = frame;
+                    probeTraced.clear();
+                    for (auto& v : probeLast) v = {-1.0f, -1.0f, -1.0f, -1.0f};
+                }
             }
         }
         if (dumpDir && dumpAfterSec >= 0.0 &&

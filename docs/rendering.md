@@ -44,6 +44,8 @@ the window shows the texture debug view.
 | `FA_VK_VALIDATION=1` | Enable the Khronos validation layer |
 | `FA_RENDER_DUMP=dir` | Debug dumps for frames 0-5 and every 30th frame: every draw logged with its textures, vertex buffers, blend state and constants; PNGs of the colour target after each draw, each resolve (as rendered and as it decodes from memory), each bound texture and the front buffer |
 | `FA_RENDER_DUMP_TRIGGER=file` | With `FA_RENDER_DUMP`: touch that file while the game runs and the next frame is dumped (checked every 8th swap), then the file is removed. For catching the exact screen someone is looking at |
+| `FA_RENDER_PROBE=trigger,x,y,...` | Like `FA_RENDER_PROBE` but armed by `FA_RENDER_DUMP_TRIGGER`: probes the frame the trigger dumps |
+| `FA_RENDER_DUMP_MAXPNG=N` | Raise the cap (default 300) on per-draw target PNGs in a dump |
 | `FA_RENDER_DUMP_AFTER=secs` | With `FA_RENDER_DUMP`: dump the first frame at least that many seconds after start |
 | `FA_MIPS=0` | Sample only the base level of every texture (default: mip levels 1.. are read from the fetch constant's mip address) |
 | `FA_RENDER_DUMP_FRAME=N` | With `FA_RENDER_DUMP`: dump only swap N (all its resolves, targets and textures) instead of the early frames; the 3D menu is around swap 600+ |
