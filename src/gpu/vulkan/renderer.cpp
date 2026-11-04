@@ -1385,7 +1385,10 @@ struct VulkanRenderer::Impl {
         if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
             const float* f = reinterpret_cast<const float*>(ht.data.data());
             uint16_t* o = reinterpret_cast<uint16_t*>(dst);
-            for (size_t i = 0; i < texels * 4; i++) o[i] = FloatToHalf(f[i]);
+            const size_t n = texels * 4, chunk = 4096;
+            rowPool.Run(uint32_t((n + chunk - 1) / chunk), [&](uint32_t ca, uint32_t cb) {
+                for (size_t i = size_t(ca) * chunk, e = std::min(n, size_t(cb) * chunk); i < e; i++) o[i] = FloatToHalf(f[i]);
+            });
         } else {
             std::memcpy(dst, ht.data.data(), bytes);
         }

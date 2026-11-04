@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 namespace fa::gpu {
 
@@ -340,6 +341,14 @@ static bool DecodeBytesFast(uint32_t f, const uint8_t* b, uint8_t* dst, uint32_t
         case 2: case 8: case 9: px[0][0] = b[0]; px[0][1] = 0; px[0][2] = 0; px[0][3] = 255; break;
         case 10: px[0][0] = b[0]; px[0][1] = b[1]; px[0][2] = 0; px[0][3] = 255; break;
         case 6: case 14: case 50: std::memcpy(px[0], b, 4); break;
+        case 7: case 54: {
+            // 10-bit channels to 8 bits with the same rounding as the float path: floor(v * 255 / 1023 + 0.5).
+            uint32_t v;
+            std::memcpy(&v, b, 4);
+            for (int c = 0; c < 3; c++) px[0][c] = uint8_t((((v >> (10 * c)) & 0x3FFu) * 510u + 1023u) / 2046u);
+            px[0][3] = uint8_t((v >> 30) * 85u);
+            break;
+        }
         case 18: case 19: case 20: case 51: case 52: case 53: DecodeBlock(f, b, px); break;
         default: return false;
     }
@@ -380,7 +389,9 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
         const uint8_t* face = src + size_t(layer) * Align(l.size, 4096);
         EndianSwapCopy(t.endian, face, sw.data(), l.size);
         uint8_t* dstLayer = out.data.data() + layer * layerBytes;
-        for (uint32_t by = 0; by < l.hBlocks; by++) {
+        // Rows of blocks write disjoint rows of the output, so bands of them can be decoded in parallel.
+        auto decodeRows = [&](uint32_t by0, uint32_t by1) {
+        for (uint32_t by = by0; by < by1; by++) {
             for (uint32_t bx = 0; bx < l.wBlocks; bx++) {
                 uint32_t off = t.tiled ? TiledBlockOffset(bx, by, l.pitchBlocks, fi.bytesPerBlock)
                                        : by * l.rowBytes + bx * fi.bytesPerBlock;
@@ -503,6 +514,20 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
                     }
                 }
             }
+        }
+        };
+        const size_t layerTexels = size_t(t.width) * t.height;
+        const unsigned hw = std::thread::hardware_concurrency();
+        const uint32_t parts = (layerTexels >= 16 * 1024 && l.hBlocks >= 16 && hw > 2) ? std::min<uint32_t>(std::min(hw - 1, 4u), l.hBlocks / 8) : 1;
+        if (parts <= 1) {
+            decodeRows(0, l.hBlocks);
+        } else {
+            const uint32_t per = (l.hBlocks + parts - 1) / parts;
+            std::vector<std::thread> workers;
+            for (uint32_t k = 1; k < parts; k++)
+                if (k * per < l.hBlocks) workers.emplace_back(decodeRows, k * per, std::min(l.hBlocks, (k + 1) * per));
+            decodeRows(0, std::min(l.hBlocks, per));
+            for (auto& w : workers) w.join();
         }
     }
     return true;
