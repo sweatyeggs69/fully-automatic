@@ -141,6 +141,8 @@ labels = [
     0x822CB308,
     0x822CB400,
     0x822CB280,
+    0x822CB06C,
+    0x822CB0C8,
 ]
 
 [[switch]]

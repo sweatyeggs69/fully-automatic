@@ -1,0 +1,26 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 0f51c1f..ead3684 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -814,7 +814,7 @@ bool Recompiler::Recompile(
+             }
+ 
+             println("\tdefault:");
+-            println("\t\t__builtin_unreachable();");
++            println("\t\t__builtin_trap();  // out-of-range index: a switch table recorded too short");
+             println("\t}}");
+ 
+             switchTable = config.switchTables.end();
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index ea72f33..3e3b7bd 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -87,7 +87,7 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+                     {
+                         switchTable.labels.push_back(*label.value<uint32_t>());
+                     }
+-                    switchTables.emplace(*table["base"].value<uint32_t>(), std::move(switchTable));
++                    switchTables.insert_or_assign(*table["base"].value<uint32_t>(), std::move(switchTable));  // a later entry (config/extra_switch_tables.toml) replaces an analyser entry
+                 }
+             }
+         }
