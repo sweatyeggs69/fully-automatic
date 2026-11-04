@@ -1358,10 +1358,18 @@ struct VulkanRenderer::Impl {
     }
 
     // ---- textures ----------------------------------------------------------------------------
+    // The fetch constant's MIN_MIP_LEVEL is how the game streams a texture: levels sharper than it are
+    // not resident yet, so sampling must not go below it (FA_MIPCLAMP=0 disables). The image clamps
+    // minLod to its last decoded level, so a range past the decoded levels is safe.
+    static uint32_t mipClampMin(const TextureFetch& t) {
+        static const bool off = [] { const char* e = std::getenv("FA_MIPCLAMP"); return e && e[0] == '0'; }();
+        return (off || t.mipFilter == 2) ? 0u : uint32_t(t.mipMin & 15);
+    }
+
     VkSampler GetSampler(const TextureFetch& t) {
         uint64_t key = uint64_t(t.magFilter & 1) | (uint64_t(t.minFilter & 1) << 1) | (uint64_t(t.clamp[0]) << 2) |
                        (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11) |
-                       (uint64_t(t.mipFilter & 3) << 14);
+                       (uint64_t(t.mipFilter & 3) << 14) | (uint64_t(mipClampMin(t)) << 16);
         auto it = samplers.find(key);
         if (it != samplers.end()) return it->second;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1374,6 +1382,7 @@ struct VulkanRenderer::Impl {
         si.addressModeV = AddressMode(t.clamp[1], mirrorClampEdge);
         si.addressModeW = AddressMode(t.clamp[2], mirrorClampEdge);
         si.borderColor = t.borderColor == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        si.minLod = float(mipClampMin(t));
         si.maxLod = t.mipFilter == 2 ? 0.0f : 16.0f;
         VkSampler s = VK_NULL_HANDLE;
         Check(vkCreateSampler(dev, &si, nullptr, &s), "vkCreateSampler");
