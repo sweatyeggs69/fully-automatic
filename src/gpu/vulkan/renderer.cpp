@@ -1474,6 +1474,15 @@ struct VulkanRenderer::Impl {
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
+        {   // FA_TEXLOG=1: one line per upload, to see when the game's streaming changes each texture
+            static const bool texLog = [] { const char* e = std::getenv("FA_TEXLOG"); return e && e[0] == '1'; }();
+            static int texLogged = 0;
+            if (texLog && texLogged < 20000) {
+                texLogged++;
+                std::fprintf(stderr, "[texlog] frame %llu base %08x fmt %u %ux%u mipbase %08x mipmin %u mipmax %u %s\n", (unsigned long long)frame,
+                             t.base, t.format, t.width, t.height, t.mipBase, t.mipMin, t.mipMax, tex.ok ? "CHANGED" : "new");
+            }
+        }
 
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
