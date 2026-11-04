@@ -635,7 +635,10 @@ void XmaDecoder::poll_registers() {
             auto* w = reinterpret_cast<uint32_t*>(regs + base + r * 4);
             if (__atomic_load_n(w, __ATOMIC_RELAXED) == 0) continue;
             uint32_t raw = __atomic_exchange_n(w, 0u, __ATOMIC_ACQ_REL);
-            if (raw) write_register(base + r * 4, __builtin_bswap32(raw));
+            // Device registers are little-endian: the game writes them with byte-reversed
+            // stores (stwbrx), so memory already holds the little-endian value, which is
+            // what a host load returns. (Swapping here turned a kick of context 0 into 24.)
+            if (raw) write_register(base + r * 4, raw);
         }
     }
 }
