@@ -12,7 +12,10 @@ namespace fa::gpu {
 // guest advances the write pointer, or on a timer while a wait is pending.
 class CommandProcessor {
 public:
-    struct Stats { uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0; };
+    struct Stats {
+        uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0;
+        uint64_t unknownOps[128] = {};  // unhandled type-3 packets by opcode
+    };
     enum class Status { Idle, Blocked };
 
     CommandProcessor(GuestMemory& mem, Backend& backend);

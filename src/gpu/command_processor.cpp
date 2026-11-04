@@ -114,6 +114,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         case pm4::kVizQuery:
         case pm4::kImLoad:
         case pm4::kImLoadImmediate:  // shader ucode is fetched from guest memory at draw time
+        case pm4::kSetBinMask: case pm4::kSetBinSelect:  // tiled-rendering predication: draw everything
         case pm4::kSetBinMaskLo: case pm4::kSetBinMaskHi:
         case pm4::kSetBinSelectLo: case pm4::kSetBinSelectHi:
             break;
@@ -236,6 +237,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
 
         default:
             ++stats_.unknown;
+            ++stats_.unknownOps[op & 0x7F];
             break;
     }
     return Result::Done;
