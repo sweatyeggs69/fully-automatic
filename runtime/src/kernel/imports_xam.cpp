@@ -172,3 +172,13 @@ FA_IMPORT(XamUserReadProfileSettings) { ret32(ctx, 1627); }
 FA_IMPORT(XamUserCreateAchievementEnumerator) { ret32(ctx, 1168); }
 
 // XamEnumerate lives in imports_content.cpp (device and content enumerators).
+
+void complete_overlapped(uint32_t ov, uint32_t result);  // imports_xmsg.cpp
+
+// (title_id, user_index, setting_count, settings*, overlapped*): settings are accepted and
+// dropped (reads fail, so the game keeps its defaults); there is no profile storage yet.
+FA_IMPORT(XamUserWriteProfileSettings) {
+    uint32_t ov = arg32(ctx, 4);
+    if (ov) { complete_overlapped(ov, 0); ret32(ctx, 997); }  // ERROR_IO_PENDING, already complete
+    else ret32(ctx, 0);
+}
