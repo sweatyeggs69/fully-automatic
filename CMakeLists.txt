@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 project(FullAutoNative CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -9,7 +9,8 @@ add_library(fa_core STATIC src/xdvdfs.cpp src/xex.cpp)
 target_include_directories(fa_core PUBLIC include)
 
 # Xenos GPU layer: PM4 command processor + backend interface (no graphics deps).
-add_library(fa_gpu src/gpu/command_processor.cpp src/gpu/texture.cpp src/gpu/frame_backend.cpp)
+add_library(fa_gpu src/gpu/command_processor.cpp src/gpu/texture.cpp src/gpu/frame_backend.cpp
+            src/gpu/shader_translator.cpp src/gpu/primitive.cpp)
 target_include_directories(fa_gpu PUBLIC include)
 
 # Command line tool: list/extract ISO contents, inspect default.xex.
@@ -35,6 +36,21 @@ add_test(NAME gpu_pm4 COMMAND gpu_pm4_test)
 add_executable(gpu_texture_test tests/gpu_texture_test.cpp)
 target_link_libraries(gpu_texture_test fa_gpu)
 add_test(NAME gpu_texture COMMAND gpu_texture_test)
+
+# Shader translator: every ALU op, control flow and fetch format must compile with shaderc.
+if(TARGET PkgConfig::SHADERC)
+  add_executable(gpu_shader_test tests/gpu_shader_test.cpp)
+  target_include_directories(gpu_shader_test PRIVATE tests)
+  target_link_libraries(gpu_shader_test fa_gpu PkgConfig::SHADERC)
+  add_test(NAME gpu_shader COMMAND gpu_shader_test)
+endif()
+# Renderer end to end (PM4 -> draws -> resolve into memory). Skips itself without a Vulkan device.
+if(TARGET fa_render)
+  add_executable(gpu_render_test tests/gpu_render_test.cpp)
+  target_include_directories(gpu_render_test PRIVATE tests)
+  target_link_libraries(gpu_render_test fa_render fa_gpu)
+  add_test(NAME gpu_render COMMAND gpu_render_test)
+endif()
 
 # HLE services used by the runtime: file system (ISO / folders), controller
 # input (SDL2), audio output (SDL2) and XMA decoding (system FFmpeg).

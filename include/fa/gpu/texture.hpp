@@ -38,6 +38,12 @@ struct TextureFetch {
     uint32_t dimension = 1;   // 0 1D, 1 2D, 2 3D, 3 cube
     uint32_t swizzle = 0x688; // 3 bits per output channel: 0..3 = XYZW, 4 = 0, 5 = 1
     bool tiled = false;
+    uint32_t depth = 1;       // 3D depth or stack depth
+    uint8_t sign[4] = {};     // per channel: 0 unsigned, 1 signed, 2 unsigned biased, 3 gamma
+    uint8_t clamp[3] = {};    // xenos::ClampMode for X, Y, Z
+    uint8_t magFilter = 0, minFilter = 0, mipFilter = 0;  // 0 point, 1 linear
+    uint8_t borderColor = 0;
+    int8_t expAdjust = 0;
     bool IsTexture() const { return type == 2; }
 };
 
@@ -62,5 +68,40 @@ uint32_t TextureByteSize(const TextureFetch& t);
 // Returns false for unsupported formats. For k_8 / k_8_8 the swizzle is ignored and the
 // result is grey, which is what a movie's luma plane looks like.
 bool DecodeTexture(const TextureFetch& t, const uint8_t* src, std::vector<uint8_t>& rgba);
+
+// Applies a Xenos endian swap (0 none, 1 8in16, 2 8in32, 3 16in32) while copying. src may equal dst.
+void EndianSwapCopy(uint32_t endian, const uint8_t* src, uint8_t* dst, uint32_t size);
+
+// ---- Host upload (renderer) ---------------------------------------------------------------
+// Base level decoded for upload to a Vulkan image: channels in XYZW order (no fetch swizzle,
+// the renderer applies it), either RGBA8 unorm or RGBA32 float. Cube maps carry 6 layers.
+struct HostTexture {
+    uint32_t width = 0, height = 0, layers = 1;
+    bool isFloat = false;           // RGBA32F (16 bytes per texel) instead of RGBA8
+    std::vector<uint8_t> data;      // layer-major, row-major
+};
+// Format block layout for any format the host decoder handles (supported = false otherwise).
+FormatInfo GetHostFormatInfo(uint32_t format);
+// Bytes of guest memory the base level occupies (all faces for cube maps).
+uint32_t HostTextureByteSize(const TextureFetch& t);
+bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out);
+
+// ---- Resolve (EDRAM -> guest memory) ------------------------------------------------------
+struct ResolveDest {
+    uint32_t base = 0;        // guest address
+    uint32_t pitch = 0;       // texels (RB_COPY_DEST_PITCH), aligned to 32 here
+    uint32_t height = 0;      // texels, aligned to 32 here
+    uint32_t format = 6;      // xenos texture format of the destination
+    uint32_t endian = 0;      // Endian128 (0..5)
+    bool swapRB = false;      // RB_COPY_DEST_INFO.copy_dest_swap
+    int expBias = 0;          // multiply by 2^expBias before conversion
+};
+// Bytes of the destination surface (tiled 2D, what must be writable at base).
+uint32_t ResolveDestByteSize(const ResolveDest& d);
+bool ResolveFormatSupported(uint32_t format);
+// Converts `w` x `h` RGBA float pixels (row-major) and stores them at texel (dx, dy) of the
+// tiled destination. `dst` points at the destination surface (ResolveDestByteSize bytes).
+void EncodeResolve(const ResolveDest& d, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, const float* rgba,
+                   uint8_t* dst);
 
 }  // namespace fa::gpu

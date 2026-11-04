@@ -30,6 +30,9 @@
 #include "fa/rt/video.hpp"
 #include <SDL.h>
 #include <pthread.h>
+#ifdef FA_WITH_RENDERER
+#include "fa/gpu/renderer.hpp"
+#endif
 #endif
 
 using namespace fa::rt;
@@ -104,6 +107,28 @@ int main(int argc, char** argv) {
         if (window.Init(opt, err)) {
             auto& backend = gpu_frame_backend();
             backend.SetEnabled(true);
+#ifdef FA_WITH_RENDERER
+            // Real draws: the Vulkan renderer resolves into guest memory and forwards every call
+            // to the frame backend, which shows the front buffer as before. FA_RENDERER=0 = off.
+            static fa::gpu::VulkanRenderer* renderer = nullptr;
+            if (!(std::getenv("FA_RENDERER") && !std::strcmp(std::getenv("FA_RENDERER"), "0"))) {
+                auto* r = new fa::gpu::VulkanRenderer(gpu_memory(), &backend);
+                fa::gpu::VulkanRenderer::Options ropt;
+                ropt.validation = opt.validation;
+                if (const char* d = std::getenv("FA_DUMP_SHADERS")) ropt.dumpShaders = d;
+                if (const char* t = std::getenv("FA_RENDER_TRACE")) ropt.traceDraws = std::atoi(t);
+                if (const char* d = std::getenv("FA_VK_DEVICE")) ropt.deviceIndex = std::atoi(d);
+                std::string rerr;
+                if (r->Init(ropt, rerr)) {
+                    set_gpu_backend(r);
+                    renderer = r;
+                    std::fprintf(stderr, "[boot] renderer on %s\n", r->DeviceName().c_str());
+                } else {
+                    std::fprintf(stderr, "[boot] renderer unavailable (%s): showing the front buffer only\n", rerr.c_str());
+                    delete r;
+                }
+            }
+#endif
             // The guest main thread gets a large host stack (it used to run on the process main
             // thread, whose stack grows on demand).
             static uint32_t entry, stack;
@@ -134,8 +159,18 @@ int main(int argc, char** argv) {
                     double secs = std::chrono::duration<double>(now - last).count();
                     uint64_t swaps = backend.GetStats().swaps.load();
                     char b[256];
-                    std::snprintf(b, sizeof b, "Full Auto - %.0f swaps/s - %u draws/frame - %llu resolves", (swaps - lastSwaps) / secs,
+                    int n = std::snprintf(b, sizeof b, "Full Auto - %.0f swaps/s - %u draws/frame - %llu resolves", (swaps - lastSwaps) / secs,
                                   backend.GetStats().drawsLastFrame.load(), (unsigned long long)backend.GetStats().resolves.load());
+#ifdef FA_WITH_RENDERER
+                    if (renderer && n > 0 && n < int(sizeof b)) {
+                        const auto& rs = renderer->GetStats();
+                        std::snprintf(b + n, sizeof b - n, " - rendered %llu, skipped %llu, shader errors %llu",
+                                      (unsigned long long)rs.draws.load(), (unsigned long long)rs.drawsSkipped.load(),
+                                      (unsigned long long)rs.shaderErrors.load());
+                    }
+#else
+                    (void)n;
+#endif
                     last = now;
                     lastSwaps = swaps;
                     return std::string(b);

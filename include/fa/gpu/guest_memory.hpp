@@ -14,6 +14,9 @@ public:
     virtual void Write32(uint32_t guestAddr, uint32_t value) = 0;
     // Raw host pointer to guest bytes (still big-endian), for bulk uploads. May return nullptr.
     virtual const uint8_t* HostPtr(uint32_t guestAddr, uint32_t size) const = 0;
+    // Writable raw pointer (resolves write render targets back to guest memory). nullptr = use
+    // Write32 instead.
+    virtual uint8_t* HostPtrWrite(uint32_t guestAddr, uint32_t size) { return nullptr; }
 };
 
 }  // namespace fa::gpu
