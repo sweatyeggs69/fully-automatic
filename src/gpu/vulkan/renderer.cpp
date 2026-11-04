@@ -1516,16 +1516,19 @@ struct VulkanRenderer::Impl {
             // The texture as the CPU decoder sees it in guest memory, plus whether each row of
             // blocks is made of identical blocks (a sign of degenerate source data).
             static int texDumps = 0;
-            if (texDumps < 120 && t.dimension == 1 && GetFormatInfo(t.format).supported) {
+            if (t.dimension == 1 && GetFormatInfo(t.format).supported) {
                 const uint8_t* src = mem.HostPtr(t.base, TextureByteSize(t));
                 std::vector<uint8_t> rgba;
                 if (src && DecodeTexture(t, src, rgba)) {
-                    texDumps++;
+                    double sum[4] = {};
+                    for (size_t i = 0; i < rgba.size(); i++) sum[i & 3] += rgba[i];
+                    const double n = double(rgba.size() / 4) * 255.0;
+                    std::fprintf(stderr, "[render]     mean rgba %.3f %.3f %.3f %.3f\n", sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
                     char path[512];
                     std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
                                   t.base, t.format, t.width, t.height);
                     for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
-                    WritePng(path, t.width, t.height, rgba.data());
+                    if (texDumps < 400) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
                     uint32_t constRows = 0;
                     for (uint32_t y = 0; y < t.height; y++) {
                         const uint8_t* row = &rgba[size_t(y) * t.width * 4];
@@ -1553,9 +1556,12 @@ struct VulkanRenderer::Impl {
         for (uint32_t i = 256; i < 260; i++) std::fprintf(stderr, " (%g %g %g %g)", c(i, 0), c(i, 1), c(i, 2), c(i, 3));
         std::fprintf(stderr, " | vs c255 (%g %g %g %g)\n", c(255, 0), c(255, 1), c(255, 2), c(255, 3));
         // Non-zero constants c0..c31 of each stage (colours, fades, colour matrices live here).
+        std::fprintf(stderr, "[render]   alpha ref %g sc_mode %08x clip %08x\n", xe::AsFloat(regs[xe::RB_ALPHA_REF]),
+                     regs[xe::PA_SU_SC_MODE_CNTL], regs[xe::PA_CL_CLIP_CNTL]);
         for (uint32_t base : {0u, 256u}) {
             std::fprintf(stderr, "[render]   %s consts:", base ? "ps" : "vs");
-            for (uint32_t i = base; i < base + 32; i++) {
+            for (uint32_t i = base; i < base + 256; i++) {
+                if (i >= base + 32 && i < base + 224) continue;  // c0..c31 and c224..c255
                 if (!regs[pm4::kAluConstBase + i * 4] && !regs[pm4::kAluConstBase + i * 4 + 1] &&
                     !regs[pm4::kAluConstBase + i * 4 + 2] && !regs[pm4::kAluConstBase + i * 4 + 3])
                     continue;
