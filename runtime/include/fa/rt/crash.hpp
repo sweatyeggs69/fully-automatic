@@ -6,4 +6,8 @@ constexpr uint64_t kGuestWindow = 0x100000000ull;
 void install_crash_handler();
 // Debug aid: FA_WATCH=<hexaddr>:<hexlen> logs every guest write to that range (call after g_mem.init).
 void install_write_watch();
+// Debug aid: FA_PROFILE=<seconds> prints thread CPU, hot functions and import counts periodically.
+void install_profiler();
+// Names the calling host thread (shows in /proc, perf, gdb and the FA_PROFILE report).
+void set_host_thread_name(const char* name);
 }

@@ -56,6 +56,7 @@ static bool read_game(const std::string& path, std::vector<uint8_t>& xex) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: fullauto <game.iso> | fullauto <default.xex> <game.iso | folder>\n"); return 2; }
     install_crash_handler();
+    install_profiler();
     std::vector<uint8_t> xex;
     std::fprintf(stderr, "[boot] reading game\n");
     if (!read_game(argv[1], xex)) return 1;
