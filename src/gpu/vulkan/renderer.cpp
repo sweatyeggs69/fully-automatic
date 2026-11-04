@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -411,6 +412,7 @@ struct VulkanRenderer::Impl {
     std::unordered_map<uint64_t, Shader> shaders;
     VkShaderModule rectGs = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    HostDraw hostDraw;  // reused across draws so its index buffer keeps its capacity
     std::map<uint64_t, RenderTarget> rts;
     std::unordered_map<uint64_t, Texture> textures;
     std::unordered_map<uint64_t, VkSampler> samplers;
@@ -613,6 +615,7 @@ struct VulkanRenderer::Impl {
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
         stats.submits++;
+        prof::Add(prof::kSubmits, 1);
     }
 
     // Linear allocation from the upload ring; flushes the batch when it runs out.
@@ -1232,8 +1235,11 @@ struct VulkanRenderer::Impl {
         Shader* vs = GetShader(ShaderStage::Vertex, dc.vsUcode, dc.vsDwords, dc.vsHash);
         Shader* ps = GetShader(ShaderStage::Pixel, dc.psUcode, dc.psDwords, dc.psHash);
         if (!vs->ok || !ps->ok) { stats.drawsSkipped++; return; }
-        HostDraw hd;
-        if (!BuildHostDraw(dc, regs, mem, hd)) { stats.drawsSkipped++; return; }
+        std::optional<prof::Scope> sec;
+        sec.emplace(prof::kDrawBuild);
+        if (!BuildHostDraw(dc, regs, mem, hostDraw)) { stats.drawsSkipped++; return; }
+        HostDraw& hd = hostDraw;
+        prof::Add(prof::kIdxCount, hd.indices.size());
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 
@@ -1262,6 +1268,7 @@ struct VulkanRenderer::Impl {
         if (!depth && !colorMask) { stats.drawsSkipped++; return; }
 
         // Textures (uploads happen outside rendering, so before BeginRendering).
+        sec.emplace(prof::kDrawTex);
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
@@ -1300,6 +1307,7 @@ struct VulkanRenderer::Impl {
         }
 
         // Uniforms and vertex data.
+        sec.emplace(prof::kDrawUpload);
         const VkDeviceSize uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
         bool flushed;
         VkDeviceSize constsOff;
@@ -1307,6 +1315,7 @@ struct VulkanRenderer::Impl {
         if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && !std::memcmp(lastConsts.data(), consts, 8192)) {
             constsOff = lastConstsOff;
         } else {
+            prof::Add(prof::kConstUploads, 1);
             constsOff = RingAlloc(8192, uboAlign, flushed);
             std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
             lastConsts.assign(consts, consts + 2048);
@@ -1371,6 +1380,7 @@ struct VulkanRenderer::Impl {
                 at = RingAlloc(words * 4, 16, flushed);
                 if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
                 std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
+                prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                 vbCache[key] = at;
             }
             sys.vf[s][0] = uint32_t(at / 4);
@@ -1392,6 +1402,7 @@ struct VulkanRenderer::Impl {
         std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
 
         // Pipeline.
+        sec.emplace(prof::kDrawRecord);
         PipelineKey key{};
         key.vs = dc.vsHash;
         key.ps = dc.psHash;
