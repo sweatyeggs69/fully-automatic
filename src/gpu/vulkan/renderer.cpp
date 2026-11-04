@@ -443,6 +443,24 @@ struct VulkanRenderer::Impl {
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
     VkPipeline curPipeline = VK_NULL_HANDLE;
+    // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
+    // and every time a texture fetch binds it (with whether the cached copy was reused).
+    uint32_t watchAddr = [] { const char* e = std::getenv("FA_WATCH_ADDR"); return e ? uint32_t(std::strtoul(e, nullptr, 16) & 0x1FFFFFFFu) : 0u; }();
+    void WatchBytes(const char* what, uint32_t base, uint32_t size, const char* extra = "") {
+        if (!watchAddr || (base & 0x1FFFFFFFu) != watchAddr) return;
+        static int logged = 0;
+        if (logged++ >= 400) return;
+        const uint8_t* p = mem.HostPtr(base, size);
+        if (!p) { std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x: not mapped (%u bytes) %s\n", (unsigned long long)frame, (unsigned long long)stats.draws.load(), what, base, size, extra); return; }
+        std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x size %u hash %016llx %s\n  @0:", (unsigned long long)frame,
+                     (unsigned long long)stats.draws.load(), what, base, size, (unsigned long long)HashBytes(p, size), extra);
+        const uint32_t offs[3] = {0, (size / 2) & ~15u, ((size / 4) * 3) & ~15u};
+        for (int k = 0; k < 3; k++) {
+            if (k) std::fprintf(stderr, "\n  @%x:", offs[k]);
+            for (int i = 0; i < 16; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", p[offs[k] + i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -1387,6 +1405,11 @@ struct VulkanRenderer::Impl {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
             if (cube || t.dimension == 3) return fell("dimension mismatch");
         }
+        if (watchAddr && (t.base & 0x1FFFFFFFu) == watchAddr) {
+            auto wit = textures.find(HashBytes(d, 6 * sizeof(uint32_t)) ^ (uint64_t(t.dimension) << 62));
+            const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
+            WatchBytes("texture bind", t.base, HostTextureByteSize(t), reuse ? "(cached view reused without rechecking)" : "(will recheck memory)");
+        }
         if (snapEnabled && !cube && !snaps.empty())
             if (VkImageView sv = SnapView(t)) return sv;
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
@@ -2330,6 +2353,7 @@ struct VulkanRenderer::Impl {
                         mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
                 }
                 InvalidateTextures(d.base, destBytes);
+                WatchBytes("after resolve", d.base, destBytes, dst ? "(direct write)" : "(dword write path)");
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
