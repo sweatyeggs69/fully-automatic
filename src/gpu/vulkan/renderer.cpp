@@ -511,10 +511,10 @@ struct VulkanRenderer::Impl {
         // A pending surface of another base overlapping this one is written first (order matters).
         for (uint32_t k : pendingKeys) {
             const Snap& o = snaps[k];
-            if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(); break; }
+            if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
         }
         if (e.img.img && (e.img.w != w || e.img.h != h || e.img.format != fmt)) {
-            if (e.pending) FlushPending();
+            if (e.pending) FlushPending(prof::kFlushOverlap);
             ReleaseSnapImage(e);
         }
         if (!e.img.img) {
@@ -552,11 +552,12 @@ struct VulkanRenderer::Impl {
         std::memcpy(e.samples, samples, sizeof samples);
         e.version++;
         e.valid = true;
-        if (pendingBytes > (96u << 20)) FlushPending();
+        if (pendingBytes > (96u << 20)) FlushPending(prof::kFlushCap);
         return true;
     }
-    void FlushPending() {
+    void FlushPending(prof::Stat why = prof::kFlushSync) {
         if (pendingKeys.empty()) return;
+        prof::Add(why, 1);
         std::vector<uint32_t> keys;
         keys.swap(pendingKeys);
         pendingBytes = 0;
@@ -1325,7 +1326,7 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
-        if (!pendingKeys.empty() && PendingOverlaps(t.base, size)) FlushPending();
+        if (!pendingKeys.empty() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
         const uint8_t* src = mem.HostPtr(t.base, size);
         if (!src) {
             tex.validatedGen = generation;
@@ -2104,7 +2105,7 @@ struct VulkanRenderer::Impl {
                         goto clears;
                     }
                 }
-                if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending();
+                if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending(prof::kFlushOverlap);
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
                 if (bytes > readback.size) {
@@ -2317,7 +2318,7 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
-        FlushPending();
+        FlushPending(prof::kFlushSwap);
         {
             prof::Scope ps_(prof::kOtherWait);
             SubmitAndWait();
