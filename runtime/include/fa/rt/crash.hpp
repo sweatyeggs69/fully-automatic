@@ -8,6 +8,7 @@ void install_crash_handler();
 void install_write_watch();
 // Debug aid: FA_PROFILE=<seconds> prints thread CPU, hot functions and import counts periodically.
 void install_profiler();
+void install_memory_guard();  // exits before the machine runs out of memory (FA_MEMGUARD=0 disables)
 // Names the calling host thread (shows in /proc, perf, gdb and the FA_PROFILE report).
 void set_host_thread_name(const char* name);
 }
