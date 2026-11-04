@@ -1966,6 +1966,7 @@ struct VulkanRenderer::Impl {
                 if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
                 std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, copyWords * 4);
                 prof::Add(prof::kVbBytes, uint64_t(copyWords) * 4);
+                if (!vs->info.vfetchStride[s]) prof::Add(prof::kVbUnbounded, uint64_t(copyWords) * 4);  // whole-buffer copies
                 vbCache[vf.address] = {at, copyWords};
             }
             sys.vf[s][0] = uint32_t(at / 4);
