@@ -5,6 +5,7 @@
 #include <shaderc/shaderc.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -705,6 +706,12 @@ struct VulkanRenderer::Impl {
     int64_t dumpFrameSel = -1;
     uint64_t dumpDrawLo = 0, dumpDrawHi = ~0ull, drawInFrame = 0;
     std::set<uint32_t> dumpedTexBases;
+    // FA_RENDER_DUMP_TRIGGER=<file>: when that file appears (touch it), the next frame is dumped like
+    // FA_RENDER_DUMP_FRAME and the file is removed. FA_RENDER_DUMP_AFTER=<seconds>: the same, once,
+    // that many seconds after start. Both need FA_RENDER_DUMP=<dir>.
+    const char* dumpTrigger = nullptr;
+    double dumpAfterSec = -1.0;
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
     bool DumpFrame() const {
         if (!dumpDir) return false;
         if (dumpFrameSel >= 0) return uint64_t(dumpFrameSel) == frame;
@@ -720,6 +727,8 @@ struct VulkanRenderer::Impl {
         const char* d = std::getenv("FA_RENDER_DUMP");
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_TRIGGER")) if (*c) dumpTrigger = c;
+        if (const char* c = std::getenv("FA_RENDER_DUMP_AFTER")) dumpAfterSec = std::atof(c);
         if (const char* c = std::getenv("FA_RENDER_DUMP_FRAME")) dumpFrameSel = std::strtoll(c, nullptr, 10);
         if (const char* c = std::getenv("FA_RENDER_DUMP_DRAWS")) {
             char* e = nullptr;
@@ -2466,6 +2475,22 @@ struct VulkanRenderer::Impl {
         frame++;
         drawInFrame = 0;
         dumpedTexBases.clear();
+        if (dumpDir && dumpTrigger && (frame & 7) == 0) {
+            if (FILE* tf = std::fopen(dumpTrigger, "r")) {
+                std::fclose(tf);
+                std::remove(dumpTrigger);
+                dumpFrameSel = int64_t(frame);
+                dumpDrawLo = 0;
+                dumpDrawHi = ~0ull;
+                std::fprintf(stderr, "[render] dump trigger: dumping frame %llu\n", (unsigned long long)frame);
+            }
+        }
+        if (dumpDir && dumpAfterSec >= 0.0 &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count() >= dumpAfterSec) {
+            dumpAfterSec = -1.0;
+            dumpFrameSel = int64_t(frame);
+            std::fprintf(stderr, "[render] timed dump: dumping frame %llu\n", (unsigned long long)frame);
+        }
     }
 };
 
