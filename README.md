@@ -38,7 +38,8 @@ XAudio output, the XMA decoder, and `fawave` for listing/decoding the game's wav
 
 ## Patching XenonRecomp
 Full Auto uses a few PowerPC instructions XenonRecomp does not implement (16-bit vector ops, `cror`/`crorc`, `bso`/`bns`).
-Apply the patch before recompiling:
+Apply the patches before recompiling, in this order (each one builds on the ones above it, so
+`xenonrecomp-keep-entries.patch` must come after `xenonrecomp-mulhd-fix.patch`):
 
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-vmx-halfword.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-jumptables-and-more-vmx.patch
