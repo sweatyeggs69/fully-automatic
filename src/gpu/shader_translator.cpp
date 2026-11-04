@@ -210,7 +210,7 @@ void Translator::WriteFetchResult(uint32_t dst, bool dstRel, uint32_t dstSwz, co
         else src += s == 5 ? "1.0" : "0.0";
     }
     if (mask.empty()) return;
-    if (dst == 0 || dstRel) r0Written_ = true;
+    if (dstRel || (dst == 0 && mask.find('x') != std::string::npos)) r0Written_ = true;  // only r0.x (the vertex index) matters
     Line("{");
     indent_++;
     Line("vec4 xe_f = " + value + ";");
@@ -591,8 +591,8 @@ void Translator::EmitAlu(const uint32_t* w) {
         else Line(lhs + "." + m + " = (" + vec4expr + ")." + m + ";");
     };
     if (!exp) {
-        if (vecMask) { if (a.vdst() == 0 || a.vdstRel()) r0Written_ = true; assign(TempRef(a.vdst(), a.vdstRel()), vecMask, "xe_v"); }
-        if (scaMask) { if (a.sdst() == 0 || a.sdstRel()) r0Written_ = true; assign(TempRef(a.sdst(), a.sdstRel()), scaMask, "vec4(xe_r)"); }
+        if (vecMask) { if (a.vdstRel() || (a.vdst() == 0 && (vecMask & 1))) r0Written_ = true; assign(TempRef(a.vdst(), a.vdstRel()), vecMask, "xe_v"); }
+        if (scaMask) { if (a.sdstRel() || (a.sdst() == 0 && (scaMask & 1))) r0Written_ = true; assign(TempRef(a.sdst(), a.sdstRel()), scaMask, "vec4(xe_r)"); }
     } else {
         uint32_t d = a.vdst();
         std::string lhs;

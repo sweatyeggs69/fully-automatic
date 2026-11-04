@@ -44,8 +44,8 @@ inline std::atomic<uint64_t> g_ns[kCount];
 inline std::atomic<uint64_t> g_count[kCount];
 
 // Plain counters (bytes, items) printed per frame after the timed sections.
-enum Stat : int { kVbBytes, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kStatCount };
-inline const char* const kStatNames[kStatCount] = {"vb KB", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap"};
+enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kStatCount };
+inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap"};
 inline std::atomic<uint64_t> g_stat[kStatCount];
 inline void Add(Stat s, uint64_t n) {
     if (g_enabled) g_stat[s].fetch_add(n, std::memory_order_relaxed);
@@ -95,7 +95,7 @@ inline void OnSwap() {
     }
     for (int i = 0; i < kStatCount && len > 0 && len < int(sizeof line); i++) {
         double v = double(g_stat[i].exchange(0, std::memory_order_relaxed)) / double(swaps);
-        if (i == kVbBytes) v /= 1024.0;
+        if (i == kVbBytes || i == kVbUnbounded) v /= 1024.0;
         len += std::snprintf(line + len, sizeof line - len, " | %s %.1f", kStatNames[i], v);
     }
     std::fprintf(stderr, "%s\n", line);
