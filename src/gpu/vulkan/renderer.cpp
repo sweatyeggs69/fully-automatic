@@ -5,6 +5,10 @@
 #include <shaderc/shaderc.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +48,72 @@ const char* VkErr(VkResult r) {
         default: return "VkResult(other)";
     }
 }
+
+// Splits row ranges across a few worker threads (resolve conversion). Run() blocks until done.
+class RowPool {
+public:
+    RowPool() {
+        unsigned n = std::thread::hardware_concurrency();
+        n = n > 2 ? std::min(n - 1, 6u) : 0;  // leave cores for the game's own threads
+        if (const char* e = std::getenv("FA_RESOLVE_THREADS")) n = unsigned(std::max(0, std::atoi(e)));
+        for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { Loop(); });
+    }
+    ~RowPool() {
+        {
+            std::lock_guard lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    // fn(y0, y1) for disjoint bands covering [0, rows).
+    void Run(uint32_t rows, const std::function<void(uint32_t, uint32_t)>& fn) {
+        const uint32_t parts = std::min<uint32_t>(uint32_t(workers_.size()) + 1, (rows + 15) / 16);
+        if (parts <= 1) { fn(0, rows); return; }
+        // Bands start on 8-row boundaries so an endian-swap unit never straddles two bands.
+        const uint32_t band = ((rows + parts - 1) / parts + 7) & ~7u;
+        {
+            std::lock_guard lk(mu_);
+            fn_ = &fn;
+            band_ = band;
+            rows_ = rows;
+            next_ = 1;  // band 0 runs on the calling thread
+            pending_ = parts - 1;
+            parts_ = parts;
+            gen_++;
+        }
+        cv_.notify_all();
+        fn(0, std::min(band, rows));
+        std::unique_lock lk(mu_);
+        done_.wait(lk, [&] { return pending_ == 0; });
+        fn_ = nullptr;
+    }
+
+private:
+    void Loop() {
+        uint64_t seen = 0;
+        std::unique_lock lk(mu_);
+        for (;;) {
+            cv_.wait(lk, [&] { return stop_ || (gen_ != seen && next_ < parts_); });
+            if (stop_) return;
+            uint32_t part = next_++;
+            if (next_ >= parts_) seen = gen_;
+            const auto* fn = fn_;
+            uint32_t y0 = part * band_, y1 = std::min(rows_, y0 + band_);
+            lk.unlock();
+            if (y0 < y1) (*fn)(y0, y1);
+            lk.lock();
+            if (--pending_ == 0) done_.notify_one();
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_;
+    const std::function<void(uint32_t, uint32_t)>* fn_ = nullptr;
+    uint32_t band_ = 0, rows_ = 0, next_ = 0, parts_ = 0, pending_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
 
 uint64_t HashBytes(const void* data, size_t n, uint64_t h = 0xCBF29CE484222325ull) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -366,6 +436,7 @@ struct VulkanRenderer::Impl {
     }
 
     std::vector<float> resolvePx;  // scratch for resolves that go through floats
+    RowPool rowPool;
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
@@ -1630,7 +1701,7 @@ struct VulkanRenderer::Impl {
                 // Destination offset: the resolve rectangle's position in EDRAM.
                 std::vector<float>& px = resolvePx;  // reused: a fresh 15 MB vector per resolve was costly
                 px.resize(size_t(w) * h * 4);
-                for (size_t i = 0; i < size_t(w) * h; i++) {
+                auto toFloat = [&](size_t i) {
                     if (isDepth) {
                         float z;
                         if (depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) std::memcpy(&z, rb + i * 4, 4);
@@ -1642,11 +1713,16 @@ struct VulkanRenderer::Impl {
                     } else {
                         ReadbackToFloat(src->image.format, rb + i * bpp, &px[i * 4]);
                     }
-                }
+                };
                 uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
                 if (dst) {
-                    EncodeResolve(d, uint32_t(x0), uint32_t(y0), w, h, px.data(), dst);
+                    // Bands of rows in parallel: each converts its rows and writes their texels.
+                    rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
+                        for (size_t i = size_t(ya) * w; i < size_t(yb) * w; i++) toFloat(i);
+                        EncodeResolve(d, uint32_t(x0), uint32_t(y0) + ya, w, yb - ya, px.data() + size_t(ya) * w * 4, dst);
+                    });
                 } else {
+                    for (size_t i = 0; i < size_t(w) * h; i++) toFloat(i);
                     // No direct pointer: encode into a copy of the surface and write it back by dwords.
                     std::vector<uint8_t> tmp(destBytes);
                     for (uint32_t i = 0; i + 4 <= destBytes; i += 4) {
@@ -1708,7 +1784,8 @@ struct VulkanRenderer::Impl {
         uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
-        for (uint32_t y = 0; y < h; y++) {
+        rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
+        for (uint32_t y = ya; y < yb; y++) {
             const uint32_t ty = dy + y;
             if (ty >= height) break;
             const uint8_t* row = rb + size_t(y) * w * bpp;
@@ -1737,6 +1814,7 @@ struct VulkanRenderer::Impl {
                 }
             }
         }
+        });
         return true;
     }
 
