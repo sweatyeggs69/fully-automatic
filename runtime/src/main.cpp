@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
         if (window.Init(opt, err)) {
             auto& backend = gpu_frame_backend();
             backend.SetEnabled(true);
+            backend.SetAsync(true);  // decode frames off the GPU thread
 #ifdef FA_WITH_RENDERER
             // Real draws: the Vulkan renderer resolves into guest memory and forwards every call
             // to the frame backend, which shows the front buffer as before. FA_RENDERER=0 = off.

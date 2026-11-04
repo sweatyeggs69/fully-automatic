@@ -365,6 +365,8 @@ struct VulkanRenderer::Impl {
         }
     }
 
+    std::vector<float> resolvePx;  // scratch for resolves that go through floats
+
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
     std::vector<uint32_t> lastConsts;
@@ -1620,13 +1622,14 @@ struct VulkanRenderer::Impl {
                 prof::Scope pc_(prof::kResolveCpu);
                 const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
                 uint32_t destBytes = ResolveDestByteSize(d);
-                if (!DumpFrame() && ResolveRaw32(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
+                if (!DumpFrame() && ResolveRaw(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
                     InvalidateTextures(d.base, destBytes);
                     goto clears;
                 }
                 {
                 // Destination offset: the resolve rectangle's position in EDRAM.
-                std::vector<float> px(size_t(w) * h * 4);
+                std::vector<float>& px = resolvePx;  // reused: a fresh 15 MB vector per resolve was costly
+                px.resize(size_t(w) * h * 4);
                 for (size_t i = 0; i < size_t(w) * h; i++) {
                     if (isDepth) {
                         float z;
@@ -1678,41 +1681,60 @@ struct VulkanRenderer::Impl {
         }
     }
 
-    // Fast resolve: the render target already holds the destination's 32-bit texel layout
-    // (8888 -> 8888, 2_10_10_10 -> 2_10_10_10), so texels are copied as words, tiled and
+    // Fast resolve: the render target already holds the destination's texel layout (8888,
+    // 2_10_10_10, 16-bit and 32-bit float formats), so texels are copied as bytes, tiled and
     // endian swapped without going through floats. Returns false when it does not apply.
-    bool ResolveRaw32(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
-                      const uint8_t* rb, uint32_t destBytes) {
+    bool ResolveRaw(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                    const uint8_t* rb, uint32_t destBytes) {
         if (isDepth || d.expBias != 0) return false;
         const bool is8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50);
         const bool is1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54);
-        if (!is8888 && !is1010) return false;
-        if (d.endian > 3) return false;
+        const bool isFloat = (srcFmt == VK_FORMAT_R16G16_SFLOAT && d.format == 31) ||
+                             (srcFmt == VK_FORMAT_R16G16B16A16_SFLOAT && d.format == 32) ||
+                             (srcFmt == VK_FORMAT_R32_SFLOAT && d.format == 36) ||
+                             (srcFmt == VK_FORMAT_R32G32_SFLOAT && d.format == 37);
+        if (!is8888 && !is1010 && !(isFloat && !d.swapRB)) return false;
+        const uint32_t bpp = VkFormatBytes(srcFmt);
+        uint32_t x8 = 0;  // an endian swap is a XOR on the byte address within the swapped unit
+        switch (d.endian) {
+            case 0: break;
+            case 1: x8 = 1; break;  // 8in16
+            case 2: x8 = 3; break;  // 8in32
+            case 3: x8 = 2; break;  // 16in32
+            case 4: x8 = 7; break;  // 8in64
+            default: return false;
+        }
+        if (x8 >= bpp) return false;
         uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
-        const uint32_t endian = d.endian;
         for (uint32_t y = 0; y < h; y++) {
             const uint32_t ty = dy + y;
             if (ty >= height) break;
-            const uint32_t* row = reinterpret_cast<const uint32_t*>(rb) + size_t(y) * w;
+            const uint8_t* row = rb + size_t(y) * w * bpp;
             for (uint32_t x = 0; x < w; x++) {
                 const uint32_t tx = dx + x;
                 if (tx >= pitch) break;
-                uint32_t v = row[x];
-                if (d.swapRB) {
-                    if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
-                    else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+                const uint32_t off = TiledBlockOffset(tx, ty, pitch, bpp);
+                if (off + bpp > destBytes) continue;
+                if (bpp == 4) {
+                    uint32_t v;
+                    std::memcpy(&v, row + x * 4, 4);
+                    if (d.swapRB) {
+                        if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                        else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+                    }
+                    switch (x8) {
+                        case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+                        case 3: v = __builtin_bswap32(v); break;
+                        case 2: v = (v << 16) | (v >> 16); break;
+                        default: break;
+                    }
+                    std::memcpy(dst + off, &v, 4);
+                } else {
+                    const uint8_t* p = row + size_t(x) * bpp;
+                    for (uint32_t k = 0; k < bpp; k++) dst[(off + k) ^ x8] = p[k];
                 }
-                switch (endian) {
-                    case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;  // 8in16
-                    case 2: v = __builtin_bswap32(v); break;                                    // 8in32
-                    case 3: v = (v << 16) | (v >> 16); break;                                   // 16in32
-                    default: break;
-                }
-                const uint32_t off = TiledBlockOffset(tx, ty, pitch, 4);
-                if (off + 4 > destBytes) continue;
-                std::memcpy(dst + off, &v, 4);
             }
         }
         return true;

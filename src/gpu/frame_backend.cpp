@@ -63,14 +63,48 @@ void FrameBackend::Draw(const DrawCall&, const RegisterFile& regs) {
 
 void FrameBackend::Resolve(const RegisterFile&) { stats_.resolves.fetch_add(1, std::memory_order_relaxed); }
 
-bool FrameBackend::DecodeFetch(const TextureFetch& t, Frame& out) {
+bool FrameBackend::CopyFetch(const TextureFetch& t, std::vector<uint8_t>& out) {
+    if (!t.width || !t.height) return false;
     uint32_t size = TextureByteSize(t);
     const uint8_t* src = mem_.HostPtr(t.base, size);
     if (!src) return false;
-    if (!DecodeTexture(t, src, out.rgba)) return false;
-    out.width = t.width;
-    out.height = t.height;
+    out.assign(src, src + size);
     return true;
+}
+
+FrameBackend::~FrameBackend() { SetAsync(false); }
+
+void FrameBackend::SetAsync(bool on) {
+    if (on == worker_.joinable()) return;
+    if (on) {
+        stop_ = false;
+        worker_ = std::thread([this] { WorkerLoop(); });
+    } else {
+        {
+            std::lock_guard lk(jobMu_);
+            stop_ = true;
+        }
+        jobCv_.notify_all();
+        worker_.join();
+    }
+}
+
+void FrameBackend::WorkerLoop() {
+    for (;;) {
+        Job job;
+        {
+            std::unique_lock lk(jobMu_);
+            jobCv_.wait(lk, [&] { return jobReady_ || stop_; });
+            if (stop_) return;
+            std::swap(job, job_);
+            jobReady_ = false;
+            workerBusy_ = true;
+        }
+        DecodeJob(job);
+        std::lock_guard lk(jobMu_);
+        workerBusy_ = false;
+        spare_ = std::move(job);  // keeps the byte buffers' capacity for the next swap
+    }
 }
 
 static bool HasContent(const std::vector<uint8_t>& rgba) {
@@ -98,9 +132,19 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
     const bool dumpThis = dumpDir && *dumpDir && (seq <= 6 || ((seq - 1) % 30 == 0 && seq <= 30 * 12));
     if (!enabled_.load(std::memory_order_relaxed) || (mailbox_.Pending() && !dumpThis)) return;
 
-    Frame f;
-    f.seq = seq;
-    bool fbOk = false;
+    const bool async = worker_.joinable();
+    Job local;
+    Job* job = &local;
+    if (async) {
+        std::lock_guard lk(jobMu_);
+        if ((workerBusy_ || jobReady_) && !dumpThis) return;  // still decoding the last frame
+        local = std::move(spare_);  // reuse the byte buffers of an earlier job
+    }
+    job->seq = seq;
+    job->width = width;
+    job->height = height;
+    job->dump = dumpThis;
+    job->haveFb = job->haveTex = false;
     if (mode_ != Mode::Texture) {
         // VdSwap loaded the front buffer's fetch constant into slot 0 just before XE_SWAP.
         uint32_t d[6];
@@ -124,30 +168,60 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
                          fb.width, fb.height, FormatName(fb.format), fb.endian, fb.tiled ? "tiled" : "linear", fb.pitch,
                          fb.swizzle);
         }
-        fbOk = DecodeFetch(fb, f);
-        if (fbOk && dumpThis) {
+        job->fb = fb;
+        job->haveFb = CopyFetch(fb, job->fbBytes);
+    }
+    // The texture view is only needed when the front buffer turns out empty; copying it is cheap
+    // next to decoding, so it rides along.
+    if (mode_ != Mode::FrontBuffer && haveTex) {
+        job->tex = tex;
+        job->haveTex = CopyFetch(tex, job->texBytes);
+    }
+    if (!async) {
+        DecodeJob(*job);
+        return;
+    }
+    {
+        std::lock_guard lk(jobMu_);
+        job_ = std::move(local);
+        jobReady_ = true;
+    }
+    jobCv_.notify_one();
+}
+
+void FrameBackend::DecodeJob(Job& job) {
+    static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
+    Frame f;
+    f.seq = job.seq;
+    bool fbOk = false;
+    if (job.haveFb && DecodeTexture(job.fb, job.fbBytes.data(), f.rgba)) {
+        fbOk = true;
+        f.width = job.fb.width;
+        f.height = job.fb.height;
+        if (job.dump) {
             char path[512];
-            std::snprintf(path, sizeof path, "%s/f%04llu_frontbuffer_%08x.png", dumpDir, (unsigned long long)(seq - 1), fb.base);
+            std::snprintf(path, sizeof path, "%s/f%04llu_frontbuffer_%08x.png", dumpDir, (unsigned long long)(job.seq - 1),
+                          job.fb.base);
             std::vector<uint8_t> opaque = f.rgba;
             for (size_t i = 3; i < opaque.size(); i += 4) opaque[i] = 255;
             WritePng(path, f.width, f.height, opaque.data());
         }
-        if (dumpThis && mailbox_.Pending()) return;
-        if (fbOk) {
-            f.source = "frontbuffer";
-            if (mode_ == Mode::Auto && !HasContent(f.rgba)) fbOk = false;
-        }
+        if (job.dump && mailbox_.Pending()) return;
+        f.source = "frontbuffer";
+        if (mode_ == Mode::Auto && !HasContent(f.rgba)) fbOk = false;
     }
-    if (!fbOk && mode_ != Mode::FrontBuffer && haveTex && DecodeFetch(tex, f)) {
+    if (!fbOk && job.haveTex && DecodeTexture(job.tex, job.texBytes.data(), f.rgba)) {
+        f.width = job.tex.width;
+        f.height = job.tex.height;
         char buf[96];
-        std::snprintf(buf, sizeof buf, "texture %s %ux%u", FormatName(tex.format), tex.width, tex.height);
+        std::snprintf(buf, sizeof buf, "texture %s %ux%u", FormatName(job.tex.format), job.tex.width, job.tex.height);
         f.source = buf;
         fbOk = true;
     }
     if (!fbOk) {
         // Nothing to show yet: a black 1280x720 frame keeps the window alive.
-        f.width = width ? width : 1280;
-        f.height = height ? height : 720;
+        f.width = job.width ? job.width : 1280;
+        f.height = job.height ? job.height : 720;
         f.rgba.assign(size_t(f.width) * f.height * 4, 0);
         f.source = "black (no front buffer content or textures yet)";
     }

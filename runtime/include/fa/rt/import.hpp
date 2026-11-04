@@ -34,8 +34,12 @@ struct ImportStat {
     ImportStat* next = nullptr;
 };
 extern bool g_profile;
-// Cheap timestamp (TSC ticks) for timing imports under FA_PROFILE.
-inline uint64_t profile_ticks() { return __builtin_ia32_rdtsc(); }
+// Cheap timestamp (TSC ticks) for timing imports under FA_PROFILE. rdtscp, not rdtsc: the
+// guest timebase patcher rewrites inlined rdtsc sequences (timebase.cpp) and would rescale these.
+inline uint64_t profile_ticks() {
+    unsigned aux;
+    return __builtin_ia32_rdtscp(&aux);
+}
 }  // namespace fa::rt
 
 #define FA_IMPORT(name)                                                       \

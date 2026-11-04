@@ -8,9 +8,11 @@
 // FA_PRESENT=frontbuffer | texture | auto (default: front buffer when it holds anything,
 // else the texture view).
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "fa/gpu/backend.hpp"
@@ -60,9 +62,14 @@ public:
     };
 
     explicit FrameBackend(GuestMemory& mem);
+    ~FrameBackend() override;
 
     // Nothing is decoded until a window wants frames.
     void SetEnabled(bool on) { enabled_.store(on); }
+    // Decode swapped frames on a worker thread instead of the GPU thread (the game window turns
+    // this on). Swap then only copies the guest bytes; a frame that arrives while the worker is
+    // still busy is dropped, as it would be while the window has not shown the last one.
+    void SetAsync(bool on);
     FrameMailbox& Mailbox() { return mailbox_; }
     const Stats& GetStats() const { return stats_; }
 
@@ -73,7 +80,17 @@ public:
     static const char* FormatName(uint32_t format);
 
 private:
-    bool DecodeFetch(const TextureFetch& t, Frame& out);
+    // One swap's sources, copied out of guest memory so decoding can happen on another thread.
+    struct Job {
+        uint64_t seq = 0;
+        uint32_t width = 0, height = 0;
+        bool haveFb = false, haveTex = false, dump = false;
+        TextureFetch fb, tex;
+        std::vector<uint8_t> fbBytes, texBytes;
+    };
+    bool CopyFetch(const TextureFetch& t, std::vector<uint8_t>& out);
+    void DecodeJob(Job& job);
+    void WorkerLoop();
 
     GuestMemory& mem_;
     FrameMailbox mailbox_;
@@ -84,6 +101,12 @@ private:
     bool haveBest_ = false;
     TextureFetch best_;  // largest texture seen in this frame's draws
     std::vector<uint8_t> scratch_;
+    // Async decode.
+    std::thread worker_;
+    std::mutex jobMu_;
+    std::condition_variable jobCv_;
+    Job job_, spare_;
+    bool jobReady_ = false, workerBusy_ = false, stop_ = false;
 };
 
 }  // namespace fa::gpu
