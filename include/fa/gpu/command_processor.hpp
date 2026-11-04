@@ -13,7 +13,7 @@ namespace fa::gpu {
 class CommandProcessor {
 public:
     struct Stats {
-        uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0, resolves = 0, shaderLoads = 0;
+        uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0, resolves = 0, shaderLoads = 0, predicatedSkips = 0;
         uint64_t unknownOps[128] = {};  // unhandled type-3 packets by opcode
     };
     enum class Status { Idle, Blocked };
@@ -53,6 +53,9 @@ private:
     struct IndirectBuffer { bool active = false; uint32_t base = 0, size = 0, pos = 0; } ib_;
     // Shader microcode by type (0 = vertex, 1 = pixel), as the last IM_LOAD left it.
     struct ShaderSlot { std::vector<uint32_t> ucode; uint64_t hash = 0; uint32_t srcAddr = 0; } shaders_[2];
+    // Predicated tiling: a type-3 packet with header bit 0 set runs only when
+    // (bin_select & bin_mask) != 0. D3D replays a frame once per screen tile this way.
+    uint64_t binMask_ = 0xFFFFFFFFull, binSelect_ = 0xFFFFFFFFull;
     void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
     Stats stats_;
 };

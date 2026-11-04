@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "fa/gpu/pm4.hpp"
+#include "fa/gpu/png.hpp"
 #include "fa/gpu/primitive.hpp"
 #include "fa/gpu/shader.hpp"
 #include "fa/gpu/texture.hpp"
@@ -253,6 +254,7 @@ struct RenderTarget {
     Image image;
     bool depth = false;
     uint32_t xeFormat = 0;
+    uint32_t base = 0;  // EDRAM tile
 };
 
 struct Shader {
@@ -343,8 +345,16 @@ struct VulkanRenderer::Impl {
     std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     int drawsTraced = 0;
+    uint64_t frame = 0;  // swaps seen
+    // FA_RENDER_DUMP=<dir>: every 30th frame (12 of them) gets all its draws logged and all its
+    // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
+    const char* dumpDir = nullptr;
+    bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < 12)); }
 
-    Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {}
+    Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {
+        const char* d = std::getenv("FA_RENDER_DUMP");
+        if (d && *d) dumpDir = d;
+    }
 
     bool Fail(std::string& err, const char* what, VkResult r) {
         char b[256];
@@ -490,6 +500,7 @@ struct VulkanRenderer::Impl {
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
+        curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
         lastConstsOff = ~0ull;
@@ -816,16 +827,23 @@ struct VulkanRenderer::Impl {
     // ---- render targets ----------------------------------------------------------------------
     RenderTarget* GetRt(uint32_t base, uint32_t xeFormat, uint32_t pitch, uint32_t msaa, bool depth) {
         pitch = std::clamp<uint32_t>(pitch ? pitch : 1280, 16, 8192);
+        // Formats with the same bits share one image, so a pass that writes k_2_10_10_10 and a
+        // later one that reads the tile as k_2_10_10_10_AS_10_10_10_10 see the same pixels.
+        if (!depth && xeFormat == xe::kRt2_10_10_10As10) xeFormat = xe::kRt2_10_10_10;
+        if (!depth && xeFormat == xe::kRt2_10_10_10FloatAs16) xeFormat = xe::kRt2_10_10_10Float;
+        // Targets are single sampled, and MSAA does not change the key: the game's 4x tiled
+        // scene passes and the 1x passes that follow on the same EDRAM tile share pixels.
+        (void)msaa;
         uint64_t key = uint64_t(base & 0xFFF) | (uint64_t(xeFormat & 0xF) << 12) | (uint64_t(pitch) << 16) |
-                       (uint64_t(msaa & 3) << 32) | (uint64_t(depth) << 34);
+                       (uint64_t(depth) << 34);
         auto it = rts.find(key);
         if (it != rts.end()) return &it->second;
         RenderTarget& rt = rts[key];
         rt.depth = depth;
         rt.xeFormat = xeFormat;
+        rt.base = base & 0xFFF;
         uint32_t bpp = depth ? 4 : (IsRt64bpp(xeFormat) ? 8 : 4);
-        uint32_t samples = 1u << std::min<uint32_t>(msaa, 2);
-        uint32_t rows = std::clamp<uint32_t>(kEdramBytes / (pitch * bpp * samples), 16, 2048);
+        uint32_t rows = std::clamp<uint32_t>(kEdramBytes / (pitch * bpp), 16, 2048);
         rows = (rows + 15) & ~15u;
         VkFormat fmt = depth ? depthFormat : ColorRtVkFormat(xeFormat);
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1131,6 +1149,22 @@ struct VulkanRenderer::Impl {
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
+            // Views first: an upload can flush the batch, which resets the descriptor pool.
+            VkDescriptorImageInfo ii[64];
+            VkWriteDescriptorSet w[64];
+            uint32_t nw = 0;
+            for (uint32_t s = 0; s < 32; s++) {
+                if (!(texUsed & (1u << s))) continue;
+                bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
+                VkSampler smp;
+                VkImageView view = GetTexture(regs, s, cube, smp);
+                ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
+                w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w[nw].dstBinding = cube ? 32 + s : s;
+                w[nw].descriptorCount = 1;
+                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                nw++;
+            }
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
@@ -1142,22 +1176,9 @@ struct VulkanRenderer::Impl {
                 vkAllocateDescriptorSets(dev, &ai, &texSet);
             }
             texSetsUsed++;
-            VkDescriptorImageInfo ii[64];
-            VkWriteDescriptorSet w[64];
-            uint32_t nw = 0;
-            for (uint32_t s = 0; s < 32; s++) {
-                if (!(texUsed & (1u << s))) continue;
-                bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
-                VkSampler smp;
-                VkImageView view = GetTexture(regs, s, cube, smp);
-                ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
-                w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                w[nw].dstSet = texSet;
-                w[nw].dstBinding = cube ? 32 + s : s;
-                w[nw].descriptorCount = 1;
-                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                w[nw].pImageInfo = &ii[nw];
-                nw++;
+            for (uint32_t i = 0; i < nw; i++) {
+                w[i].dstSet = texSet;
+                w[i].pImageInfo = &ii[i];
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
         }
@@ -1312,16 +1333,119 @@ struct VulkanRenderer::Impl {
         vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
         stats.draws++;
 
-        if (drawsTraced < opt.traceDraws) {
+        if (drawsTraced < opt.traceDraws || DumpFrame()) {
             drawsTraced++;
             std::fprintf(stderr,
-                         "[render] draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
+                         "[render] frame %llu draw %llu: prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), dc.primType, uint32_t(hd.prim), hd.indices.size(),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
+            if (DumpFrame()) TraceInputs(regs, vs, ps, sys);
         }
+        if (DumpFrame()) {
+            for (int i = 0; i < 4; i++)
+                if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
+        }
+    }
+
+    // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
+    void DumpTarget(RenderTarget* rt, VkRect2D r, const char* what) {
+        static int count = 0;
+        if (count >= 300 || !r.extent.width || !r.extent.height) return;
+        uint32_t bpp = VkFormatBytes(rt->image.format);
+        VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
+        EndRendering();
+        if (bytes > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Barrier();
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        bic.imageOffset = {r.offset.x, r.offset.y, 0};
+        bic.imageExtent = {r.extent.width, r.extent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, rt->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        Barrier();
+        SubmitAndWait();
+        Begin();
+        std::vector<uint8_t> rgba(size_t(r.extent.width) * r.extent.height * 4);
+        const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
+        for (size_t i = 0; i < size_t(r.extent.width) * r.extent.height; i++) {
+            float f[4];
+            ReadbackToFloat(rt->image.format, rb + i * bpp, f);
+            for (int c = 0; c < 3; c++) rgba[i * 4 + c] = uint8_t(std::lround(std::clamp(f[c], 0.0f, 1.0f) * 255.0f));
+            rgba[i * 4 + 3] = 255;
+        }
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/f%04llu_%s%05llu_tile%03x_%ux%u.png", dumpDir, (unsigned long long)frame, what,
+                      (unsigned long long)stats.draws.load(), rt->base & 0xFFF, r.extent.width, r.extent.height);
+        WritePng(path, r.extent.width, r.extent.height, rgba.data());
+        count++;
+        for (auto& c : curColor) c = nullptr;
+        curDepth = nullptr;
+    }
+
+    // Dump frames: what the draw reads (textures, vertex buffers, a few vertices).
+    void TraceInputs(const RegisterFile& regs, Shader* vs, Shader* ps, const XeSystemConstants& sys) {
+        uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
+        for (uint32_t s = 0; s < 32; s++) {
+            if (!(texUsed & (1u << s))) continue;
+            uint32_t d[6];
+            for (int k = 0; k < 6; k++) d[k] = regs[pm4::kFetchConstBase + s * 6 + k];
+            TextureFetch t = ParseTextureFetch(d);
+            std::fprintf(stderr,
+                         "[render]   tex %u: type %u fmt %u %ux%u depth %u dim %u base %08x pitch %u %s endian %u swz %03x "
+                         "clamp %u,%u filter %u/%u | %08x %08x %08x %08x %08x %08x\n",
+                         s, t.type, t.format, t.width, t.height, t.depth, t.dimension, t.base, t.pitch,
+                         t.tiled ? "tiled" : "linear", t.endian, t.swizzle, t.clamp[0], t.clamp[1], t.magFilter, t.minFilter,
+                         d[0], d[1], d[2], d[3], d[4], d[5]);
+            // The texture as the CPU decoder sees it in guest memory, plus whether each row of
+            // blocks is made of identical blocks (a sign of degenerate source data).
+            static int texDumps = 0;
+            if (texDumps < 120 && t.dimension == 1 && GetFormatInfo(t.format).supported) {
+                const uint8_t* src = mem.HostPtr(t.base, TextureByteSize(t));
+                std::vector<uint8_t> rgba;
+                if (src && DecodeTexture(t, src, rgba)) {
+                    texDumps++;
+                    char path[512];
+                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
+                                  t.base, t.format, t.width, t.height);
+                    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+                    WritePng(path, t.width, t.height, rgba.data());
+                    uint32_t constRows = 0;
+                    for (uint32_t y = 0; y < t.height; y++) {
+                        const uint8_t* row = &rgba[size_t(y) * t.width * 4];
+                        bool same = true;
+                        for (uint32_t x = 1; x < t.width && same; x++) same = !std::memcmp(row, row + x * 4, 3);
+                        constRows += same;
+                    }
+                    std::fprintf(stderr, "[render]     decoded: %u of %u rows are one colour; raw:", constRows, t.height);
+                    for (int i = 0; i < 32; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", src[i]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+        for (uint32_t s = 0; s < 96; s++) {
+            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32)))) continue;
+            xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
+            std::fprintf(stderr, "[render]   vf %u: type %u addr %08x words %u endian %u | first words:", s, vf.type, vf.address,
+                         vf.sizeWords, vf.endian);
+            for (uint32_t i = 0; i < std::min<uint32_t>(vf.sizeWords, 24); i++) std::fprintf(stderr, " %08x", mem.Read32(vf.address + i * 4));
+            std::fprintf(stderr, "\n");
+        }
+        auto c = [&](uint32_t i, int k) { return xe::AsFloat(regs[pm4::kAluConstBase + i * 4 + k]); };
+        std::fprintf(stderr, "[render]   blend %08x colorctl %08x depthctl %08x | ps c0..c3", regs[xe::RB_BLENDCONTROL0],
+                     regs[xe::RB_COLORCONTROL], regs[xe::RB_DEPTHCONTROL]);
+        for (uint32_t i = 256; i < 260; i++) std::fprintf(stderr, " (%g %g %g %g)", c(i, 0), c(i, 1), c(i, 2), c(i, 3));
+        std::fprintf(stderr, " | vs c255 (%g %g %g %g)\n", c(255, 0), c(255, 1), c(255, 2), c(255, 3));
+        std::fprintf(stderr, "[render]   vport scale %g %g %g offset %g %g %g ndc scale %g %g offset %g %g flags %x %x %x\n",
+                     sys.vportScale[0], sys.vportScale[1], sys.vportScale[2], sys.vportOffset[0], sys.vportOffset[1],
+                     sys.vportOffset[2], sys.ndcScale[0], sys.ndcScale[1], sys.ndcOffset[0], sys.ndcOffset[1], sys.flags[0],
+                     sys.flags[1], sys.flags[2]);
     }
 
     void RecoverConsts(const uint32_t* consts, VkDeviceSize& constsOff, VkDeviceSize& boolOff, const RegisterFile& regs,
@@ -1487,10 +1611,14 @@ struct VulkanRenderer::Impl {
                 }
                 generation++;
                 static int logged = 0;
-                if (logged++ < 16)
-                    std::fprintf(stderr, "[render] resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u endian %u%s\n",
-                                 isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.endian,
-                                 d.swapRB ? " swapRB" : "");
+                if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
+                    std::fprintf(stderr,
+                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
+                                 "| src %03x/%u surf %08x wo %08x sc %08x vtx %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
+                                 (unsigned long long)frame, isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
+                                 d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
+                                 regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
+                DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
             }
         }
 
@@ -1501,6 +1629,42 @@ struct VulkanRenderer::Impl {
             RenderTarget* z = GetRt(dinfo & 0xFFF, (dinfo >> 16) & 1, pitch, msaa, true);
             if (z) ClearRect(z, regs, x0, y0, w, h, true);
         }
+    }
+
+    // FA_RENDER_DUMP=<dir>: PNGs of the first resolves (clamped to 0..1), for debugging.
+    void DumpResolve(const std::vector<float>& px, uint32_t w, uint32_t h, const ResolveDest& d, uint32_t tile,
+                     uint32_t fmt, uint32_t dx, uint32_t dy) {
+        if (!DumpFrame()) return;
+        static int count = 0;
+        if (count >= 400) return;
+        std::vector<uint8_t> rgba(size_t(w) * h * 4);
+        for (size_t i = 0; i < rgba.size(); i++) {
+            float v = (i % 4 == 3) ? 1.0f : px[i];  // force opaque so colour shows
+            rgba[i] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+        }
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/f%04llu_resolve%03d_%08x_fmt%u_from%03x_rt%u_%ux%u.png", dumpDir,
+                      (unsigned long long)frame, count, d.base, d.format, tile, fmt, w, h);
+        WritePng(path, w, h, rgba.data());
+        // What actually landed in guest memory, decoded the way a texture fetch would read it.
+        TextureFetch t;
+        t.type = 2;
+        t.format = d.format;
+        t.endian = d.endian & 3;
+        t.base = d.base;
+        t.pitch = (std::max(d.pitch, 32u) + 31) & ~31u;
+        t.width = std::min(t.pitch, dx + w);
+        t.height = std::max(d.height, dy + h);
+        t.tiled = true;
+        std::vector<uint8_t> dec;
+        const uint8_t* src = mem.HostPtr(d.base, TextureByteSize(t));
+        if (src && GetFormatInfo(t.format).supported && DecodeTexture(t, src, dec)) {
+            for (size_t i = 3; i < dec.size(); i += 4) dec[i] = 255;
+            std::snprintf(path, sizeof path, "%s/f%04llu_resolve%03d_%08x_inmemory_%ux%u.png", dumpDir,
+                          (unsigned long long)frame, count, d.base, t.width, t.height);
+            WritePng(path, t.width, t.height, dec.data());
+        }
+        count++;
     }
 
     void ClearRect(RenderTarget* rt, const RegisterFile& regs, int32_t x, int32_t y, uint32_t w, uint32_t h, bool depth) {
@@ -1535,6 +1699,7 @@ struct VulkanRenderer::Impl {
         SubmitAndWait();
         Begin();
         generation++;
+        frame++;
     }
 };
 

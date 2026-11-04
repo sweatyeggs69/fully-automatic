@@ -106,6 +106,10 @@ CommandProcessor::Result CommandProcessor::ExecutePacket(uint32_t& pos, uint32_t
             break;
         case pm4::kType2: break;  // padding NOP
         case pm4::kType3: {
+            if ((header & 1) && !(binSelect_ & binMask_)) {  // predicated for another tile
+                ++stats_.predicatedSkips;
+                break;
+            }
             Result r = ExecuteType3(pm4::T3Opcode(header), d, depth);
             if (r == Result::Blocked) return r;  // pos untouched, retried on next Pump
             break;
@@ -124,9 +128,26 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         case pm4::kInvalidateState:
         case pm4::kEventWrite:
         case pm4::kVizQuery:
-        case pm4::kSetBinMask: case pm4::kSetBinSelect:  // tiled-rendering predication: draw everything
-        case pm4::kSetBinMaskLo: case pm4::kSetBinMaskHi:
-        case pm4::kSetBinSelectLo: case pm4::kSetBinSelectHi:
+            break;
+
+        // Tiled-rendering predication (see binMask_).
+        case pm4::kSetBinMask:
+            if (n >= 2) binMask_ = (uint64_t(d[0]) << 32) | d[1];
+            break;
+        case pm4::kSetBinSelect:
+            if (n >= 2) binSelect_ = (uint64_t(d[0]) << 32) | d[1];
+            break;
+        case pm4::kSetBinMaskLo:
+            if (n >= 1) binMask_ = (binMask_ & 0xFFFFFFFF00000000ull) | d[0];
+            break;
+        case pm4::kSetBinMaskHi:
+            if (n >= 1) binMask_ = (binMask_ & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
+            break;
+        case pm4::kSetBinSelectLo:
+            if (n >= 1) binSelect_ = (binSelect_ & 0xFFFFFFFF00000000ull) | d[0];
+            break;
+        case pm4::kSetBinSelectHi:
+            if (n >= 1) binSelect_ = (binSelect_ & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
             break;
 
         case pm4::kImLoad: {

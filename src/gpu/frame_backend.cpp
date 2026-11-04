@@ -1,5 +1,6 @@
 #include "fa/gpu/frame_backend.hpp"
 
+#include "fa/gpu/png.hpp"
 #include "fa/gpu/pm4.hpp"
 
 #include <cstdio>
@@ -89,7 +90,10 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
     haveBest_ = false;
 
     // Skip the decode while the window still has not shown the previous frame.
-    if (!enabled_.load(std::memory_order_relaxed) || mailbox_.Pending()) return;
+    // FA_RENDER_DUMP: the front buffer after every 30th frame (matches the renderer's dump frames).
+    static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
+    const bool dumpThis = dumpDir && *dumpDir && (seq <= 6 || ((seq - 1) % 30 == 0 && seq <= 30 * 12));
+    if (!enabled_.load(std::memory_order_relaxed) || (mailbox_.Pending() && !dumpThis)) return;
 
     Frame f;
     f.seq = seq;
@@ -118,6 +122,14 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
                          fb.swizzle);
         }
         fbOk = DecodeFetch(fb, f);
+        if (fbOk && dumpThis) {
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/f%04llu_frontbuffer_%08x.png", dumpDir, (unsigned long long)(seq - 1), fb.base);
+            std::vector<uint8_t> opaque = f.rgba;
+            for (size_t i = 3; i < opaque.size(); i += 4) opaque[i] = 255;
+            WritePng(path, f.width, f.height, opaque.data());
+        }
+        if (dumpThis && mailbox_.Pending()) return;
         if (fbOk) {
             f.source = "frontbuffer";
             if (mode_ == Mode::Auto && !HasContent(f.rgba)) fbOk = false;

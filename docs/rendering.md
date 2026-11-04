@@ -42,6 +42,7 @@ the window shows the texture debug view.
 | `FA_DUMP_SHADERS=dir` | Write translated GLSL and disassembly |
 | `FA_VK_DEVICE=N` | Pick the Vulkan device (default: first discrete GPU) |
 | `FA_VK_VALIDATION=1` | Enable the Khronos validation layer |
+| `FA_RENDER_DUMP=dir` | Debug dumps for frames 0-5 and every 30th frame: every draw logged with its textures, vertex buffers, blend state and constants; PNGs of the colour target after each draw, each resolve (as rendered and as it decodes from memory), each bound texture and the front buffer |
 
 The window title adds `rendered N, skipped N, shader errors N`. Skipped draws are ones the
 renderer cannot handle yet (missing shader, unsupported primitive, no render target).
@@ -52,6 +53,15 @@ renderer cannot handle yet (missing shader, unsupported primitive, no render tar
 through the command processor and renderer (a vertex coloured triangle, a textured rectangle
 list, a clear and a resolve) and checks the resolved pixels. It runs on lavapipe
 (`mesa-vulkan-drivers`) and skips itself when there is no Vulkan device.
+
+## Predicated tiling
+
+The game renders 720p in three screen tiles (4x MSAA scene passes, 256 + 256 + 208 rows).
+D3D replays the frame once per tile and marks tile-specific packets with the type-3
+predicate bit; `SET_BIN_SELECT` / `SET_BIN_MASK` pick the tile. The command processor skips
+predicated packets whose tile is not selected, so each tile gets its own window offset and
+resolve destination. EDRAM targets ignore the MSAA mode, so the tiled 4x passes and the 1x
+passes that read the same tile share pixels.
 
 ## Not done yet
 
