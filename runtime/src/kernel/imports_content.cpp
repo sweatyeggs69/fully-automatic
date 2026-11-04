@@ -26,6 +26,9 @@
 using namespace fa::rt;
 
 void complete_overlapped(uint32_t ov, uint32_t result);  // imports_xmsg.cpp
+void post_system_notification(uint32_t id, uint32_t param);  // imports_xam.cpp
+
+constexpr uint32_t kXnSysUi = 0x9, kXnSysStorageDevicesChanged = 0xB;
 
 namespace {
 constexpr uint32_t kErrorIoPending = 997;
@@ -323,6 +326,7 @@ FA_IMPORT(XamShowDeviceSelectorUI) {
     };
     if (!ov) { st32(out, kDeviceId); ret32(ctx, 0); return; }
     dump("call", out, ov);
+    post_system_notification(kXnSysUi, 1);  // selector UI opened
     static const long delay_ms = [] {
         const char* e = std::getenv("FA_DEVICE_SELECT_DELAY_MS");
         return e ? std::atol(e) : 200L;
@@ -330,6 +334,8 @@ FA_IMPORT(XamShowDeviceSelectorUI) {
     if (delay_ms <= 0) {
         st32(out, kDeviceId);
         complete_overlapped(ov, 0);
+        post_system_notification(kXnSysUi, 0);
+        post_system_notification(kXnSysStorageDevicesChanged, 1);
         ret32(ctx, kErrorIoPending);
         return;
     }
@@ -341,6 +347,8 @@ FA_IMPORT(XamShowDeviceSelectorUI) {
         st32(out, kDeviceId);
         complete_overlapped(ov, 0);
         dump("done", out, ov);
+        post_system_notification(kXnSysUi, 0);  // selector UI closed
+        post_system_notification(kXnSysStorageDevicesChanged, 1);
     }).detach();
     ret32(ctx, kErrorIoPending);
 }
