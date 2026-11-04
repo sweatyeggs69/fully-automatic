@@ -4,6 +4,7 @@
 #include "fa/rt/import.hpp"
 #include "fa/rt/memory.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -49,7 +50,13 @@ FA_IMPORT(KeResumeThread) {
     ret32(ctx, g_kernel.resume(static_cast<KThread&>(*o)));
 }
 
-FA_IMPORT(NtYieldExecution) { std::this_thread::yield(); }
+FA_IMPORT(NtYieldExecution) {
+    // A guest spin loop on a lock another thread holds: show what every thread is doing, once
+    // early (20k yields) so the log has it long before the 1M spin report.
+    static std::atomic<uint64_t> n{0};
+    if (n.fetch_add(1, std::memory_order_relaxed) == 20000) g_kernel.dump_threads("NtYieldExecution x20000");
+    std::this_thread::yield();
+}
 FA_IMPORT(KeSetAffinityThread) { ret32(ctx, 0x3F); }
 FA_IMPORT(KeSetBasePriorityThread) { ret32(ctx, 0); }
 FA_IMPORT(KeQueryBasePriorityThread) { ret32(ctx, 0); }

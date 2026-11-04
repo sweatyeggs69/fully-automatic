@@ -101,6 +101,18 @@ uint32_t Kernel::wait(const std::vector<std::shared_ptr<KObject>>& objs, bool wa
         }
     }
 
+    struct WaitMark {
+        KThread* t;
+        WaitMark(KThread* th, const std::vector<std::shared_ptr<KObject>>& o) : t(th) {
+            if (!t) return;
+            t->wait_lr = t->ctx ? uint32_t(t->ctx->lr) : 0;
+            t->wait_first = o.empty() ? 0 : (o[0]->guest_ptr ? o[0]->guest_ptr : o[0]->handle);
+            t->wait_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            t->wait_count = int(o.size());
+        }
+        ~WaitMark() { if (t) t->wait_count = 0; }
+    } wait_mark(me, objs);
     std::unique_lock<std::mutex> lk(g_kmu);
     for (;;) {
         if (wait_all) {
@@ -133,6 +145,26 @@ uint32_t Kernel::wait(const std::vector<std::shared_ptr<KObject>>& objs, bool wa
 // ---- threads ----------------------------------------------------------------------------
 
 KThread* Kernel::current() const { return t_current; }
+
+void Kernel::dump_threads(const char* why) {
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(tmu_);
+    std::fprintf(stderr, "[threads] %s: %zu guest threads\n", why, threads_.size());
+    for (auto& t : threads_) {
+        int wc = t->wait_count.load();
+        std::fprintf(stderr,
+            "[threads]  tid=%u %s start=%08x ctx=%08x %s susp=%d", t->tid, t->name.c_str(),
+            t->start_address, t->start_context,
+            t->finished ? "FINISHED" : (!t->started ? "not-started" : (wc ? "WAITING" : "running")),
+            t->suspend_count);
+        if (wc && !t->finished)
+            std::fprintf(stderr, " on %d obj first=%08x lr=%08x for %lld ms", wc, t->wait_first.load(),
+                         t->wait_lr.load(), (long long)(now - t->wait_since_ms.load()));
+        if (t->finished) std::fprintf(stderr, " exit=%08x", t->exit_code);
+        std::fprintf(stderr, "\n");
+    }
+}
 
 bool Kernel::setup_thread_memory(KThread& t) {
     if (t.stack_size < kMinStack) t.stack_size = kDefaultStack;
@@ -210,6 +242,7 @@ void Kernel::thread_main(std::shared_ptr<KThread> t) {
         sync_thread_header(*t);
     }
     g_kcv.notify_all();
+    std::fprintf(stderr, "[thread] tid=%u start=%08x exited code=%08x\n", t->tid, t->start_address, t->exit_code);
 }
 
 std::shared_ptr<KThread> Kernel::create_thread(uint32_t stack_size, uint32_t xapi_startup,
@@ -375,6 +408,7 @@ void report_spin(const char* name, PPCContext& ctx, uint64_t count) {
     void* frames[24];
     int n = backtrace(frames, 24);
     backtrace_symbols_fd(frames, n, 2);
+    g_kernel.dump_threads(name);
 }
 
 void dump_guest_context_short() {

@@ -73,6 +73,10 @@ struct KThread : KObject {
     uint32_t exit_code = 0;
     std::thread host;
     PPCContext* ctx = nullptr;
+    // Wait diagnostics (dump_threads): what this thread is blocked on, if anything.
+    std::atomic<uint32_t> wait_lr{0}, wait_first{0};
+    std::atomic<int> wait_count{0};
+    std::atomic<int64_t> wait_since_ms{0};
 };
 
 // Thrown through guest frames by ExTerminateThread.
@@ -94,6 +98,8 @@ public:
     // timeout_ptr: guest pointer to a signed 64-bit 100ns count (negative = relative), or 0 to wait forever.
     uint32_t wait(const std::vector<std::shared_ptr<KObject>>& objs, bool wait_all, uint32_t timeout_ptr);
     void signal_changed() { g_kcv.notify_all(); }
+    // Prints every guest thread's state (running, waiting on what, finished) to stderr.
+    void dump_threads(const char* why);
 
     // ---- threads ----
     void set_tls_info(const TlsInfo& t) { tls_ = t; }
