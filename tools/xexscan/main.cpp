@@ -5,12 +5,18 @@
 //   xexscan default.xex [dump-image.bin]
 //   xexscan default.xex --dump16 0xADDR COUNT     (print big-endian halfwords)
 //   xexscan default.xex --disasm 0xSTART 0xEND     (print instructions in a range)
+//   xexscan default.xex --check-switches switch_tables.toml
+//       compares each [[switch]] with the table in the image: label mismatches, and further
+//       code-address words right after the last label (a table recorded too short)
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <regex>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include <image.h>
@@ -41,6 +47,55 @@ int main(int argc, char** argv) {
     Image img = Image::ParseImage(file.data(), file.size());
     if (!img.data) { std::fprintf(stderr, "failed to parse image\n"); return 1; }
 
+    if (argc == 4 && std::strcmp(argv[2], "--check-switches") == 0) {
+        std::ifstream tf(argv[3]);
+        if (!tf) { std::fprintf(stderr, "cannot open %s\n", argv[3]); return 1; }
+        std::string text((std::istreambuf_iterator<char>(tf)), {});
+        auto be32 = [&](size_t a, uint32_t& v) {
+            const uint8_t* p = static_cast<const uint8_t*>(img.Find(a));
+            if (!p) return false;
+            v = uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3];
+            return true;
+        };
+        auto is_code = [&](uint32_t a) {
+            for (const auto& s : img.sections)
+                if ((s.flags & SectionFlags_Code) && a >= s.base && a < s.base + s.size && !(a & 3)) return true;
+            return false;
+        };
+        std::regex re_switch(R"(\[\[switch\]\][^\[]*?base\s*=\s*(0x[0-9A-Fa-f]+)[^\[]*?labels\s*=\s*\[([^\]]*)\])");
+        int bad = 0, total = 0;
+        for (std::sregex_iterator it(text.begin(), text.end(), re_switch), end; it != end; ++it) {
+            size_t base = std::strtoull((*it)[1].str().c_str(), nullptr, 16);
+            std::vector<uint32_t> labels;
+            std::string body = (*it)[2].str();
+            static const std::regex re_hex("0x[0-9A-Fa-f]+");
+            for (std::sregex_iterator l(body.begin(), body.end(), re_hex), e2; l != e2; ++l)
+                labels.push_back(uint32_t(std::strtoull(l->str().c_str(), nullptr, 16)));
+            ++total;
+            bool ok = true;
+            for (size_t i = 0; i < labels.size(); i++) {
+                uint32_t w;
+                if (!be32(base + 4 + i * 4, w) || w != labels[i]) {
+                    std::printf("MISMATCH switch 0x%zX entry %zu: toml %08X image %08X\n", base, i, labels[i],
+                                be32(base + 4 + i * 4, w) ? w : 0);
+                    ok = false;
+                }
+            }
+            // More words that point into the same area as the labels: the table may be longer.
+            uint32_t lo = ~0u, hi = 0;
+            for (uint32_t a : labels) { lo = std::min(lo, a); hi = std::max(hi, a); }
+            size_t extra = 0;
+            for (size_t i = labels.size(); i < labels.size() + 32; i++) {
+                uint32_t w;
+                if (!be32(base + 4 + i * 4, w) || !is_code(w) || w + 0x1000 < lo || w > hi + 0x1000) break;
+                std::printf("LONGER? switch 0x%zX: word %zu after the labels is %08X (near the other labels)\n", base, i, w);
+                ++extra;
+            }
+            if (extra || !ok) ++bad;
+        }
+        std::printf("# %d switches checked, %d suspicious\n", total, bad);
+        return bad ? 3 : 0;
+    }
     if (argc == 5 && std::strcmp(argv[2], "--dump16") == 0) {
         size_t a = std::strtoull(argv[3], nullptr, 16), n = std::strtoull(argv[4], nullptr, 10);
         const uint8_t* p = static_cast<const uint8_t*>(img.Find(a));

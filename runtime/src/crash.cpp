@@ -7,6 +7,7 @@
 #include "fa/rt/kernel.hpp"
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <sys/syscall.h>
 #include <signal.h>
@@ -105,11 +106,45 @@ static void handler(int sig, siginfo_t* info, void* uc) {
     write_hex("fault address: ", a);
     uint64_t b = reinterpret_cast<uint64_t>(g_base);
     if (g_base && a >= b && a < b + kGuestWindow) write_hex("  = guest address: ", a - b);
-    void* frames[48];
-    int n = backtrace(frames, 48);
-    write_str("backtrace (innermost first):\n");
-    backtrace_symbols_fd(frames, n, 2);
+    // Guest state first: the native backtrace below can itself fault on a recompiled frame (its
+    // return address is a guest address), which used to lose this output.
+    auto* uctx = static_cast<ucontext_t*>(uc);
+    const auto& g = uctx->uc_mcontext.gregs;
+    write_hex("si_code: ", uint64_t(info->si_code));
+    write_hex("trap: ", uint64_t(g[REG_TRAPNO]));
+    write_hex("err: ", uint64_t(g[REG_ERR]));
+    uint64_t rip = uint64_t(g[REG_RIP]);
+    write_hex("host rip: ", rip);
+    Dl_info di{};
+    if (dladdr(reinterpret_cast<void*>(rip), &di)) {
+        write_hex("  module base: ", reinterpret_cast<uint64_t>(di.dli_fbase));
+        write_hex("  rip - base: ", rip - reinterpret_cast<uint64_t>(di.dli_fbase));
+        if (di.dli_sname) write_str("  nearest symbol: "), write_str(di.dli_sname), write_str("\n");
+    }
+    {   // the faulting instruction bytes (a #GP with a canonical-looking address is often an aligned SSE access)
+        char line[96];
+        const uint8_t* ip = reinterpret_cast<const uint8_t*>(rip);
+        int len = std::snprintf(line, sizeof line, "  bytes at rip:");
+        for (int i = 0; i < 16; i++) len += std::snprintf(line + len, sizeof line - len, " %02x", ip[i]);
+        line[len++] = '\n';
+        ssize_t r = ::write(2, line, len); (void)r;
+    }
+    static const char* const names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    static const int idx[] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP,
+                              REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+    for (int i = 0; i < 16; i++) {
+        char label[16];
+        std::snprintf(label, sizeof label, "  %s=", names[i]);
+        write_hex(label, uint64_t(g[idx[i]]));
+    }
     dump_guest_context();
+    if (const char* bt = std::getenv("FA_CRASH_BACKTRACE"); bt && bt[0] == '1') {
+        void* frames[48];
+        int n = backtrace(frames, 48);
+        write_str("backtrace (innermost first):\n");
+        backtrace_symbols_fd(frames, n, 2);
+    }
     _exit(128 + sig);
 }
 
