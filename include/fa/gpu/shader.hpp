@@ -34,6 +34,10 @@ struct TranslatedShader {
 
     // What the shader touches, so the renderer only uploads / binds what is needed.
     uint32_t vfetchUsed[3] = {0, 0, 0};  // bit i of word i/32: vertex fetch constant i (0..95)
+    // Dwords one vertex index can reach in vertex fetch constant i: index * vfetchStride[i] +
+    // vfetchEnd[i]. vfetchStride[i] == 0 means the extent is unknown (computed index).
+    uint32_t vfetchStride[96] = {};
+    uint32_t vfetchEnd[96] = {};
     uint32_t texUsed = 0;                // bit n: texture fetch constant n (0..31)
     uint8_t texDim[32] = {};             // dimension per used texture slot
     uint32_t colorWritten = 0;           // PS: bit n = oCn exported

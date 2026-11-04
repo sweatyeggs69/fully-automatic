@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -412,6 +413,10 @@ struct VulkanRenderer::Impl {
     std::unordered_map<uint64_t, Shader> shaders;
     VkShaderModule rectGs = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    struct TexKey { uint32_t binding; VkSampler smp; VkImageView view; };
+    VkDescriptorSet lastTexSet = VK_NULL_HANDLE;  // texture set of the previous draw in this batch
+    std::vector<TexKey> lastTexKey;
+    HostDraw hostDraw;  // reused across draws so its index buffer keeps its capacity
     std::map<uint64_t, RenderTarget> rts;
     std::unordered_map<uint64_t, Texture> textures;
     std::unordered_map<uint64_t, VkSampler> samplers;
@@ -430,10 +435,76 @@ struct VulkanRenderer::Impl {
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size) {
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (auto& [k, e] : snaps)
+            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) e.valid = false;
         for (auto& [k, t] : textures) {
             const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
             if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
         }
+    }
+
+    // ---- resolved surfaces kept on the GPU ---------------------------------------------------------
+    // A resolve of an 8888 target to guest memory also copies the pixels into an image of its own. A
+    // texture fetch that reads exactly that surface samples the image instead of hashing, decoding and
+    // uploading the guest bytes again (FA_RESOLVE_GPU=0 turns this off).
+    struct Snap {
+        Image img;
+        std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
+        bool valid = false;
+        uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
+        bool swapRB = false;
+        uint32_t samples[64] = {};  // dwords of the guest surface when it was resolved
+    };
+    std::unordered_map<uint32_t, Snap> snaps;  // by destination base (masked to 512 MB)
+    std::vector<VkImageView> garbageViews;
+    const bool snapEnabled = [] { const char* e = std::getenv("FA_RESOLVE_GPU"); return !(e && e[0] == '0'); }();
+
+    static bool SnapSample(const uint8_t* p, uint32_t size, uint32_t out[64]) {
+        const uint32_t words = size / 4;
+        if (words < 64) return false;
+        for (uint32_t i = 0; i < 64; i++) std::memcpy(&out[i], p + size_t(i) * (words / 64) * 4, 4);
+        return true;
+    }
+    void ReleaseSnapImage(Snap& e) {
+        for (auto& [k, v] : e.views) garbageViews.push_back(v);
+        e.views.clear();
+        if (e.img.img) garbageImages.push_back(e.img);
+        e.img = Image{};
+        e.valid = false;
+    }
+    // View of a still valid snapshot that matches this texture fetch, or null.
+    VkImageView SnapView(const TextureFetch& t) {
+        auto it = snaps.find(t.base & 0x1FFFFFFFu);
+        if (it == snaps.end() || !it->second.valid) return VK_NULL_HANDLE;
+        Snap& e = it->second;
+        if (!t.tiled || t.dimension != 1 || (t.format != 6 && t.format != 14 && t.format != 50)) return VK_NULL_HANDLE;
+        if (t.endian != e.endian || t.width != e.w || t.height != e.h || t.expAdjust != 0) return VK_NULL_HANDLE;
+        for (int c = 0; c < 4; c++) if (t.sign[c]) return VK_NULL_HANDLE;
+        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return VK_NULL_HANDLE;
+        const uint8_t* src = mem.HostPtr(t.base, e.size);
+        if (!src) return VK_NULL_HANDLE;
+        uint32_t cur[64];
+        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return VK_NULL_HANDLE; }
+        auto v = e.views.find(t.swizzle);
+        if (v != e.views.end()) return v->second;
+        VkComponentMapping cm;
+        VkComponentSwizzle* comps[4] = {&cm.r, &cm.g, &cm.b, &cm.a};
+        for (int c = 0; c < 4; c++) {
+            uint32_t sw = (t.swizzle >> (3 * c)) & 7;
+            if (e.swapRB && sw < 4 && sw != 1 && sw != 3) sw = sw == 0 ? 2 : 0;  // the resolve swapped R and B
+            *comps[c] = sw < 4 ? VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + sw)
+                      : sw == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+        }
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = e.img.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = e.img.format;
+        vi.components = cm;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        e.views[t.swizzle] = view;
+        return view;
     }
 
     std::vector<float> resolvePx;  // scratch for resolves that go through floats
@@ -624,13 +695,17 @@ struct VulkanRenderer::Impl {
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
+        lastTexSet = VK_NULL_HANDLE;
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
         lastConstsOff = ~0ull;
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
+        for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
+        garbageViews.clear();
         stats.submits++;
+        prof::Add(prof::kSubmits, 1);
     }
 
     // Linear allocation from the upload ring; flushes the batch when it runs out.
@@ -863,6 +938,11 @@ struct VulkanRenderer::Impl {
             for (auto& [k, t] : textures) DestroyImage(t.image);
             for (auto& [k, s] : samplers) vkDestroySampler(dev, s, nullptr);
             for (auto& im : garbageImages) DestroyImage(im);
+            for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
+            for (auto& [k, e] : snaps) {
+                for (auto& [sw, v] : e.views) vkDestroyImageView(dev, v, nullptr);
+                DestroyImage(e.img);
+            }
             DestroyImage(dummy2D);
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
@@ -1058,6 +1138,8 @@ struct VulkanRenderer::Impl {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
             if (cube || t.dimension == 3) return fallback.view;
         }
+        if (snapEnabled && !cube && !snaps.empty())
+            if (VkImageView sv = SnapView(t)) return sv;
         uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
@@ -1250,8 +1332,11 @@ struct VulkanRenderer::Impl {
         Shader* vs = GetShader(ShaderStage::Vertex, dc.vsUcode, dc.vsDwords, dc.vsHash);
         Shader* ps = GetShader(ShaderStage::Pixel, dc.psUcode, dc.psDwords, dc.psHash);
         if (!vs->ok || !ps->ok) { stats.drawsSkipped++; return; }
-        HostDraw hd;
-        if (!BuildHostDraw(dc, regs, mem, hd)) { stats.drawsSkipped++; return; }
+        std::optional<prof::Scope> sec;
+        sec.emplace(prof::kDrawBuild);
+        if (!BuildHostDraw(dc, regs, mem, hostDraw)) { stats.drawsSkipped++; return; }
+        HostDraw& hd = hostDraw;
+        prof::Add(prof::kIdxCount, hd.indices.size());
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 
@@ -1280,6 +1365,7 @@ struct VulkanRenderer::Impl {
         if (!depth && !colorMask) { stats.drawsSkipped++; return; }
 
         // Textures (uploads happen outside rendering, so before BeginRendering).
+        sec.emplace(prof::kDrawTex);
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
@@ -1299,6 +1385,11 @@ struct VulkanRenderer::Impl {
                 w[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 nw++;
             }
+            // Same samplers and views as the previous draw of this batch: reuse its descriptor set.
+            bool sameSet = lastTexSet != VK_NULL_HANDLE && lastTexKey.size() == nw;
+            for (uint32_t i = 0; i < nw && sameSet; i++)
+                sameSet = lastTexKey[i].binding == w[i].dstBinding && lastTexKey[i].smp == ii[i].sampler && lastTexKey[i].view == ii[i].imageView;
+            if (!sameSet) {
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
@@ -1315,9 +1406,16 @@ struct VulkanRenderer::Impl {
                 w[i].pImageInfo = &ii[i];
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
+            lastTexSet = texSet;
+            lastTexKey.resize(nw);
+            for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
+            } else {
+                texSet = lastTexSet;
+            }
         }
 
         // Uniforms and vertex data.
+        sec.emplace(prof::kDrawUpload);
         const VkDeviceSize uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
         bool flushed;
         VkDeviceSize constsOff;
@@ -1325,6 +1423,7 @@ struct VulkanRenderer::Impl {
         if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && !std::memcmp(lastConsts.data(), consts, 8192)) {
             constsOff = lastConstsOff;
         } else {
+            prof::Add(prof::kConstUploads, 1);
             constsOff = RingAlloc(8192, uboAlign, flushed);
             std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
             lastConsts.assign(consts, consts + 2048);
@@ -1373,11 +1472,32 @@ struct VulkanRenderer::Impl {
         if (sys.misc[1] <= 0.0f) sys.misc[1] = 1.0f;
 
         // Vertex buffers used by the vertex shader.
+        uint32_t maxIdx = ~0u;  // largest vertex index of this draw, computed on first use
         for (uint32_t s = 0; s < 96; s++) {
             if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32)))) continue;
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             uint32_t words = std::min<uint32_t>(vf.sizeWords, 4u << 20);
             if (vf.type != 3 || !words) continue;
+            // Games often give the fetch constant a whole pool as its size; only the part the draw's
+            // indices can reach needs copying (when the shader indexes straight from the vertex index).
+            if (vs->info.vfetchStride[s]) {
+                if (maxIdx == ~0u) {
+                    maxIdx = 0;
+                    for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
+                }
+                uint64_t need = uint64_t(maxIdx) * vs->info.vfetchStride[s] + vs->info.vfetchEnd[s];
+                words = uint32_t(std::min<uint64_t>(words, need));
+            }
+            if (prof::g_enabled) {
+                static int logged = 0;
+                static uint64_t seen = 0;
+                if (logged < 60 && seen++ % 700 == 0) {
+                    logged++;
+                    std::fprintf(stderr, "[vbprof] vs %016llx slot %u: fetch words %u, copy %u, stride %u end %u, indices %zu max %d\n",
+                                 (unsigned long long)dc.vsHash, s, vf.sizeWords, words, vs->info.vfetchStride[s],
+                                 vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
+                }
+            }
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
             VkDeviceSize at;
@@ -1389,6 +1509,7 @@ struct VulkanRenderer::Impl {
                 at = RingAlloc(words * 4, 16, flushed);
                 if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
                 std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
+                prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                 vbCache[key] = at;
             }
             sys.vf[s][0] = uint32_t(at / 4);
@@ -1410,6 +1531,7 @@ struct VulkanRenderer::Impl {
         std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
 
         // Pipeline.
+        sec.emplace(prof::kDrawRecord);
         PipelineKey key{};
         key.vs = dc.vsHash;
         key.ps = dc.psHash;
@@ -1771,6 +1893,31 @@ struct VulkanRenderer::Impl {
                 bic.imageOffset = {x0, y0, 0};
                 bic.imageExtent = {w, h, 1};
                 vkCmdCopyImageToBuffer(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+                // Plain 8888 surfaces from the top-left corner are also kept as a GPU image (see Snap).
+                Snap* snap = nullptr;
+                if (snapEnabled && !isDepth && d.expBias == 0 && src->image.format == VK_FORMAT_R8G8B8A8_UNORM &&
+                    (d.format == 6 || d.format == 14 || d.format == 50) && d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
+                    snap = &snaps[d.base & 0x1FFFFFFFu];
+                    if (snap->img.img && (snap->img.w != w || snap->img.h != h)) ReleaseSnapImage(*snap);
+                    if (!snap->img.img) {
+                        if (CreateImage(snap->img, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1,
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                            ImageToGeneral(snap->img.img, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                        } else {
+                            ReleaseSnapImage(*snap);
+                            snap = nullptr;
+                        }
+                    }
+                    if (snap) {
+                        snap->valid = false;
+                        Barrier();
+                        VkImageCopy ic{};
+                        ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        ic.extent = {w, h, 1};
+                        vkCmdCopyImage(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, snap->img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                    }
+                }
                 Barrier();
                 {
                     prof::Scope pw_(prof::kResolveWait);
@@ -1782,6 +1929,19 @@ struct VulkanRenderer::Impl {
                 uint32_t destBytes = ResolveDestByteSize(d);
                 if (!DumpFrame() && ResolveRaw(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
                     InvalidateTextures(d.base, destBytes);
+                    if (snap) {
+                        const uint8_t* gp = mem.HostPtr(d.base, destBytes);
+                        if (gp && SnapSample(gp, destBytes, snap->samples)) {
+                            snap->base = d.base & 0x1FFFFFFFu;
+                            snap->size = destBytes;
+                            snap->pitch = (std::max(d.pitch, 32u) + 31) & ~31u;
+                            snap->endian = d.endian;
+                            snap->swapRB = d.swapRB;
+                            snap->w = w;
+                            snap->h = h;
+                            snap->valid = true;
+                        }
+                    }
                     goto clears;
                 }
                 {

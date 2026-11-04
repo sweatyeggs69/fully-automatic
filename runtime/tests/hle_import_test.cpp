@@ -47,6 +47,8 @@ PPC_EXTERN_FUNC(XamContentCreateEnumerator);
 PPC_EXTERN_FUNC(XamShowDeviceSelectorUI);
 PPC_EXTERN_FUNC(XamContentCreateDeviceEnumerator);
 PPC_EXTERN_FUNC(XamEnumerate);
+PPC_EXTERN_FUNC(XamNotifyCreateListener);
+PPC_EXTERN_FUNC(XNotifyGetNext);
 PPC_EXTERN_FUNC(XamContentGetDeviceData);
 PPC_EXTERN_FUNC(XamContentGetDeviceName);
 PPC_EXTERN_FUNC(XamContentGetDeviceState);
@@ -152,8 +154,19 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
         CHECK(ld32(cb) == 8 * 0x134 && ld32(h) != 0);
         uint32_t dev = s + 0x308, ov = s + 0x310;
         std::memset(host(ov), 0, 0x1C);
+        uint32_t ln = K(ctx, XamNotifyCreateListener, 1, 0);
+        uint32_t nid = s + 0x2D0, npar = s + 0x2D4;
+        CHECK(K(ctx, XNotifyGetNext, ln, 0, nid, npar) == 0);
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, ov) == 997);
+        CHECK(ld32(ov) == 997);  // pending first, finished by a host thread
+        for (int i = 0; i < 100 && ld32(ov) == 997; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         CHECK(ld32(dev) == 1 && ld32(ov) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // UI opened (9,1), UI closed (9,0), storage changed (0xB,1), in that order.
+        CHECK(K(ctx, XNotifyGetNext, ln, 0, nid, npar) == 1 && ld32(nid) == 9 && ld32(npar) == 1);
+        CHECK(K(ctx, XNotifyGetNext, ln, 0xB, nid, npar) == 1 && ld32(nid) == 0xB && ld32(npar) == 1);
+        CHECK(K(ctx, XNotifyGetNext, ln, 0, nid, npar) == 1 && ld32(nid) == 9 && ld32(npar) == 0);
+        CHECK(K(ctx, XNotifyGetNext, ln, 0, nid, npar) == 0);
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, 0) == 0);
     }
 

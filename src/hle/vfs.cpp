@@ -657,6 +657,8 @@ bool Vfs::mount_defaults(const std::string& game_source, const std::string& data
     std::shared_ptr<Device> hdd = make_host_device(data_dir + "/hdd", false);
     std::shared_ptr<Device> cache = make_host_device(data_dir + "/cache", false);
     mount("\\Device\\Harddisk0\\Partition1", hdd);
+    // The game opens \Device\Harddisk0\Partition0 to probe the drive; give it the same storage.
+    mount("\\Device\\Harddisk0\\Partition0", hdd);
     mount("\\Device\\Harddisk0\\Cache0", cache);
     add_link("hdd:", "\\Device\\Harddisk0\\Partition1");
     add_link("e:", "\\Device\\Harddisk0\\Partition1");

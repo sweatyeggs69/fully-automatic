@@ -10,7 +10,10 @@
 #include "fa/hle/services.hpp"
 #include "fa/hle/vfs.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -23,6 +26,9 @@
 using namespace fa::rt;
 
 void complete_overlapped(uint32_t ov, uint32_t result);  // imports_xmsg.cpp
+void post_system_notification(uint32_t id, uint32_t param);  // imports_xam.cpp
+
+constexpr uint32_t kXnSysUi = 0x9, kXnSysStorageDevicesChanged = 0xB;
 
 namespace {
 constexpr uint32_t kErrorIoPending = 997;
@@ -307,17 +313,55 @@ FA_IMPORT(XamContentGetCreator) {
 }
 
 // (user_index, content_type, content_flags, min_free_bytes (u64), device_id*, overlapped*)
-// Auto-selects the single virtual device instead of showing UI.
+// Auto-selects the single virtual device instead of showing UI. Like the real call it returns
+// ERROR_IO_PENDING with the overlapped marked pending, and finishes it a moment later from a host
+// thread (FA_DEVICE_SELECT_DELAY_MS, default 200; 0 completes before returning).
 FA_IMPORT(XamShowDeviceSelectorUI) {
     uint32_t out = arg32(ctx, 4), ov = arg32(ctx, 5);
     if (!out) { ret32(ctx, kErrorInvalidParameter); return; }
-    st32(out, kDeviceId);
-    finish(ov, 0, ctx);
+    auto dump = [](const char* when, uint32_t out, uint32_t ov) {
+        std::fprintf(stderr, "Content: selector %s out=%08X [%08X] ov=%08X:", when, out, ld32(out), ov);
+        for (int i = 0; i < 0x1C; i += 4) std::fprintf(stderr, " %08X", ld32(ov + i));
+        std::fprintf(stderr, "\n");
+    };
+    if (!ov) { st32(out, kDeviceId); ret32(ctx, 0); return; }
+    dump("call", out, ov);
+    post_system_notification(kXnSysUi, 1);  // selector UI opened
+    static const long delay_ms = [] {
+        const char* e = std::getenv("FA_DEVICE_SELECT_DELAY_MS");
+        return e ? std::atol(e) : 200L;
+    }();
+    if (delay_ms <= 0) {
+        st32(out, kDeviceId);
+        complete_overlapped(ov, 0);
+        post_system_notification(kXnSysUi, 0);
+        post_system_notification(kXnSysStorageDevicesChanged, 1);
+        ret32(ctx, kErrorIoPending);
+        return;
+    }
+    st32(ov + 0x00, kErrorIoPending);  // pending until the thread below finishes it
+    st32(ov + 0x04, 0);
+    st32(ov + 0x18, 0);
+    std::thread([out, ov, dump] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        st32(out, kDeviceId);
+        complete_overlapped(ov, 0);
+        dump("done", out, ov);
+        post_system_notification(kXnSysUi, 0);  // selector UI closed
+        post_system_notification(kXnSysStorageDevicesChanged, 1);
+    }).detach();
+    ret32(ctx, kErrorIoPending);
 }
 
 // ---- wide printf --------------------------------------------------------------------
 // Guest va_list is a pointer to 8-byte big-endian slots; 32-bit values sit in the low half.
 namespace {
+
+// FA_TRACE_PRINTF=1 logs every vswprintf format and result.
+bool printf_trace() {
+    static const bool on = std::getenv("FA_TRACE_PRINTF") != nullptr;
+    return on;
+}
 
 struct VaList {
     uint32_t p;
@@ -459,6 +503,12 @@ FA_IMPORT(vswprintf) {
     uint32_t dst = arg32(ctx, 0);
     std::u16string s;
     if (!dst || !format_wide(arg32(ctx, 1), arg32(ctx, 2), s)) { ret32(ctx, uint32_t(-1)); return; }
+    if (printf_trace()) {
+        std::string f, o;
+        for (uint32_t i = arg32(ctx, 1); ld16(i); i += 2) f += char(ld16(i) < 128 ? ld16(i) : '?');
+        for (char16_t c : s) o += char(c < 128 ? c : '?');
+        std::fprintf(stderr, "vswprintf fmt=\"%s\" -> \"%s\"\n", f.c_str(), o.c_str());
+    }
     for (size_t i = 0; i < s.size(); ++i) st16(dst + uint32_t(i) * 2, s[i]);
     st16(dst + uint32_t(s.size()) * 2, 0);
     ret32(ctx, uint32_t(s.size()));

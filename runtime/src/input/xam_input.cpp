@@ -1,5 +1,7 @@
 // xam input imports: XamInputGetState and friends, backed by fa::hle::Input
 // (SDL2 game controllers plus a keyboard for player 1).
+#include <cstdlib>
+#include <cstdio>
 #include "fa/hle/services.hpp"
 #include "fa/rt/import.hpp"
 
@@ -67,14 +69,31 @@ FA_IMPORT(XamInputSetState) {
     ret32(ctx, services().input.set_vibration(user, v));
 }
 
-// Keystroke queues (chatpad / virtual keys) are not emulated: report "no input".
-FA_IMPORT(XamInputGetKeystroke) {
-    uint32_t user = arg32(ctx, 0);
-    ret32(ctx, services().input.connected(user) ? xi::kErrorEmpty : xi::kErrorDeviceNotConnected);
+// XamInputGetKeystroke(user, flags, XINPUT_KEYSTROKE*)
+uint32_t get_keystroke(uint32_t user, uint32_t out) {
+    if (!out) return kErrorBadArguments;
+    fa::hle::XInputKeystroke k;
+    uint32_t rc = services().input.get_keystroke(user, k);
+    if (rc == 0) {
+        st16(out + 0, k.virtual_key);
+        st16(out + 2, k.unicode);
+        st16(out + 4, k.flags);
+        st8(out + 6, k.user_index);
+        st8(out + 7, k.hid_code);
+        static const bool trace = std::getenv("FA_TRACE_INPUT") != nullptr;
+        if (trace)
+            std::fprintf(stderr, "[input] keystroke vk=%04X flags=%04X user=%u\n", k.virtual_key, k.flags, k.user_index);
+    }
+    return rc;
 }
 
+FA_IMPORT(XamInputGetKeystroke) { ret32(ctx, get_keystroke(arg32(ctx, 0), arg32(ctx, 2))); }
+
+// XamInputGetKeystrokeEx(DWORD* user_index in/out, flags, XINPUT_KEYSTROKE*)
 FA_IMPORT(XamInputGetKeystrokeEx) {
-    uint32_t user_ptr = arg32(ctx, 0);
-    uint32_t user = user_ptr ? ld32(user_ptr) : 0;
-    ret32(ctx, services().input.connected(user) ? xi::kErrorEmpty : xi::kErrorDeviceNotConnected);
+    uint32_t user_ptr = arg32(ctx, 0), out = arg32(ctx, 2);
+    uint32_t user = user_ptr ? ld32(user_ptr) : xi::kUserAny;
+    uint32_t rc = get_keystroke(user, out);
+    if (rc == 0 && user_ptr) st32(user_ptr, ld8(out + 6));
+    ret32(ctx, rc);
 }
