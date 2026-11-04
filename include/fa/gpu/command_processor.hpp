@@ -58,6 +58,7 @@ private:
     uint64_t binMask_ = 0xFFFFFFFFull, binSelect_ = 0xFFFFFFFFull;
     void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
     Stats stats_;
+    std::vector<uint32_t> payload_;  // scratch for the packet being executed
 };
 
 }  // namespace fa::gpu

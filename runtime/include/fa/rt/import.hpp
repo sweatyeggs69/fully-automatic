@@ -24,16 +24,38 @@ extern bool g_trace_imports;
 void trace_import(const char* name, PPCContext& ctx, bool entry);
 // Called when one import has been called a very large number of times (a guest spin loop).
 void report_spin(const char* name, PPCContext& ctx, uint64_t count);
+
+// Per-import call counter, linked into a global list on first use. FA_PROFILE reports them.
+struct ImportStat {
+    explicit ImportStat(const char* n);
+    const char* name;
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> ticks{0};  // TSC ticks spent inside the import, counted only under FA_PROFILE
+    ImportStat* next = nullptr;
+};
+extern bool g_profile;
+// Cheap timestamp (TSC ticks) for timing imports under FA_PROFILE. rdtscp, not rdtsc: the
+// guest timebase patcher rewrites inlined rdtsc sequences (timebase.cpp) and would rescale these.
+inline uint64_t profile_ticks() {
+    unsigned aux;
+    return __builtin_ia32_rdtscp(&aux);
+}
 }  // namespace fa::rt
 
 #define FA_IMPORT(name)                                                       \
     static void fa_impl_##name(PPCContext& ctx, uint8_t* base);               \
     PPC_FUNC(__imp__##name) {                                                 \
-        static std::atomic<uint64_t> fa_calls;                                \
-        uint64_t fa_n = ++fa_calls;                                           \
+        static fa::rt::ImportStat fa_stat{#name};                             \
+        uint64_t fa_n = fa_stat.calls.fetch_add(1, std::memory_order_relaxed) + 1; \
         if (fa_n == 1000000 || fa_n == 30000000) fa::rt::report_spin(#name, ctx, fa_n); \
         if (fa::rt::g_trace_imports) fa::rt::trace_import(#name, ctx, true);  \
-        fa_impl_##name(ctx, base);                                            \
+        if (fa::rt::g_profile) {                                              \
+            uint64_t fa_t0 = fa::rt::profile_ticks();                        \
+            fa_impl_##name(ctx, base);                                        \
+            fa_stat.ticks.fetch_add(fa::rt::profile_ticks() - fa_t0, std::memory_order_relaxed); \
+        } else {                                                              \
+            fa_impl_##name(ctx, base);                                        \
+        }                                                                     \
         if (fa::rt::g_trace_imports) fa::rt::trace_import(#name, ctx, false); \
     }                                                                         \
     PPC_FUNC(name) { __imp__##name(ctx, base); }                              \

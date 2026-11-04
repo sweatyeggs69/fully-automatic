@@ -3,6 +3,11 @@
 #include "fa/rt/import.hpp"
 #include "fa/rt/memory.hpp"
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <cstdio>
 
 using namespace fa::rt;
@@ -260,15 +265,44 @@ FA_IMPORT(NtSignalAndWaitForSingleObjectEx) {
 // ---- critical sections ---------------------------------------------------------------------
 // Guest layout (X_RTL_CRITICAL_SECTION): 0x10 byte dispatcher header, then
 // +0x10 lock_count, +0x14 recursion_count, +0x18 owning thread id.
+//
+// The owner word is taken with a compare-and-swap, so an uncontended enter/leave is a few
+// instructions and takes no host lock. A thread that cannot get the section spins briefly, then
+// sleeps on a futex on the owner word. Only the owner touches the two counters.
 
 namespace {
 uint32_t me() { return g_kernel.current() ? g_kernel.current()->tid : 1; }
+
+std::atomic<int> g_cs_waiters{0};
+
+uint32_t* cs_owner(uint32_t p) { return reinterpret_cast<uint32_t*>(host(p + 0x18)); }
+
+long futex(uint32_t* addr, int op, uint32_t val) {
+    return syscall(SYS_futex, addr, op, val, nullptr, nullptr, 0);
+}
 
 void cs_init(uint32_t p) {
     st32(p + 0x00, 1);
     st32(p + 0x10, 0xFFFFFFFF);
     st32(p + 0x14, 0);
     st32(p + 0x18, 0);
+}
+
+// Fast path shared by enter and try-enter: true if the caller now owns the section.
+bool cs_try(uint32_t p, uint32_t self_be) {
+    uint32_t* own = cs_owner(p);
+    if (__atomic_load_n(own, __ATOMIC_RELAXED) == self_be) {  // recursive enter
+        uint32_t rc = ld32(p + 0x14) + 1;
+        st32(p + 0x14, rc);
+        st32(p + 0x10, rc - 1);
+        return true;
+    }
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(own, &expected, self_be, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return false;
+    st32(p + 0x14, 1);
+    st32(p + 0x10, 0);
+    return true;
 }
 }  // namespace
 
@@ -277,35 +311,32 @@ FA_IMPORT(RtlInitializeCriticalSectionAndSpinCount) { cs_init(arg32(ctx, 0)); }
 FA_IMPORT(RtlDeleteCriticalSection) { }
 
 FA_IMPORT(RtlEnterCriticalSection) {
-    uint32_t p = arg32(ctx, 0), t = me();
-    std::unique_lock<std::mutex> lk(g_kmu);
-    while (ld32(p + 0x18) != 0 && ld32(p + 0x18) != t) g_kcv.wait(lk);
-    st32(p + 0x18, t);
-    st32(p + 0x14, ld32(p + 0x14) + 1);
-    st32(p + 0x10, ld32(p + 0x14) - 1);
+    uint32_t p = arg32(ctx, 0), self_be = __builtin_bswap32(me());
+    for (int spin = 0; !cs_try(p, self_be); ++spin) {
+        if (spin < 100) { __builtin_ia32_pause(); continue; }
+        // Announce the waiter before the final check, so a leaving owner either sees the count
+        // or this thread sees the free owner word (both sides use sequentially consistent ops).
+        g_cs_waiters.fetch_add(1);
+        uint32_t cur = __atomic_load_n(cs_owner(p), __ATOMIC_SEQ_CST);
+        if (cur != 0) futex(cs_owner(p), FUTEX_WAIT_PRIVATE, cur);
+        g_cs_waiters.fetch_sub(1);
+    }
 }
 
 FA_IMPORT(RtlTryEnterCriticalSection) {
-    uint32_t p = arg32(ctx, 0), t = me();
-    std::lock_guard<std::mutex> lk(g_kmu);
-    if (ld32(p + 0x18) != 0 && ld32(p + 0x18) != t) { ret32(ctx, 0); return; }
-    st32(p + 0x18, t);
-    st32(p + 0x14, ld32(p + 0x14) + 1);
-    st32(p + 0x10, ld32(p + 0x14) - 1);
-    ret32(ctx, 1);
+    ret32(ctx, cs_try(arg32(ctx, 0), __builtin_bswap32(me())) ? 1 : 0);
 }
 
 FA_IMPORT(RtlLeaveCriticalSection) {
     uint32_t p = arg32(ctx, 0);
-    std::lock_guard<std::mutex> lk(g_kmu);
     uint32_t rc = ld32(p + 0x14);
     if (rc == 0) return;
     --rc;
     st32(p + 0x14, rc);
     st32(p + 0x10, rc - 1);
     if (rc == 0) {
-        st32(p + 0x18, 0);
-        g_kcv.notify_all();
+        __atomic_store_n(cs_owner(p), 0u, __ATOMIC_SEQ_CST);
+        if (g_cs_waiters.load()) futex(cs_owner(p), FUTEX_WAKE_PRIVATE, 1);
     }
 }
 
@@ -318,7 +349,10 @@ FA_IMPORT(KfLowerIrql) { }
 static void spin_acquire(uint32_t p) {
     auto* w = reinterpret_cast<uint32_t*>(host(p));
     uint32_t t = me();
-    while (!__sync_bool_compare_and_swap(w, 0u, t)) std::this_thread::yield();
+    for (int spin = 0; !__sync_bool_compare_and_swap(w, 0u, t); ++spin) {
+        if (spin < 200) __builtin_ia32_pause();
+        else std::this_thread::yield();
+    }
 }
 FA_IMPORT(KfAcquireSpinLock) { spin_acquire(arg32(ctx, 0)); ret32(ctx, 0); }
 FA_IMPORT(KfReleaseSpinLock) { __sync_lock_release(reinterpret_cast<uint32_t*>(host(arg32(ctx, 0)))); }

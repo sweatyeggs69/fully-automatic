@@ -331,6 +331,31 @@ uint32_t HostTextureByteSize(const TextureFetch& t) {
     return face;
 }
 
+// Unsigned 8-bit and DXT formats going to an RGBA8 host texture: the bytes are the result, so
+// skip the float round trip. Returns false for formats it does not cover.
+static bool DecodeBytesFast(uint32_t f, const uint8_t* b, uint8_t* dst, uint32_t bx, uint32_t by, const FormatInfo& fi,
+                            uint32_t width, uint32_t height) {
+    uint8_t px[16][4];
+    switch (f) {
+        case 2: case 8: case 9: px[0][0] = b[0]; px[0][1] = 0; px[0][2] = 0; px[0][3] = 255; break;
+        case 10: px[0][0] = b[0]; px[0][1] = b[1]; px[0][2] = 0; px[0][3] = 255; break;
+        case 6: case 14: case 50: std::memcpy(px[0], b, 4); break;
+        case 18: case 19: case 20: case 51: case 52: case 53: DecodeBlock(f, b, px); break;
+        default: return false;
+    }
+    const uint32_t bw = fi.blockW, bh = fi.blockH;
+    for (uint32_t iy = 0; iy < bh; iy++) {
+        const uint32_t y = by * bh + iy;
+        if (y >= height) break;
+        for (uint32_t ix = 0; ix < bw; ix++) {
+            const uint32_t x = bx * bw + ix;
+            if (x >= width) break;
+            std::memcpy(dst + (size_t(y) * width + x) * 4, px[iy * bw + ix], 4);
+        }
+    }
+    return true;
+}
+
 bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out) {
     FormatInfo fi = GetHostFormatInfo(t.format);
     if (!fi.supported || !t.width || !t.height) return false;
@@ -361,6 +386,7 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
                                        : by * l.rowBytes + bx * fi.bytesPerBlock;
                 if (off + fi.bytesPerBlock > l.size) continue;
                 const uint8_t* b = sw.data() + off;
+                if (!out.isFloat && DecodeBytesFast(f, b, dstLayer, bx, by, fi, t.width, t.height)) continue;
                 float px[16][4];
                 for (auto& p : px) { p[0] = p[1] = p[2] = 0.0f; p[3] = 1.0f; }
                 auto bitsN = [&](uint32_t v, int sh, int n) { return float((v >> sh) & ((1u << n) - 1)) / float((1u << n) - 1); };
@@ -473,7 +499,7 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
                         for (int c = 0; c < 4; c++) v[c] *= expScale;
                         std::memcpy(o, v, 16);
                     } else {
-                        for (int c = 0; c < 4; c++) o[c] = uint8_t(std::lround(std::clamp(v[c], 0.0f, 1.0f) * 255.0f));
+                        for (int c = 0; c < 4; c++) o[c] = uint8_t(std::clamp(v[c], 0.0f, 1.0f) * 255.0f + 0.5f);
                     }
                 }
             }
@@ -518,7 +544,8 @@ void EncodeResolve(const ResolveDest& d, uint32_t dx, uint32_t dy, uint32_t w, u
         default: break;
     }
     const float scale = std::ldexp(1.0f, d.expBias);
-    auto un = [](float v, uint32_t maxv) { return uint32_t(std::lround(std::clamp(v, 0.0f, 1.0f) * float(maxv))); };
+    // + 0.5 and truncate: the same as lround for non-negative values, without the libm call.
+    auto un = [](float v, uint32_t maxv) { return uint32_t(double(std::clamp(v, 0.0f, 1.0f)) * maxv + 0.5); };
     for (uint32_t y = 0; y < h; y++) {
         uint32_t ty = dy + y;
         if (ty >= height) break;
