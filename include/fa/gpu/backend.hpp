@@ -25,13 +25,23 @@ struct DrawCall {
     uint32_t indexGuestAddr = 0;
     uint32_t indexEndian = 0;   // Xenos endian swap mode for index data
     std::vector<uint32_t> inlineIndices;  // indices carried inside the packet (host order)
+    // Shader microcode loaded with IM_LOAD / IM_LOAD_IMMEDIATE (host order dwords), owned by the
+    // command processor and valid during the Draw call.
+    const uint32_t* vsUcode = nullptr;
+    uint32_t vsDwords = 0;
+    uint64_t vsHash = 0;
+    const uint32_t* psUcode = nullptr;
+    uint32_t psDwords = 0;
+    uint64_t psHash = 0;
 };
 
 class Backend {
 public:
     virtual ~Backend() = default;
     virtual void Draw(const DrawCall& draw, const RegisterFile& regs) = 0;
-    // EVENT_WRITE_EXT resolve: copy EDRAM contents to a texture in guest memory.
+    // Resolve: a draw issued with RB_MODECONTROL.edram_mode = copy. Copies (and optionally
+    // clears) an EDRAM rectangle into guest memory as described by RB_COPY_* registers; the
+    // rectangle comes from the three vertices at vertex fetch constant 0.
     virtual void Resolve(const RegisterFile& regs) = 0;
     // Present: the game finished a frame (VdSwap / PM4 XE_SWAP). VdSwap loads the front
     // buffer's texture fetch constant into fetch slot 0 (regs 0x4800..0x4805) first.

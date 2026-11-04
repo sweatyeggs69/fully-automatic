@@ -1,8 +1,11 @@
 #include "fa/gpu/command_processor.hpp"
 
+#include <algorithm>
 #include <vector>
 
 #include "fa/gpu/pm4.hpp"
+#include "fa/gpu/shader.hpp"
+#include "fa/gpu/xenos.hpp"
 
 namespace fa::gpu {
 
@@ -44,6 +47,15 @@ void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
         uint32_t i = reg - pm4::kScratchReg0;
         if (regs_[pm4::kScratchUmsk] & (1u << i)) mem_.Write32(regs_[pm4::kScratchAddr] + i * 4, value);
     }
+}
+
+void CommandProcessor::LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr) {
+    if (type > 1) { ++stats_.unknown; return; }
+    ShaderSlot& s = shaders_[type];
+    s.ucode = std::move(ucode);
+    s.hash = HashUcode(s.ucode.data(), s.ucode.size()) ^ (uint64_t(type) << 63);
+    s.srcAddr = srcAddr;
+    ++stats_.shaderLoads;
 }
 
 CommandProcessor::Status CommandProcessor::Pump() {
@@ -112,12 +124,27 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         case pm4::kInvalidateState:
         case pm4::kEventWrite:
         case pm4::kVizQuery:
-        case pm4::kImLoad:
-        case pm4::kImLoadImmediate:  // shader ucode is fetched from guest memory at draw time
         case pm4::kSetBinMask: case pm4::kSetBinSelect:  // tiled-rendering predication: draw everything
         case pm4::kSetBinMaskLo: case pm4::kSetBinMaskHi:
         case pm4::kSetBinSelectLo: case pm4::kSetBinSelectHi:
             break;
+
+        case pm4::kImLoad: {
+            // d0 = address | shader type (0 vertex, 1 pixel), d1 = start << 16 | size in dwords.
+            if (n < 2) break;
+            uint32_t type = d[0] & 3, addr = d[0] & ~3u, size = d[1] & 0xFFFF;
+            std::vector<uint32_t> u(size);
+            for (uint32_t i = 0; i < size; i++) u[i] = mem_.Read32(addr + i * 4);
+            LoadShader(type, std::move(u), addr);
+            break;
+        }
+        case pm4::kImLoadImmediate: {
+            // d0 = shader type, d1 = start << 16 | size in dwords, then the microcode.
+            if (n < 2) break;
+            uint32_t type = d[0] & 3, size = std::min<uint32_t>(d[1] & 0xFFFF, n - 2);
+            LoadShader(type, std::vector<uint32_t>(d.begin() + 2, d.begin() + 2 + size), 0);
+            break;
+        }
 
         case pm4::kInterrupt:
             if (interrupt_) interrupt_(n ? d[0] : 0);
@@ -166,8 +193,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (n >= 3) mem_.Write32(d[1] & ~3u, d[2]);
             break;
 
-        case pm4::kEventWriteExt:  // EDRAM resolve
-            backend_.Resolve(regs_);
+        case pm4::kEventWriteExt:  // screen extents report; resolves are copy-mode draws
             break;
 
         case pm4::kSetConstant: {
@@ -222,6 +248,19 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                     else { dc.inlineIndices.push_back(d[i] >> 16); dc.inlineIndices.push_back(d[i] & 0xFFFF); }
                 }
                 if (dc.inlineIndices.size() > dc.indexCount) dc.inlineIndices.resize(dc.indexCount);
+            }
+            regs_[xe::VGT_DRAW_INITIATOR] = init;
+            if ((regs_[xe::RB_MODECONTROL] & 7) == xe::kEdramCopy) {
+                backend_.Resolve(regs_);
+                ++stats_.resolves;
+                break;
+            }
+            for (int t = 0; t < 2; t++) {
+                const ShaderSlot& s = shaders_[t];
+                if (s.ucode.empty()) continue;
+                (t ? dc.psUcode : dc.vsUcode) = s.ucode.data();
+                (t ? dc.psDwords : dc.vsDwords) = uint32_t(s.ucode.size());
+                (t ? dc.psHash : dc.vsHash) = s.hash;
             }
             backend_.Draw(dc, regs_);
             ++stats_.draws;

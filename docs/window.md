@@ -7,13 +7,14 @@ host thread with a 64 MB stack.
 
 ## Where frames come from
 
-There is no rasterizer yet (draws and shaders are the next step), so `FrameBackend`
-(`src/gpu/frame_backend.cpp`) turns each swap into an RGBA8 picture on the CPU:
+Draws are rendered by the Vulkan renderer (see [rendering.md](rendering.md)), which resolves
+EDRAM into guest memory exactly where the game expects its front buffer. `FrameBackend`
+(`src/gpu/frame_backend.cpp`) then turns each swap into an RGBA8 picture on the CPU:
 
 - **frontbuffer**: `VdSwap` loads the front buffer's texture fetch constant into fetch slot 0
   and emits `XE_SWAP`. The backend reads that fetch constant (format, endian, tiling, pitch,
-  swizzle), untiles and endian swaps the front buffer from guest memory and decodes it. Until
-  draws and EDRAM resolves are implemented this stays black, because nothing writes it.
+  swizzle), untiles and endian swaps the front buffer from guest memory and decodes it. Without
+  the renderer (no shaderc, or `FA_RENDERER=0`) this stays black, because nothing writes it.
 - **texture** (debug view): the largest 2D texture bound by any draw of the frame. Splash
   screens, menus and movie frames are usually drawn as one full screen textured quad, so this
   shows them before shaders exist. Movies decoded to YUV planes show as a grey luma picture.

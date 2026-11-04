@@ -13,7 +13,7 @@ namespace fa::gpu {
 class CommandProcessor {
 public:
     struct Stats {
-        uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0;
+        uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0, resolves = 0, shaderLoads = 0;
         uint64_t unknownOps[128] = {};  // unhandled type-3 packets by opcode
     };
     enum class Status { Idle, Blocked };
@@ -51,6 +51,9 @@ private:
     uint32_t ringBase_ = 0, ringSizeDwords_ = 0, rptr_ = 0, wptr_ = 0, rptrWriteback_ = 0;
     std::function<void(uint32_t)> interrupt_;
     struct IndirectBuffer { bool active = false; uint32_t base = 0, size = 0, pos = 0; } ib_;
+    // Shader microcode by type (0 = vertex, 1 = pixel), as the last IM_LOAD left it.
+    struct ShaderSlot { std::vector<uint32_t> ucode; uint64_t hash = 0; uint32_t srcAddr = 0; } shaders_[2];
+    void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
     Stats stats_;
 };
 

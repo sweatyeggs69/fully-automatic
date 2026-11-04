@@ -108,6 +108,9 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
         }
         return host(g);
     }
+    uint8_t* HostPtrWrite(uint32_t a, uint32_t size) override {
+        return const_cast<uint8_t*>(HostPtr(a, size));  // resolves write textures / the front buffer
+    }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
@@ -117,6 +120,7 @@ RtGuestMemory g_gpu_mem;
 fa::gpu::FrameBackend g_gpu_backend(g_gpu_mem);
 fa::gpu::CommandProcessor* g_cp = nullptr;
 std::atomic<bool> g_gpu_started{false};
+std::atomic<fa::gpu::Backend*> g_backend_override{nullptr};
 
 void gpu_thread() {
     attach_guest_thread("gpu");
@@ -161,7 +165,8 @@ void gpu_thread() {
 
 void start_gpu() {
     if (g_gpu_started.exchange(true)) return;
-    g_cp = new fa::gpu::CommandProcessor(g_gpu_mem, g_gpu_backend);
+    fa::gpu::Backend* be = g_backend_override.load();
+    g_cp = new fa::gpu::CommandProcessor(g_gpu_mem, be ? *be : static_cast<fa::gpu::Backend&>(g_gpu_backend));
     g_cp->SetRingBuffer(g_vd.ring_base, g_vd.ring_size_bytes);
     if (g_vd.rptr_writeback) g_cp->SetReadPtrWriteback(g_vd.rptr_writeback);
     std::thread(gpu_thread).detach();
@@ -169,6 +174,11 @@ void start_gpu() {
 }  // namespace
 
 fa::gpu::FrameBackend& fa::rt::gpu_frame_backend() { return g_gpu_backend; }
+fa::gpu::GuestMemory& fa::rt::gpu_memory() { return g_gpu_mem; }
+void fa::rt::set_gpu_backend(fa::gpu::Backend* backend) {
+    if (g_gpu_started.load()) std::fprintf(stderr, "[gpu] set_gpu_backend after the GPU started: ignored\n");
+    g_backend_override.store(backend);
+}
 
 FA_IMPORT(VdInitializeRingBuffer) {
     // (physical base, log2 of the size in 8-byte units)

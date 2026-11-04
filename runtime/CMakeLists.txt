@@ -25,7 +25,8 @@ file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 # The GPU command processor lives in the top-level src/gpu.
 list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/texture.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/frame_backend.cpp)
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/texture.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/frame_backend.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/shader_translator.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/primitive.cpp)
 # The game window (SDL2 + Vulkan). Optional: FA_NO_WINDOW=ON or no Vulkan -> headless build.
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_present.cmake)
 
@@ -83,6 +84,9 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     if(TARGET fa_present)
         target_link_libraries(fullauto PRIVATE fa_present)
         target_compile_definitions(fullauto PRIVATE FA_WITH_PRESENTER)
+    endif()
+    if(TARGET fa_render)
+        target_link_libraries(fullauto PRIVATE fa_render)
     endif()
     # The recompiled code is huge; keep per-file compile cheap by default.
     set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-fno-strict-aliasing")

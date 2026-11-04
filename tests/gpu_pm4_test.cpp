@@ -45,8 +45,10 @@ int main() {
     put(T3(pm4::kDrawIndx2, 3)); put((4u << 16) | (1u << 6) | 4); put(0x00000001); put(0x00020003);
     // Fence write.
     put(T3(pm4::kEventWriteShd, 3)); put(0); put(0x200); put(0xDEAD);
-    // Resolve + swap.
-    put(T3(pm4::kEventWriteExt, 1)); put(0);
+    // Resolve (a draw in EDRAM copy mode) + swap.
+    put((0u << 16) | 0x2208); put(6);
+    put(T3(pm4::kDrawIndx2, 1)); put((3u << 16) | (2u << 6) | 8);
+    put((0u << 16) | 0x2208); put(4);
     put(T3(pm4::kXeSwap, 4)); put(0x50415753); put(0x00A00000); put(1280); put(720);
 
     cp.SetWritePtr(w);
@@ -105,6 +107,17 @@ int main() {
     cp.SetWritePtr(w % (ringBytes / 4));
     CHECK(cp.Pump() == CommandProcessor::Status::Idle);
     CHECK(cp.GetStats().unknown == 1 && cp.GetStats().unknownOps[0x7E] == 1);
+
+    // IM_LOAD_IMMEDIATE (pixel) and IM_LOAD (vertex, from memory): the next draw carries the ucode.
+    put(T3(pm4::kImLoadImmediate, 5)); put(1); put(3); put(0x11); put(0x22); put(0x33);
+    mem.Write32(0x3000, 0xA1); mem.Write32(0x3004, 0xA2);
+    put(T3(pm4::kImLoad, 2)); put(0x3000 | 0); put(2);
+    put(T3(pm4::kDrawIndx2, 1)); put((3u << 16) | (2u << 6) | 4);
+    cp.SetWritePtr(w % (ringBytes / 4));
+    CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+    CHECK(be.draws.back().psDwords == 3 && be.draws.back().psUcode[2] == 0x33);
+    CHECK(be.draws.back().vsDwords == 2 && be.draws.back().vsUcode[1] == 0xA2);
+    CHECK(be.draws.back().vsHash != be.draws.back().psHash);
 
     std::printf(failures ? "gpu_pm4_test: %d failure(s)\n" : "gpu_pm4_test: ok\n", failures);
     return failures ? 1 : 0;
