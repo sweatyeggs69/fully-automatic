@@ -477,6 +477,8 @@ struct VulkanRenderer::Impl {
     // images hold the data and the guest memory is written in one batch (one GPU wait) when something
     // can observe it: a swap, a fence / interrupt / memory write from the command stream, a texture
     // fetch that cannot use a snapshot, or a resolve that overlaps a pending one.
+    // Deferring the guest memory write is experimental (FA_RESOLVE_LAZY=1); by default each snapshotted resolve is written right away.
+    const bool lazyWriteback = [] { const char* e = std::getenv("FA_RESOLVE_LAZY"); return e && e[0] == '1'; }();
     std::vector<uint32_t> pendingKeys;
     uint64_t pendingBytes = 0;
     bool PendingOverlaps(uint32_t base, uint32_t size) {
@@ -1941,7 +1943,10 @@ struct VulkanRenderer::Impl {
                     (d.format == 6 || d.format == 14 || d.format == 50) && d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
-                    if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) goto clears;
+                    if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) {
+                        if (!lazyWriteback) FlushPending();  // eager: write guest memory right away
+                        goto clears;
+                    }
                 }
                 if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending();
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
