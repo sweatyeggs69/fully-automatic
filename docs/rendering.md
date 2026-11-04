@@ -43,6 +43,7 @@ the window shows the texture debug view.
 | `FA_VK_DEVICE=N` | Pick the Vulkan device (default: first discrete GPU) |
 | `FA_VK_VALIDATION=1` | Enable the Khronos validation layer |
 | `FA_RENDER_DUMP=dir` | Debug dumps for frames 0-5 and every 30th frame: every draw logged with its textures, vertex buffers, blend state and constants; PNGs of the colour target after each draw, each resolve (as rendered and as it decodes from memory), each bound texture and the front buffer |
+| `FA_MIPS=0` | Sample only the base level of every texture (default: mip levels 1.. are read from the fetch constant's mip address) |
 | `FA_RENDER_DUMP_FRAME=N` | With `FA_RENDER_DUMP`: dump only swap N (all its resolves, targets and textures) instead of the early frames; the 3D menu is around swap 600+ |
 | `FA_RENDER_DUMP_DRAWS=A-B` | With `FA_RENDER_DUMP_FRAME`: trace and dump only draws A..B of that frame (numbered from 0). Texture lines carry a mean colour for every format, including cube, 3D and compressed ones |
 
@@ -68,5 +69,5 @@ passes that read the same tile share pixels.
 ## Not done yet
 
 MSAA (targets are single sampled), EDRAM aliasing between formats sharing memory, tessellation,
-memory export, mip levels (the base level is sampled), and 3D textures (sampled as 2D). Each
+memory export, packed mip tails (the smallest levels, 16 texels or less; sampling clamps to the last full level) and mips of cube, 3D and linear textures, and 3D textures (sampled as 2D). Each
 resolve and swap waits for the GPU, which is simple but not fast.

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace fa::gpu {
@@ -26,6 +27,10 @@ TextureFetch ParseTextureFetch(const uint32_t d[6]) {
     t.mipFilter = uint8_t((d[3] >> 23) & 3);
     t.borderColor = uint8_t(d[5] & 3);
     t.expAdjust = int8_t(int32_t(d[3] << 13) >> 26);
+    t.mipBase = d[5] & 0xFFFFF000u;
+    t.mipMin = uint8_t((d[4] >> 2) & 0xF);
+    t.mipMax = uint8_t((d[4] >> 6) & 0xF);
+    t.packedMips = (d[5] >> 11) & 1;
     if (t.dimension == 2) {  // 3D: 11 + 11 + 10 bits
         t.width = (d[2] & 0x7FF) + 1;
         t.height = ((d[2] >> 11) & 0x7FF) + 1;
@@ -356,7 +361,38 @@ static bool DecodeBytesFast(uint32_t f, const uint8_t* b, uint8_t* dst, uint32_t
     return true;
 }
 
-bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out) {
+
+static TextureFetch MipFetch(const TextureFetch& t, uint32_t m) {
+    TextureFetch tl = t;
+    tl.width = std::max(1u, t.width >> m);
+    tl.height = std::max(1u, t.height >> m);
+    tl.pitch = 0;
+    return tl;
+}
+
+uint32_t HostMipLevels(const TextureFetch& t) {
+    static const bool off = [] { const char* e = std::getenv("FA_MIPS"); return e && e[0] == '0'; }();  // FA_MIPS=0: base level only
+    if (off) return 1;
+    if (t.dimension != 1 || !t.tiled || t.depth > 1 || t.mipFilter == 2 || t.mipMax == 0 || !t.mipBase) return 1;
+    if (!GetHostFormatInfo(t.format).supported) return 1;
+    uint32_t n = 1;
+    for (uint32_t m = 1; m <= t.mipMax; m++) {
+        const uint32_t w = std::max(1u, t.width >> m), h = std::max(1u, t.height >> m);
+        if (t.packedMips && std::min(w, h) <= 16) break;
+        n++;
+    }
+    return n;
+}
+
+uint32_t HostMipByteSize(const TextureFetch& t) {
+    const uint32_t n = HostMipLevels(t);
+    uint32_t total = 0;
+    const FormatInfo fi = GetHostFormatInfo(t.format);
+    for (uint32_t m = 1; m < n; m++) total += GetLayoutFor(MipFetch(t, m), fi).size;
+    return total;
+}
+
+bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out, const uint8_t* mipSrc) {
     FormatInfo fi = GetHostFormatInfo(t.format);
     if (!fi.supported || !t.width || !t.height) return false;
     Layout l = GetLayoutFor(t, fi);
@@ -369,17 +405,21 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
     out.width = t.width;
     out.height = t.height;
     out.layers = t.dimension == 3 ? 6 : 1;
+    out.levels = mipSrc ? HostMipLevels(t) : 1;
     const size_t texelBytes = out.isFloat ? 16 : 4;
-    const size_t layerBytes = size_t(t.width) * t.height * texelBytes;
+    size_t layerBytes = 0;  // all levels of one layer
+    for (uint32_t m = 0; m < out.levels; m++) {
+        const TextureFetch tl = MipFetch(t, m);
+        layerBytes += size_t(tl.width) * tl.height * texelBytes;
+    }
     out.data.assign(layerBytes * out.layers, 0);
     const float expScale = std::ldexp(1.0f, t.expAdjust);
-    std::vector<uint8_t> sw(l.size);
+    std::vector<uint8_t> sw;
     const uint32_t texels = fi.blockW * fi.blockH;
 
-    for (uint32_t layer = 0; layer < out.layers; layer++) {
-        const uint8_t* face = src + size_t(layer) * Align(l.size, 4096);
+    auto decodeLevel = [&](const TextureFetch& t, const Layout& l, const uint8_t* face, uint8_t* dstLayer) {
+        sw.resize(l.size);
         EndianSwapCopy(t.endian, face, sw.data(), l.size);
-        uint8_t* dstLayer = out.data.data() + layer * layerBytes;
         for (uint32_t by = 0; by < l.hBlocks; by++) {
             for (uint32_t bx = 0; bx < l.wBlocks; bx++) {
                 uint32_t off = t.tiled ? TiledBlockOffset(bx, by, l.pitchBlocks, fi.bytesPerBlock)
@@ -503,6 +543,20 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
                     }
                 }
             }
+        }
+    };
+    for (uint32_t layer = 0; layer < out.layers; layer++) {
+        const uint8_t* face = src + size_t(layer) * Align(l.size, 4096);
+        uint8_t* dstLayer = out.data.data() + layer * layerBytes;
+        decodeLevel(t, l, face, dstLayer);
+        const uint8_t* mipFace = mipSrc;
+        size_t dstOff = size_t(t.width) * t.height * texelBytes;
+        for (uint32_t m = 1; m < out.levels; m++) {
+            const TextureFetch tl = MipFetch(t, m);
+            const Layout ll = GetLayoutFor(tl, fi);
+            decodeLevel(tl, ll, mipFace, dstLayer + dstOff);
+            mipFace += ll.size;
+            dstOff += size_t(tl.width) * tl.height * texelBytes;
         }
     }
     return true;

@@ -336,7 +336,7 @@ struct Image {
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t w = 0, h = 0, layers = 1;
+    uint32_t w = 0, h = 0, layers = 1, levels = 1;
 };
 
 struct RenderTarget {
@@ -798,13 +798,13 @@ struct VulkanRenderer::Impl {
     }
 
     bool CreateImage(Image& im, VkFormat fmt, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags usage, bool cube,
-                     VkImageAspectFlags aspect, const VkComponentMapping* swz = nullptr) {
+                     VkImageAspectFlags aspect, const VkComponentMapping* swz = nullptr, uint32_t levels = 1) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = fmt;
         ci.extent = {w, h, 1};
-        ci.mipLevels = 1;
+        ci.mipLevels = levels;
         ci.arrayLayers = layers;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -825,12 +825,13 @@ struct VulkanRenderer::Impl {
         vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
         vi.format = fmt;
         if (swz) vi.components = *swz;
-        vi.subresourceRange = {aspect, 0, 1, 0, layers};
+        vi.subresourceRange = {aspect, 0, levels, 0, layers};
         if (vkCreateImageView(dev, &vi, nullptr, &im.view) != VK_SUCCESS) return false;
         im.format = fmt;
         im.w = w;
         im.h = h;
         im.layers = layers;
+        im.levels = levels;
         return true;
     }
     void DestroyImage(Image& im) {
@@ -857,7 +858,7 @@ struct VulkanRenderer::Impl {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
     }
-    void ImageToGeneral(VkImage img, VkImageAspectFlags aspect, uint32_t layers) {
+    void ImageToGeneral(VkImage img, VkImageAspectFlags aspect, uint32_t layers, uint32_t levels = 1) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = 0;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -865,7 +866,7 @@ struct VulkanRenderer::Impl {
         b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = img;
-        b.subresourceRange = {aspect, 0, 1, 0, layers};
+        b.subresourceRange = {aspect, 0, levels, 0, layers};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
     }
@@ -1308,18 +1309,21 @@ struct VulkanRenderer::Impl {
     // ---- textures ----------------------------------------------------------------------------
     VkSampler GetSampler(const TextureFetch& t) {
         uint64_t key = uint64_t(t.magFilter & 1) | (uint64_t(t.minFilter & 1) << 1) | (uint64_t(t.clamp[0]) << 2) |
-                       (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11);
+                       (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11) |
+                       (uint64_t(t.mipFilter & 3) << 14);
         auto it = samplers.find(key);
         if (it != samplers.end()) return it->second;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = (t.magFilter & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         si.minFilter = (t.minFilter & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        // Mip filter 0 point, 1 linear, 2 base map only. Images only hold the levels that were decoded,
+        // so the LOD clamps to their last level.
+        si.mipmapMode = t.mipFilter == 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         si.addressModeU = AddressMode(t.clamp[0], mirrorClampEdge);
         si.addressModeV = AddressMode(t.clamp[1], mirrorClampEdge);
         si.addressModeW = AddressMode(t.clamp[2], mirrorClampEdge);
         si.borderColor = t.borderColor == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-        si.maxLod = 0.0f;
+        si.maxLod = t.mipFilter == 2 ? 0.0f : 16.0f;
         VkSampler s = VK_NULL_HANDLE;
         Check(vkCreateSampler(dev, &si, nullptr, &s), "vkCreateSampler");
         samplers[key] = s;
@@ -1357,7 +1361,7 @@ struct VulkanRenderer::Impl {
         }
         if (snapEnabled && !cube && !snaps.empty())
             if (VkImageView sv = SnapView(t)) return sv;
-        uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
+        uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
         uint32_t size = HostTextureByteSize(t);
@@ -1397,13 +1401,18 @@ struct VulkanRenderer::Impl {
             prof::Scope ps_(prof::kTexCheck);
             h = HashBytes(src, size);
         }
+        // Mip levels 1.. live at the mip address. They are optional: when that memory is not
+        // readable the texture is uploaded with its base level only.
+        const uint32_t mipBytes = HostMipByteSize(t);
+        const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
+        if (mipSrc) h = h * 0x9E3779B97F4A7C15ull + HashBytes(mipSrc, mipBytes) + 1;
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
 
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
-        if (!DecodeTextureHost(t, src, ht)) return fell("decode failed");
+        if (!DecodeTextureHost(t, src, ht, mipSrc)) return fell("decode failed");
         if (prof::g_enabled) {
             static uint64_t n = 0;
             static uint64_t decNs[64] = {};
@@ -1417,7 +1426,7 @@ struct VulkanRenderer::Impl {
         }
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
-                       tex.image.layers != ht.layers;
+                       tex.image.layers != ht.layers || tex.image.levels != ht.levels;
         EndRendering();
         if (needNew) {
             if (tex.ok) garbageImages.push_back(tex.image);
@@ -1432,12 +1441,12 @@ struct VulkanRenderer::Impl {
             }
             if (!CreateImage(tex.image, fmt, ht.width, ht.height, ht.layers,
                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, ht.layers == 6,
-                             VK_IMAGE_ASPECT_COLOR_BIT, &cm))
+                             VK_IMAGE_ASPECT_COLOR_BIT, &cm, ht.levels))
                 return fallback.view;
-            ImageToGeneral(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, ht.layers);
+            ImageToGeneral(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, ht.layers, ht.levels);
         }
         // Stage the texels (RGBA32F -> RGBA16F when that is the host format).
-        size_t texels = size_t(ht.width) * ht.height * ht.layers;
+        size_t texels = ht.data.size() / (ht.isFloat ? 16 : 4);  // all layers and levels
         size_t bytes = texels * (fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16);
         if (bytes > ring.size / 2) return fallback.view;
         bool flushed;
@@ -1451,11 +1460,30 @@ struct VulkanRenderer::Impl {
             std::memcpy(dst, ht.data.data(), bytes);
         }
         Barrier();
-        VkBufferImageCopy bic{};
-        bic.bufferOffset = at;
-        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, ht.layers};
-        bic.imageExtent = {ht.width, ht.height, 1};
-        vkCmdCopyBufferToImage(cmd, ring.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
+        {
+            const VkDeviceSize texelBytes = fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16;
+            VkBufferImageCopy regions[16];
+            uint32_t nr = 0;
+            if (ht.levels <= 1) {
+                regions[nr] = VkBufferImageCopy{};
+                regions[nr].bufferOffset = at;
+                regions[nr].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, ht.layers};
+                regions[nr].imageExtent = {ht.width, ht.height, 1};
+                nr++;
+            } else {  // mip chains are 2D, one layer: levels are stored back to back
+                VkDeviceSize off = at;
+                for (uint32_t m = 0; m < ht.levels && nr < 16; m++) {
+                    const uint32_t lw = std::max(1u, ht.width >> m), lh = std::max(1u, ht.height >> m);
+                    regions[nr] = VkBufferImageCopy{};
+                    regions[nr].bufferOffset = off;
+                    regions[nr].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1};
+                    regions[nr].imageExtent = {lw, lh, 1};
+                    nr++;
+                    off += VkDeviceSize(lw) * lh * texelBytes;
+                }
+            }
+            vkCmdCopyBufferToImage(cmd, ring.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
+        }
         Barrier();
         tex.contentHash = h;
         tex.guestBase = t.base;
@@ -1974,6 +2002,28 @@ struct VulkanRenderer::Impl {
                          s, t.type, t.format, t.width, t.height, t.depth, t.dimension, t.base, t.pitch,
                          t.tiled ? "tiled" : "linear", t.endian, t.swizzle, t.clamp[0], t.clamp[1], t.magFilter, t.minFilter,
                          d[0], d[1], d[2], d[3], d[4], d[5]);
+            if (t.IsTexture() && t.mipMax) {
+                const uint32_t levels = HostMipLevels(t), mb = HostMipByteSize(t);
+                std::fprintf(stderr, "[render]     mips: filter %u min %u max %u packed %d mip addr %08x -> %u host levels, %u bytes", t.mipFilter,
+                             t.mipMin, t.mipMax, t.packedMips ? 1 : 0, t.mipBase, levels, mb);
+                const uint8_t* ms = mb ? mem.HostPtr(t.mipBase, mb) : nullptr;
+                const uint8_t* bs = levels > 1 ? mem.HostPtr(t.base, HostTextureByteSize(t)) : nullptr;
+                HostTexture ht;
+                if (ms && bs && DecodeTextureHost(t, bs, ht, ms) && !ht.isFloat && ht.levels > 1) {
+                    for (uint32_t m = 0, off = 0; m < ht.levels; m++) {
+                        const uint32_t lw = std::max(1u, ht.width >> m), lh = std::max(1u, ht.height >> m);
+                        double sum[4] = {};
+                        for (size_t i = 0; i < size_t(lw) * lh; i++)
+                            for (int c = 0; c < 4; c++) sum[c] += ht.data[off + i * 4 + c];
+                        const double n = double(lw) * lh * 255.0;
+                        std::fprintf(stderr, " | L%u %ux%u mean %.3f %.3f %.3f %.3f", m, lw, lh, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+                        off += lw * lh * 4;
+                    }
+                } else if (mb && !ms) {
+                    std::fprintf(stderr, " (mip memory not mapped)");
+                }
+                std::fprintf(stderr, "\n");
+            }
             // The texture as the CPU decoder sees it in guest memory, plus whether each row of
             // blocks is made of identical blocks (a sign of degenerate source data).
             static int texDumps = 0;

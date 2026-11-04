@@ -44,6 +44,9 @@ struct TextureFetch {
     uint8_t magFilter = 0, minFilter = 0, mipFilter = 0;  // 0 point, 1 linear
     uint8_t borderColor = 0;
     int8_t expAdjust = 0;
+    uint32_t mipBase = 0;     // physical address of mip level 1 (dword 5)
+    uint8_t mipMin = 0, mipMax = 0;  // fetch constant mip level range
+    bool packedMips = false;  // small mips share one tail tile
     bool IsTexture() const { return type == 2; }
 };
 
@@ -76,7 +79,7 @@ void EndianSwapCopy(uint32_t endian, const uint8_t* src, uint8_t* dst, uint32_t 
 // Base level decoded for upload to a Vulkan image: channels in XYZW order (no fetch swizzle,
 // the renderer applies it), either RGBA8 unorm or RGBA32 float. Cube maps carry 6 layers.
 struct HostTexture {
-    uint32_t width = 0, height = 0, layers = 1;
+    uint32_t width = 0, height = 0, layers = 1, levels = 1;
     bool isFloat = false;           // RGBA32F (16 bytes per texel) instead of RGBA8
     std::vector<uint8_t> data;      // layer-major, row-major
 };
@@ -84,7 +87,15 @@ struct HostTexture {
 FormatInfo GetHostFormatInfo(uint32_t format);
 // Bytes of guest memory the base level occupies (all faces for cube maps).
 uint32_t HostTextureByteSize(const TextureFetch& t);
-bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out);
+// Mip levels the host can decode for this fetch: 1 + the unpacked mips stored at mipBase (levels
+// whose smaller side is 16 texels or less sit in a packed tail tile and are not decoded; sampling
+// clamps to the last decoded level). Only tiled 2D textures with a mip filter get more than one.
+uint32_t HostMipLevels(const TextureFetch& t);
+// Bytes of guest memory at mipBase covering levels 1 .. HostMipLevels-1 (0 when there are none).
+uint32_t HostMipByteSize(const TextureFetch& t);
+// `mipSrc` points at the guest bytes at mipBase (HostMipByteSize bytes); null decodes the base level only.
+// With more than one level (out.levels), out.data holds the levels back to back, base first.
+bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& out, const uint8_t* mipSrc = nullptr);
 
 // ---- Resolve (EDRAM -> guest memory) ------------------------------------------------------
 struct ResolveDest {
