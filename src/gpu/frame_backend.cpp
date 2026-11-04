@@ -1,5 +1,6 @@
 #include "fa/gpu/frame_backend.hpp"
 
+#include "fa/gpu/png.hpp"
 #include "fa/gpu/pm4.hpp"
 
 #include <cstdio>
@@ -118,6 +119,19 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
                          fb.swizzle);
         }
         fbOk = DecodeFetch(fb, f);
+        // FA_RENDER_DUMP=<dir>: the decoded front buffer of every 30th presented swap (first 20).
+        static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
+        static int dumped = 0;
+        static uint64_t lastDump = 0;
+        if (fbOk && dumpDir && *dumpDir && dumped < 20 && (dumped == 0 || seq >= lastDump + 30)) {
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/frontbuffer_swap%05llu_%08x.png", dumpDir, (unsigned long long)seq, fb.base);
+            std::vector<uint8_t> opaque = f.rgba;
+            for (size_t i = 3; i < opaque.size(); i += 4) opaque[i] = 255;
+            WritePng(path, f.width, f.height, opaque.data());
+            dumped++;
+            lastDump = seq;
+        }
         if (fbOk) {
             f.source = "frontbuffer";
             if (mode_ == Mode::Auto && !HasContent(f.rgba)) fbOk = false;

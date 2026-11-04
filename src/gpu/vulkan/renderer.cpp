@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "fa/gpu/pm4.hpp"
+#include "fa/gpu/png.hpp"
 #include "fa/gpu/primitive.hpp"
 #include "fa/gpu/shader.hpp"
 #include "fa/gpu/texture.hpp"
@@ -1487,10 +1488,14 @@ struct VulkanRenderer::Impl {
                 }
                 generation++;
                 static int logged = 0;
-                if (logged++ < 16)
-                    std::fprintf(stderr, "[render] resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u endian %u%s\n",
-                                 isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.endian,
-                                 d.swapRB ? " swapRB" : "");
+                if (logged++ < std::max(16, opt.traceDraws * 4))
+                    std::fprintf(stderr,
+                                 "[render] resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
+                                 "| src %03x/%u surf %08x wo %08x sc %08x vtx %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
+                                 isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
+                                 d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
+                                 regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
+                DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat);
             }
         }
 
@@ -1501,6 +1506,24 @@ struct VulkanRenderer::Impl {
             RenderTarget* z = GetRt(dinfo & 0xFFF, (dinfo >> 16) & 1, pitch, msaa, true);
             if (z) ClearRect(z, regs, x0, y0, w, h, true);
         }
+    }
+
+    // FA_RENDER_DUMP=<dir>: PNGs of the first resolves (clamped to 0..1), for debugging.
+    void DumpResolve(const std::vector<float>& px, uint32_t w, uint32_t h, const ResolveDest& d, uint32_t tile,
+                     uint32_t fmt) {
+        static const char* dir = std::getenv("FA_RENDER_DUMP");
+        static int count = 0;
+        if (!dir || !*dir || count >= 200) return;
+        std::vector<uint8_t> rgba(size_t(w) * h * 4);
+        for (size_t i = 0; i < rgba.size(); i++) {
+            float v = (i % 4 == 3) ? 1.0f : px[i];  // force opaque so colour shows
+            rgba[i] = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+        }
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/resolve%03d_%08x_fmt%u_from%03x_rt%u_%ux%u.png", dir, count, d.base, d.format,
+                      tile, fmt, w, h);
+        count++;
+        WritePng(path, w, h, rgba.data());
     }
 
     void ClearRect(RenderTarget* rt, const RegisterFile& regs, int32_t x, int32_t y, uint32_t w, uint32_t h, bool depth) {
