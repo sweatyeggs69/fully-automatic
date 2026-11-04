@@ -16,16 +16,24 @@ namespace fa::rt {
 
 static uint32_t g_bundle = 0;
 
+// One epoch for every interrupt-time reader (KeTimeStampBundle +0 and KeQueryInterruptTime), so the game
+// never sees two different bases for the same quantity. First use sets it.
+uint64_t interrupt_time_100ns() {
+    using namespace std::chrono;
+    static const auto start = steady_clock::now();
+    return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
+}
+
 static void ticker() {
     using namespace std::chrono;
-    auto start = steady_clock::now();
+    interrupt_time_100ns();  // fix the epoch before the first bundle write
     constexpr uint64_t kEpochDelta = 116444736000000000ull;
     for (;;) {
-        auto el = duration_cast<milliseconds>(steady_clock::now() - start).count();
+        const uint64_t now100 = interrupt_time_100ns();
         auto ns = duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
-        st64(g_bundle + 0, uint64_t(el) * 10000);
+        st64(g_bundle + 0, now100);
         st64(g_bundle + 8, kEpochDelta + uint64_t(ns) / 100);
-        st32(g_bundle + 0x10, uint32_t(el));
+        st32(g_bundle + 0x10, uint32_t(now100 / 10000));
         std::this_thread::sleep_for(milliseconds(1));
     }
 }

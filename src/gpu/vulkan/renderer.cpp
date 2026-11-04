@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cstdio>
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -835,6 +837,63 @@ struct VulkanRenderer::Impl {
         }
     }
 
+    // ---- persistent pipeline cache -------------------------------------------------------------------
+    // The driver's pipeline cache is kept in $XDG_CACHE_HOME/fullauto (or ~/.cache/fullauto) so pipelines
+    // compiled in earlier runs are not compiled again (first-use stalls). It holds driver blobs only, no game
+    // data. FA_PIPELINE_CACHE=0 turns it off; FA_PIPELINE_CACHE=<path> picks the file.
+    std::filesystem::path PipelineCachePath() const {
+        const char* e = std::getenv("FA_PIPELINE_CACHE");
+        if (e && std::strcmp(e, "0") == 0) return {};
+        if (e && e[0] && std::strcmp(e, "1") != 0) return e;
+        std::filesystem::path dir;
+        if (const char* x = std::getenv("XDG_CACHE_HOME"); x && x[0]) dir = x;
+        else if (const char* h = std::getenv("HOME"); h && h[0]) dir = std::filesystem::path(h) / ".cache";
+        else return {};
+        return dir / "fullauto" / "pipeline_cache.bin";
+    }
+
+    std::vector<char> LoadPipelineCacheFile() const {
+        std::vector<char> data;
+        const auto path = PipelineCachePath();
+        if (path.empty()) return data;
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) return data;
+        const std::streamsize n = f.tellg();
+        // VkPipelineCacheHeaderVersionOne: size, version, vendor, device, 16 byte UUID.
+        if (n < 32 || n > (256ll << 20)) return data;
+        data.resize(size_t(n));
+        f.seekg(0);
+        if (!f.read(data.data(), n)) { data.clear(); return data; }
+        uint32_t hdr[4];
+        std::memcpy(hdr, data.data(), sizeof(hdr));
+        if (hdr[0] < 32 || hdr[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || hdr[2] != props.vendorID ||
+            hdr[3] != props.deviceID || std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+            data.clear();
+        else
+            std::fprintf(stderr, "[vk] pipeline cache: loaded %zu bytes from %s\n", data.size(), path.string().c_str());
+        return data;
+    }
+
+    void SavePipelineCacheFile() const {
+        const auto path = PipelineCachePath();
+        if (path.empty() || !pipeCache) return;
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev, pipeCache, &n, nullptr) != VK_SUCCESS || n < 32) return;
+        std::vector<char> data(n);
+        if (vkGetPipelineCacheData(dev, pipeCache, &n, data.data()) != VK_SUCCESS) return;
+        data.resize(n);
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        auto tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f.write(data.data(), std::streamsize(data.size()))) return;
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (!ec) std::fprintf(stderr, "[vk] pipeline cache: saved %zu bytes to %s\n", data.size(), path.string().c_str());
+    }
+
     bool Fail(std::string& err, const char* what, VkResult r) {
         char b[256];
         std::snprintf(b, sizeof b, "%s failed: %s (%d)", what, VkErr(r), int(r));
@@ -1226,6 +1285,11 @@ struct VulkanRenderer::Impl {
         vkCreateDescriptorPool(dev, &dpci, nullptr, &texPool);
 
         VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        std::vector<char> cacheData = LoadPipelineCacheFile();
+        if (!cacheData.empty()) {
+            pcci.initialDataSize = cacheData.size();
+            pcci.pInitialData = cacheData.data();
+        }
         vkCreatePipelineCache(dev, &pcci, nullptr, &pipeCache);
 
         compiler = shaderc_compiler_initialize();
@@ -1283,7 +1347,10 @@ struct VulkanRenderer::Impl {
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
             DestroyBuffer(readback);
-            if (pipeCache) vkDestroyPipelineCache(dev, pipeCache, nullptr);
+            if (pipeCache) {
+                SavePipelineCacheFile();
+                vkDestroyPipelineCache(dev, pipeCache, nullptr);
+            }
             if (texPool) vkDestroyDescriptorPool(dev, texPool, nullptr);
             if (set0Pool) vkDestroyDescriptorPool(dev, set0Pool, nullptr);
             if (pipeLayout) vkDestroyPipelineLayout(dev, pipeLayout, nullptr);
