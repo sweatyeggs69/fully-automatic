@@ -754,7 +754,8 @@ struct VulkanRenderer::Impl {
     RowPool rowPool;
 
     // Per-batch upload dedup.
-    std::unordered_map<uint64_t, VkDeviceSize> vbCache;
+    struct VbCopy { VkDeviceSize at; uint32_t words; };
+    std::unordered_map<uint32_t, VbCopy> vbCache;  // by guest address: the largest prefix copied into the ring this batch
     std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     int drawsTraced = 0;
@@ -1306,7 +1307,10 @@ struct VulkanRenderer::Impl {
                      std::string& err) {
         shaderc_compile_options_t o = shaderc_compile_options_initialize();
         shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-        shaderc_compile_options_set_optimization_level(o, shaderc_optimization_level_performance);
+        // shaderc's -O pass takes ~25 ms per translated shader and the driver compiler optimises anyway: skip it
+        // unless FA_SHADER_OPT=1 (races compile a new shader about every frame while streaming in).
+        static const bool optimise = [] { const char* e = std::getenv("FA_SHADER_OPT"); return e && e[0] == '1'; }();
+        shaderc_compile_options_set_optimization_level(o, optimise ? shaderc_optimization_level_performance : shaderc_optimization_level_zero);
         shaderc_compilation_result_t r = shaderc_compile_into_spv(compiler, src.data(), src.size(), kind, name, "main", o);
         bool ok = shaderc_result_get_compilation_status(r) == shaderc_compilation_status_success;
         if (ok) {
@@ -1999,19 +2003,23 @@ struct VulkanRenderer::Impl {
                                  vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
                 }
             }
-            uint64_t key = (uint64_t(vf.address) << 32) ^ words;
-            auto it = vbCache.find(key);
+            auto it = vbCache.find(vf.address);
             VkDeviceSize at;
-            if (it != vbCache.end()) {
-                at = it->second;
+            if (it != vbCache.end() && it->second.words >= words) {
+                at = it->second.at;  // an earlier draw already copied at least this much from the same address
             } else {
-                const uint8_t* src = mem.HostPtr(vf.address, words * 4);
+                // Round the copy up (within the fetch constant's size) so draws over the same pool with
+                // slightly different index ranges share one copy instead of each copying its own.
+                const uint32_t cap = std::min<uint32_t>(vf.sizeWords, 4u << 20);
+                uint32_t copyWords = std::min<uint32_t>(cap, (words + 16383u) & ~16383u);
+                const uint8_t* src = mem.HostPtr(vf.address, copyWords * 4);
+                if (!src) { copyWords = words; src = mem.HostPtr(vf.address, words * 4); }
                 if (!src) continue;
-                at = RingAlloc(words * 4, 16, flushed);
+                at = RingAlloc(copyWords * 4, 16, flushed);
                 if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); }
-                std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
-                prof::Add(prof::kVbBytes, uint64_t(words) * 4);
-                vbCache[key] = at;
+                std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, copyWords * 4);
+                prof::Add(prof::kVbBytes, uint64_t(copyWords) * 4);
+                vbCache[vf.address] = {at, copyWords};
             }
             sys.vf[s][0] = uint32_t(at / 4);
             sys.vf[s][1] = vf.endian;
@@ -2345,7 +2353,7 @@ struct VulkanRenderer::Impl {
             VkDeviceSize at = RingAlloc(sys.vf[s][2] * 4, 16, f);
             std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, sys.vf[s][2] * 4);
             sys.vf[s][0] = uint32_t(at / 4);
-            vbCache[(uint64_t(vf.address) << 32) ^ sys.vf[s][2]] = at;
+            vbCache[vf.address] = {at, sys.vf[s][2]};
         }
     }
 
