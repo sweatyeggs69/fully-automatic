@@ -432,6 +432,7 @@ struct VulkanRenderer::Impl {
     struct TexKey { uint32_t binding; VkSampler smp; VkImageView view; };
     VkDescriptorSet lastTexSet = VK_NULL_HANDLE;  // texture set of the previous draw in this batch
     std::vector<TexKey> lastTexKey;
+    std::unordered_map<uint64_t, VkDescriptorSet> texSetCache;  // every texture set built in this batch, by hash of its (binding, sampler, view) list
     HostDraw hostDraw;  // reused across draws so its index buffer keeps its capacity
     std::map<uint64_t, RenderTarget> rts;
     std::unordered_map<uint64_t, Texture> textures;
@@ -466,6 +467,19 @@ struct VulkanRenderer::Impl {
         }
         std::fprintf(stderr, "\n");
     }
+    // FA_SNAPLOG=1: log (once per base and reason) why a resolve was not kept as a GPU snapshot and why a
+    // texture fetch of a snapshotted surface could not use it. These are the per-frame render target re-uploads.
+    static void SnapLog(const char* kind, const char* why, uint32_t base, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f) {
+        static const bool on = [] { const char* v = std::getenv("FA_SNAPLOG"); return v && v[0] == '1'; }();
+        if (!on) return;
+        static std::set<uint64_t> seen;
+        static int n = 0;
+        uint64_t k = (uint64_t(base) << 24) ^ (uint64_t(why[0]) << 16) ^ (uint64_t(why[1]) << 8) ^ uint64_t(kind[0]) ^ (uint64_t(a) << 48);
+        if (n < 400 && seen.insert(k).second) {
+            n++;
+            std::fprintf(stderr, "[snaplog] %s %s base %08x: %u %u %u %u %u %u\n", kind, why, base, a, b, c, d, e, f);
+        }
+    }
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -484,6 +498,19 @@ struct VulkanRenderer::Impl {
     // A resolve of an 8888 target to guest memory also copies the pixels into an image of its own. A
     // texture fetch that reads exactly that surface samples the image instead of hashing, decoding and
     // uploading the guest bytes again (FA_RESOLVE_GPU=0 turns this off).
+    // Guest texture format classes a snapshot can stand in for: 8888, 2_10_10_10, 32_FLOAT, 16_16_FLOAT (all 4 bytes per texel).
+    static int SnapClass(uint32_t f) {
+        return (f == 6 || f == 14 || f == 50) ? 1 : (f == 7 || f == 54) ? 2 : f == 36 ? 3 : f == 31 ? 4 : 0;
+    }
+    // Host render target formats whose resolve to guest format `f` can be kept as a snapshot (ResolveRaw converts on writeback).
+    static bool SnapResolvable(VkFormat src, uint32_t f) {
+        switch (SnapClass(f)) {
+            case 1: case 2: return src == VK_FORMAT_R8G8B8A8_UNORM || src == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            case 3: return src == VK_FORMAT_R32_SFLOAT;
+            case 4: return src == VK_FORMAT_R16G16_SFLOAT;
+        }
+        return false;
+    }
     struct Snap {
         Image img;
         std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
@@ -495,6 +522,7 @@ struct VulkanRenderer::Impl {
         };
         std::unordered_map<uint32_t, Crop> crops;  // by width << 16 | height
         uint64_t version = 0;                       // bumped whenever the snapshot is rewritten
+        uint64_t checkedGen = 0, checkedVer = ~0ull;  // frame and version at which the guest memory samples last matched
         bool valid = false;
         uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
         bool swapRB = false;
@@ -647,20 +675,27 @@ struct VulkanRenderer::Impl {
     // View of a still valid snapshot that matches this texture fetch, or null.
     VkImageView SnapView(const TextureFetch& t) {
         auto it = snaps.find(t.base & 0x1FFFFFFFu);
-        if (it == snaps.end() || !it->second.valid) return VK_NULL_HANDLE;
+        if (it == snaps.end()) return VK_NULL_HANDLE;
+        if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, 0, 0, 0); return VK_NULL_HANDLE; }
         Snap& e = it->second;
-        const bool fmt8888 = e.img.format == VK_FORMAT_R8G8B8A8_UNORM && (t.format == 6 || t.format == 14 || t.format == 50);
-        const bool fmt1010 = e.img.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (t.format == 7 || t.format == 54);
-        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return VK_NULL_HANDLE;
-        if (t.endian != e.endian || t.expAdjust != 0) return VK_NULL_HANDLE;
+        const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
+        auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
+        if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
+        if (t.endian != e.endian || t.expAdjust != 0) return rej("endian/exp");
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
-        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return VK_NULL_HANDLE;
-        for (int c = 0; c < 4; c++) if (t.sign[c]) return VK_NULL_HANDLE;
-        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return VK_NULL_HANDLE;
+        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
+        for (int c = 0; c < 4; c++) if (t.sign[c]) return rej("sign");
+        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return rej("pitch");
         const uint8_t* src = mem.HostPtr(t.base, e.size);
         if (!src) return VK_NULL_HANDLE;
-        uint32_t cur[64];
-        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return VK_NULL_HANDLE; }
+        // Sampling 64 dwords spread over the surface costs a cache miss each: once per frame and snapshot version
+        // is enough (the CPU writes textures between frames, as for ordinary textures).
+        if (e.checkedGen != generation || e.checkedVer != e.version) {
+            uint32_t cur[64];
+            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
+            e.checkedGen = generation;
+            e.checkedVer = e.version;
+        }
         VkImage image = e.img.img;
         std::unordered_map<uint32_t, VkImageView>* views = &e.views;
         if (t.width != e.w || t.height != e.h) {
@@ -944,6 +979,7 @@ struct VulkanRenderer::Impl {
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
         lastTexSet = VK_NULL_HANDLE;
+        texSetCache.clear();
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
@@ -1424,8 +1460,10 @@ struct VulkanRenderer::Impl {
             const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
             if (!reuse) WatchBytes("texture bind", t.base, HostTextureByteSize(t), "(will recheck memory)");  // reused binds are not logged
         }
-        if (snapEnabled && !cube && !snaps.empty())
+        if (snapEnabled && !cube && !snaps.empty()) {
+            prof::Scope pn_(prof::kDtSnap);
             if (VkImageView sv = SnapView(t)) return sv;
+        }
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
@@ -1757,7 +1795,11 @@ struct VulkanRenderer::Impl {
                 if (!(texUsed & (1u << s))) continue;
                 bool cube = (vs->info.texUsed & (1u << s) ? vs->info.texDim[s] : ps->info.texDim[s]) == kTexDimCube;
                 VkSampler smp;
-                VkImageView view = GetTexture(regs, s, cube, smp);
+                VkImageView view;
+                {
+                    prof::Scope pg_(prof::kDtGet);
+                    view = GetTexture(regs, s, cube, smp);
+                }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 w[nw].dstBinding = cube ? 32 + s : s;
@@ -1769,7 +1811,26 @@ struct VulkanRenderer::Impl {
             bool sameSet = lastTexSet != VK_NULL_HANDLE && lastTexKey.size() == nw;
             for (uint32_t i = 0; i < nw && sameSet; i++)
                 sameSet = lastTexKey[i].binding == w[i].dstBinding && lastTexKey[i].smp == ii[i].sampler && lastTexKey[i].view == ii[i].imageView;
+            uint64_t setHash = 0;
             if (!sameSet) {
+                setHash = 0xCBF29CE484222325ull ^ nw;
+                for (uint32_t i = 0; i < nw; i++) {
+                    setHash = (setHash ^ w[i].dstBinding) * 0x100000001B3ull;
+                    setHash = (setHash ^ uint64_t(reinterpret_cast<uintptr_t>(ii[i].sampler))) * 0x100000001B3ull;
+                    setHash = (setHash ^ uint64_t(reinterpret_cast<uintptr_t>(ii[i].imageView))) * 0x100000001B3ull;
+                    setHash ^= setHash >> 29;
+                }
+                auto cached = texSetCache.find(setHash);
+                if (cached != texSetCache.end()) {
+                    // Built earlier in this batch for the same samplers and views: reuse it.
+                    texSet = lastTexSet = cached->second;
+                    lastTexKey.resize(nw);
+                    for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
+                    sameSet = true;
+                }
+            }
+            if (!sameSet) {
+            prof::Scope pd_(prof::kDtDesc);
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
@@ -1787,6 +1848,7 @@ struct VulkanRenderer::Impl {
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
             lastTexSet = texSet;
+            texSetCache[setHash] = texSet;
             lastTexKey.resize(nw);
             for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
             } else {
@@ -2326,9 +2388,8 @@ struct VulkanRenderer::Impl {
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
             } else {
                 // Snapshot-able 8888 surface from the top-left corner: keep it on the GPU, write guest memory later.
-                if (snapEnabled && !isDepth && d.expBias == 0 &&
-                    ((src->image.format == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50)) ||
-                     (src->image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54))) &&
+                if (snapEnabled && !isDepth && d.expBias == 0 && SnapResolvable(src->image.format, d.format) &&
+                    (SnapClass(d.format) <= 2 || !d.swapRB) &&
                     d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
@@ -2337,6 +2398,8 @@ struct VulkanRenderer::Impl {
                         goto clears;
                     }
                 }
+                SnapLog("resolve", isDepth ? "depth" : (x0 || y0) ? "offset" : d.endian > 3 ? "endian" : d.expBias ? "expbias" : "format", d.base & 0x1FFFFFFFu,
+                        d.format, src->image.format, w, h, d.endian, uint32_t(x0 | y0));
                 if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending(prof::kFlushOverlap);
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
@@ -2435,8 +2498,10 @@ struct VulkanRenderer::Impl {
     bool ResolveRaw(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                     const uint8_t* rb, uint32_t destBytes) {
         if (isDepth || d.expBias != 0) return false;
-        const bool is8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50);
-        const bool is1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54);
+        const bool src8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM, src1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        const bool is8888 = (src8888 || src1010) && (d.format == 6 || d.format == 14 || d.format == 50);  // is8888/is1010: the guest format
+        const bool is1010 = (src8888 || src1010) && (d.format == 7 || d.format == 54);
+        const bool convert = (is8888 && src1010) || (is1010 && src8888);  // 10-bit <-> 8-bit conversion on the way out
         const bool isFloat = (srcFmt == VK_FORMAT_R16G16_SFLOAT && d.format == 31) ||
                              (srcFmt == VK_FORMAT_R16G16B16A16_SFLOAT && d.format == 32) ||
                              (srcFmt == VK_FORMAT_R32_SFLOAT && d.format == 36) ||
@@ -2469,6 +2534,15 @@ struct VulkanRenderer::Impl {
                 if (bpp == 4) {
                     uint32_t v;
                     std::memcpy(&v, row + x * 4, 4);
+                    if (convert) {
+                        if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
+                            v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
+                                (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
+                        } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
+                            v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
+                                (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
+                        }
+                    }
                     if (d.swapRB) {
                         if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
                         else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
