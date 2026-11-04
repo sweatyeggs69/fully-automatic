@@ -5,6 +5,10 @@
 #include <shaderc/shaderc.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "fa/gpu/gpu_profile.hpp"
 #include "fa/gpu/pm4.hpp"
 #include "fa/gpu/png.hpp"
 #include "fa/gpu/primitive.hpp"
@@ -44,9 +49,89 @@ const char* VkErr(VkResult r) {
     }
 }
 
+// Splits row ranges across a few worker threads (resolve conversion). Run() blocks until done.
+class RowPool {
+public:
+    RowPool() {
+        unsigned n = std::thread::hardware_concurrency();
+        n = n > 2 ? std::min(n - 1, 6u) : 0;  // leave cores for the game's own threads
+        if (const char* e = std::getenv("FA_RESOLVE_THREADS")) n = unsigned(std::max(0, std::atoi(e)));
+        for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { Loop(); });
+    }
+    ~RowPool() {
+        {
+            std::lock_guard lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    // fn(y0, y1) for disjoint bands covering [0, rows).
+    void Run(uint32_t rows, const std::function<void(uint32_t, uint32_t)>& fn) {
+        const uint32_t parts = std::min<uint32_t>(uint32_t(workers_.size()) + 1, (rows + 15) / 16);
+        if (parts <= 1) { fn(0, rows); return; }
+        // Bands start on 8-row boundaries so an endian-swap unit never straddles two bands.
+        const uint32_t band = ((rows + parts - 1) / parts + 7) & ~7u;
+        {
+            std::lock_guard lk(mu_);
+            fn_ = &fn;
+            band_ = band;
+            rows_ = rows;
+            next_ = 1;  // band 0 runs on the calling thread
+            pending_ = parts - 1;
+            parts_ = parts;
+            gen_++;
+        }
+        cv_.notify_all();
+        fn(0, std::min(band, rows));
+        std::unique_lock lk(mu_);
+        done_.wait(lk, [&] { return pending_ == 0; });
+        fn_ = nullptr;
+    }
+
+private:
+    void Loop() {
+        uint64_t seen = 0;
+        std::unique_lock lk(mu_);
+        for (;;) {
+            cv_.wait(lk, [&] { return stop_ || (gen_ != seen && next_ < parts_); });
+            if (stop_) return;
+            uint32_t part = next_++;
+            if (next_ >= parts_) seen = gen_;
+            const auto* fn = fn_;
+            uint32_t y0 = part * band_, y1 = std::min(rows_, y0 + band_);
+            lk.unlock();
+            if (y0 < y1) (*fn)(y0, y1);
+            lk.lock();
+            if (--pending_ == 0) done_.notify_one();
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_;
+    const std::function<void(uint32_t, uint32_t)>* fn_ = nullptr;
+    uint32_t band_ = 0, rows_ = 0, next_ = 0, parts_ = 0, pending_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
+
 uint64_t HashBytes(const void* data, size_t n, uint64_t h = 0xCBF29CE484222325ull) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t i = 0;
+    if (n >= 64) {
+        // Four independent lanes so the multiplies overlap (texture checks hash megabytes per frame).
+        uint64_t l[4] = {h, h ^ 0x9E3779B97F4A7C15ull, h ^ 0xC2B2AE3D27D4EB4Full, h ^ 0x165667B19E3779F9ull};
+        for (; i + 32 <= n; i += 32) {
+            for (int k = 0; k < 4; k++) {
+                uint64_t v;
+                std::memcpy(&v, p + i + 8 * k, 8);
+                l[k] = (l[k] ^ v) * 0x100000001B3ull;
+                l[k] ^= l[k] >> 29;
+            }
+        }
+        h = l[0] ^ (l[1] * 0x9E3779B97F4A7C15ull) ^ (l[2] * 0xC2B2AE3D27D4EB4Full) ^ (l[3] * 0x165667B19E3779F9ull);
+        h ^= h >> 32;
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t v;
         std::memcpy(&v, p + i, 8);
@@ -338,7 +423,20 @@ struct VulkanRenderer::Impl {
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
     VkPipeline curPipeline = VK_NULL_HANDLE;
-    uint64_t generation = 1;  // bumped when guest memory may have changed (swap / resolve)
+    uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
+
+    // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
+    // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
+    void InvalidateTextures(uint32_t base, uint32_t size) {
+        const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (auto& [k, t] : textures) {
+            const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
+            if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+        }
+    }
+
+    std::vector<float> resolvePx;  // scratch for resolves that go through floats
+    RowPool rowPool;
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
@@ -786,6 +884,7 @@ struct VulkanRenderer::Impl {
     Shader* GetShader(ShaderStage stage, const uint32_t* ucode, uint32_t dwords, uint64_t hash) {
         auto it = shaders.find(hash);
         if (it != shaders.end()) return &it->second;
+        prof::Scope ps_(prof::kShader);
         Shader& s = shaders[hash];
         s.info = TranslateShader(stage, ucode, dwords);
         std::string err = s.info.error;
@@ -938,14 +1037,21 @@ struct VulkanRenderer::Impl {
         Texture& tex = textures[key];
         uint32_t size = HostTextureByteSize(t);
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
+        tex.guestBase = t.base;
+        tex.guestSize = size;
         const uint8_t* src = mem.HostPtr(t.base, size);
         if (!src) {
             tex.validatedGen = generation;
             return tex.ok ? tex.image.view : fallback.view;
         }
-        uint64_t h = HashBytes(src, size);
+        uint64_t h;
+        {
+            prof::Scope ps_(prof::kTexCheck);
+            h = HashBytes(src, size);
+        }
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
+        prof::Scope ps_(prof::kTexUpload);
 
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht)) return fallback.view;
@@ -1004,6 +1110,7 @@ struct VulkanRenderer::Impl {
         std::string k(reinterpret_cast<const char*>(&key), sizeof key);
         auto it = pipelines.find(k);
         if (it != pipelines.end()) return it->second;
+        prof::Scope ps_(prof::kPipeline);
 
         VkPipelineShaderStageCreateInfo st[3] = {};
         uint32_t ns = 0;
@@ -1110,6 +1217,7 @@ struct VulkanRenderer::Impl {
 
     // ---- draws -------------------------------------------------------------------------------
     void Draw(const DrawCall& dc, const RegisterFile& regs) {
+        prof::Scope ps_(prof::kDraw);
         uint32_t mode = regs[xe::RB_MODECONTROL] & 7;
         if (mode != xe::kEdramColorDepth && mode != xe::kEdramDepthOnly) { stats.drawsSkipped++; return; }
         if (!dc.vsUcode || !dc.psUcode) { stats.drawsSkipped++; return; }
@@ -1497,6 +1605,7 @@ struct VulkanRenderer::Impl {
 
     // ---- resolves ----------------------------------------------------------------------------
     void Resolve(const RegisterFile& regs) {
+        prof::Scope ps_(prof::kResolve);
         stats.resolves++;
         Begin();
         const uint32_t copyCtl = regs[xe::RB_COPY_CONTROL];
@@ -1576,12 +1685,23 @@ struct VulkanRenderer::Impl {
                 bic.imageExtent = {w, h, 1};
                 vkCmdCopyImageToBuffer(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
                 Barrier();
-                SubmitAndWait();
+                {
+                    prof::Scope pw_(prof::kResolveWait);
+                    SubmitAndWait();
+                }
                 Begin();
-                // Destination offset: the resolve rectangle's position in EDRAM.
-                std::vector<float> px(size_t(w) * h * 4);
+                prof::Scope pc_(prof::kResolveCpu);
                 const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
-                for (size_t i = 0; i < size_t(w) * h; i++) {
+                uint32_t destBytes = ResolveDestByteSize(d);
+                if (!DumpFrame() && ResolveRaw(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
+                    InvalidateTextures(d.base, destBytes);
+                    goto clears;
+                }
+                {
+                // Destination offset: the resolve rectangle's position in EDRAM.
+                std::vector<float>& px = resolvePx;  // reused: a fresh 15 MB vector per resolve was costly
+                px.resize(size_t(w) * h * 4);
+                auto toFloat = [&](size_t i) {
                     if (isDepth) {
                         float z;
                         if (depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) std::memcpy(&z, rb + i * 4, 4);
@@ -1593,12 +1713,16 @@ struct VulkanRenderer::Impl {
                     } else {
                         ReadbackToFloat(src->image.format, rb + i * bpp, &px[i * 4]);
                     }
-                }
-                uint32_t destBytes = ResolveDestByteSize(d);
+                };
                 uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
                 if (dst) {
-                    EncodeResolve(d, uint32_t(x0), uint32_t(y0), w, h, px.data(), dst);
+                    // Bands of rows in parallel: each converts its rows and writes their texels.
+                    rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
+                        for (size_t i = size_t(ya) * w; i < size_t(yb) * w; i++) toFloat(i);
+                        EncodeResolve(d, uint32_t(x0), uint32_t(y0) + ya, w, yb - ya, px.data() + size_t(ya) * w * 4, dst);
+                    });
                 } else {
+                    for (size_t i = 0; i < size_t(w) * h; i++) toFloat(i);
                     // No direct pointer: encode into a copy of the surface and write it back by dwords.
                     std::vector<uint8_t> tmp(destBytes);
                     for (uint32_t i = 0; i + 4 <= destBytes; i += 4) {
@@ -1609,7 +1733,7 @@ struct VulkanRenderer::Impl {
                     for (uint32_t i = 0; i + 4 <= destBytes; i += 4)
                         mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
                 }
-                generation++;
+                InvalidateTextures(d.base, destBytes);
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
@@ -1619,9 +1743,11 @@ struct VulkanRenderer::Impl {
                                  d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
                                  regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
                 DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
+                }
             }
         }
 
+    clears:
         // Clears of the resolved rectangle.
         if (clearColor && !isDepth) ClearRect(src, regs, x0, y0, w, h, false);
         if (clearDepth) {
@@ -1629,6 +1755,67 @@ struct VulkanRenderer::Impl {
             RenderTarget* z = GetRt(dinfo & 0xFFF, (dinfo >> 16) & 1, pitch, msaa, true);
             if (z) ClearRect(z, regs, x0, y0, w, h, true);
         }
+    }
+
+    // Fast resolve: the render target already holds the destination's texel layout (8888,
+    // 2_10_10_10, 16-bit and 32-bit float formats), so texels are copied as bytes, tiled and
+    // endian swapped without going through floats. Returns false when it does not apply.
+    bool ResolveRaw(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                    const uint8_t* rb, uint32_t destBytes) {
+        if (isDepth || d.expBias != 0) return false;
+        const bool is8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50);
+        const bool is1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54);
+        const bool isFloat = (srcFmt == VK_FORMAT_R16G16_SFLOAT && d.format == 31) ||
+                             (srcFmt == VK_FORMAT_R16G16B16A16_SFLOAT && d.format == 32) ||
+                             (srcFmt == VK_FORMAT_R32_SFLOAT && d.format == 36) ||
+                             (srcFmt == VK_FORMAT_R32G32_SFLOAT && d.format == 37);
+        if (!is8888 && !is1010 && !(isFloat && !d.swapRB)) return false;
+        const uint32_t bpp = VkFormatBytes(srcFmt);
+        uint32_t x8 = 0;  // an endian swap is a XOR on the byte address within the swapped unit
+        switch (d.endian) {
+            case 0: break;
+            case 1: x8 = 1; break;  // 8in16
+            case 2: x8 = 3; break;  // 8in32
+            case 3: x8 = 2; break;  // 16in32
+            case 4: x8 = 7; break;  // 8in64
+            default: return false;
+        }
+        if (x8 >= bpp) return false;
+        uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+        if (!dst) return false;
+        const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
+        rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
+        for (uint32_t y = ya; y < yb; y++) {
+            const uint32_t ty = dy + y;
+            if (ty >= height) break;
+            const uint8_t* row = rb + size_t(y) * w * bpp;
+            for (uint32_t x = 0; x < w; x++) {
+                const uint32_t tx = dx + x;
+                if (tx >= pitch) break;
+                const uint32_t off = TiledBlockOffset(tx, ty, pitch, bpp);
+                if (off + bpp > destBytes) continue;
+                if (bpp == 4) {
+                    uint32_t v;
+                    std::memcpy(&v, row + x * 4, 4);
+                    if (d.swapRB) {
+                        if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                        else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+                    }
+                    switch (x8) {
+                        case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+                        case 3: v = __builtin_bswap32(v); break;
+                        case 2: v = (v << 16) | (v >> 16); break;
+                        default: break;
+                    }
+                    std::memcpy(dst + off, &v, 4);
+                } else {
+                    const uint8_t* p = row + size_t(x) * bpp;
+                    for (uint32_t k = 0; k < bpp; k++) dst[(off + k) ^ x8] = p[k];
+                }
+            }
+        }
+        });
+        return true;
     }
 
     // FA_RENDER_DUMP=<dir>: PNGs of the first resolves (clamped to 0..1), for debugging.
@@ -1696,7 +1883,10 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
-        SubmitAndWait();
+        {
+            prof::Scope ps_(prof::kOtherWait);
+            SubmitAndWait();
+        }
         Begin();
         generation++;
         frame++;

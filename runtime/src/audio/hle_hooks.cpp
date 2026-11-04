@@ -24,9 +24,8 @@ fa::hle::GuestHooks make_runtime_hooks() {
         // Physical memory is mapped at 0xA0000000 (64 KiB pages) or 0xC0000000
         // (16 MiB pages) without aliasing; use whichever window holds it.
         phys &= 0x1FFFFFFFu;
-        uint32_t start, size;
         for (uint32_t window : {0xA0000000u, 0xC0000000u, 0xE0000000u})
-            if (g_mem.find_allocation(window + phys, start, size)) return g_base + window + phys;
+            if (g_mem.is_committed(window + phys)) return g_base + window + phys;
         return g_base + 0xA0000000u + phys;
     };
     return h;

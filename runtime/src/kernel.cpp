@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <new>
+#include <pthread.h>
+
+#include "fa/rt/crash.hpp"
 
 extern PPCFuncMapping PPCFuncMappings[];
 
@@ -167,8 +170,19 @@ void Kernel::init_context(KThread& t) {
     c.fpscr.disableFlushModeUnconditional();
 }
 
+void set_host_thread_name(const char* name) {
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%s", name);  // the kernel limit is 15 characters
+    pthread_setname_np(pthread_self(), buf);
+}
+
 void Kernel::thread_main(std::shared_ptr<KThread> t) {
     t_current = t.get();
+    {
+        char name[16];
+        std::snprintf(name, sizeof name, "guest-%u", t->tid);
+        set_host_thread_name(name);
+    }
     {
         std::unique_lock<std::mutex> lk(g_kmu);
         g_kcv.wait(lk, [&] { return t->suspend_count <= 0; });
@@ -250,6 +264,7 @@ uint32_t Kernel::run_main_thread(uint32_t entry, uint32_t stack_size) {
         threads_.push_back(t);
     }
     t_current = t.get();
+    set_host_thread_name("main");
     t->started = true;
     try {
         call_guest(*t->ctx, entry);
@@ -324,6 +339,7 @@ void attach_guest_thread(const std::string& name) {
     auto t = std::make_shared<KThread>();
     t->tid = g_kernel.next_tid();
     t->name = name;
+    set_host_thread_name(name.c_str());
     t->stack_size = kDefaultStack;
     if (!g_kernel.setup_thread_memory_public(*t)) return;
     t_current = t.get();

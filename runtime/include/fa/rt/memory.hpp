@@ -13,6 +13,7 @@
 // The three physical views alias one 512 MiB block. Allocations are made in the 0xA0000000
 // view; the physical address returned by MmGetPhysicalAddress is the guest address masked to
 // 29 bits (plus 0x1000 for the 0xE0000000 view).
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -42,6 +43,12 @@ public:
     bool free(uint32_t addr, uint32_t* freed_size = nullptr);
     // Size of the allocation that starts at addr, or 0.
     uint32_t allocation_size(uint32_t addr);
+    // True if the page holding addr is committed (readable and writable). Lock free; physical
+    // pages count as committed in all three views once any view of them is.
+    bool is_committed(uint32_t addr) const {
+        uint32_t page = addr >> 12;
+        return (committed_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
+    }
     // Start and size of the allocation containing addr, false if none.
     bool find_allocation(uint32_t addr, uint32_t& start, uint32_t& size);
 
@@ -54,7 +61,9 @@ private:
     struct Range { uint32_t lo, hi; };
     static Range range_of(Heap h);
     bool protect(uint32_t addr, uint64_t size, int prot);
+    void mark(uint64_t addr, uint64_t size, bool on);
     uint8_t* base_ = nullptr;
+    std::atomic<uint64_t> committed_[(kGuestSpace >> 12) / 64] = {};
     int phys_fd_ = -1;
     std::mutex mu_;
     std::mutex malloc_mu_;

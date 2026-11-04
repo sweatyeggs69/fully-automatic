@@ -53,17 +53,37 @@ static int64_t physical_of(uint32_t addr) {
     return addr & 0x1FFFFFFFu;
 }
 
+// Sets or clears the committed bits of the pages in [addr, addr + size).
+void GuestMemory::mark(uint64_t addr, uint64_t size, bool on) {
+    uint64_t end = std::min<uint64_t>((addr + size + kPageSize - 1) >> 12, kGuestSpace >> 12);
+    for (uint64_t page = addr >> 12; page < end; ++page) {
+        uint64_t bit = 1ull << (page & 63);
+        if (on) committed_[page >> 6].fetch_or(bit, std::memory_order_relaxed);
+        else committed_[page >> 6].fetch_and(~bit, std::memory_order_relaxed);
+    }
+}
+
 // Applies `prot` to [addr, addr + size) and to the same physical pages in the other views.
 bool GuestMemory::protect(uint32_t addr, uint64_t size, int prot) {
+    bool on = prot != PROT_NONE;
     int64_t phys = physical_of(addr);
-    if (phys < 0) return mprotect(base_ + addr, size, prot) == 0;
+    if (phys < 0) {
+        mark(addr, size, on);
+        return mprotect(base_ + addr, size, prot) == 0;
+    }
     bool ok = true;
     for (uint32_t view : {0xA0000000u, 0xC0000000u}) {
         uint64_t end = std::min<uint64_t>(phys + size, kPhysicalSize);
-        if (uint64_t(phys) < end) ok &= mprotect(base_ + view + phys, end - phys, prot) == 0;
+        if (uint64_t(phys) < end) {
+            mark(view + phys, end - phys, on);
+            ok &= mprotect(base_ + view + phys, end - phys, prot) == 0;
+        }
     }
     uint64_t lo = std::max<int64_t>(phys, 0x1000), end = std::min<uint64_t>(phys + size, kPhysicalSize);
-    if (lo < end) ok &= mprotect(base_ + 0xE0000000u + (lo - 0x1000), end - lo, prot) == 0;
+    if (lo < end) {
+        mark(0xE0000000u + (lo - 0x1000), end - lo, on);
+        ok &= mprotect(base_ + 0xE0000000u + (lo - 0x1000), end - lo, prot) == 0;
+    }
     return ok;
 }
 

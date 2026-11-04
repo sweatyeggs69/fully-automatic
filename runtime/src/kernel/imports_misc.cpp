@@ -2,6 +2,7 @@
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/import.hpp"
 #include "fa/rt/memory.hpp"
+#include "fa/rt/crash.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +47,10 @@ FA_IMPORT(RtlRaiseException) {
     uint32_t rec = arg32(ctx, 0);
     if (ld32(rec) == 0x406D1388 && g_kernel.current()) {
         uint32_t name = ld32(rec + 0x18);
-        if (name) g_kernel.current()->name = reinterpret_cast<const char*>(host(name));
+        if (name) {
+            g_kernel.current()->name = reinterpret_cast<const char*>(host(name));
+            set_host_thread_name(g_kernel.current()->name.c_str());
+        }
     }
 }
 
