@@ -81,3 +81,40 @@ FA_IMPORT(ExGetXConfigSetting) {
 // Returns a pointer to an XEX optional header field, or 0 if absent. The headers are not
 // kept in guest memory, so everything reports "not present" and the game falls back to defaults.
 FA_IMPORT(RtlImageXexHeaderField) { ret32(ctx, 0); }
+
+// ---- user, region and network startup queries ----------------------------------------
+
+FA_IMPORT(KeSetDisableBoostThread) { ret32(ctx, 0); }
+
+FA_IMPORT(XGetGameRegion) { ret32(ctx, 0xFFFF); }  // all regions
+
+// Player 0 is signed in locally (state 1); every other slot is empty.
+FA_IMPORT(XamUserGetSigninState) { ret32(ctx, arg32(ctx, 0) == 0 ? 1 : 0); }
+
+FA_IMPORT(XamUserGetXUID) {
+    // (user_index, type_mask, xuid*)
+    uint32_t idx = arg32(ctx, 0), out = arg32(ctx, 2);
+    if (idx != 0 || !out) { ret32(ctx, 0x525); return; }  // ERROR_NO_SUCH_USER
+    st32(out, 0xE0000000);
+    st32(out + 4, 0x00000001);
+    ret32(ctx, 0);
+}
+
+FA_IMPORT(XamUserGetName) {
+    // (user_index, char* buffer, size)
+    uint32_t idx = arg32(ctx, 0), buf = arg32(ctx, 1), size = arg32(ctx, 2);
+    if (idx != 0 || !buf || size == 0) { ret32(ctx, 0x525); return; }
+    const char* name = "Player";
+    size_t n = std::strlen(name) + 1;
+    if (n > size) n = size;
+    std::memcpy(host(buf), name, n);
+    host(buf)[n - 1] = 0;
+    ret32(ctx, 0);
+}
+
+FA_IMPORT(NetDll_WSAStartup) {
+    // (caller, version, WSADATA*): report success, version echoed back.
+    uint32_t ver = arg32(ctx, 1), data = arg32(ctx, 2);
+    if (data) { std::memset(host(data), 0, 0x190); st16(data, (uint16_t)ver); st16(data + 2, (uint16_t)ver); }
+    ret32(ctx, 0);
+}
