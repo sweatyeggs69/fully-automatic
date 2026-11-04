@@ -118,3 +118,14 @@ FA_IMPORT(NetDll_WSAStartup) {
     if (data) { std::memset(host(data), 0, 0x190); st16(data, (uint16_t)ver); st16(data + 2, (uint16_t)ver); }
     ret32(ctx, 0);
 }
+
+// ---- profile settings and achievements: no profile storage, so report failure/empty ----
+
+// Failing synchronously (ERROR_FUNCTION_FAILED) makes the game fall back to default settings.
+FA_IMPORT(XamUserReadProfileSettings) { ret32(ctx, 1627); }
+
+// ERROR_NOT_FOUND: no achievement enumerator is created, the game skips the list.
+FA_IMPORT(XamUserCreateAchievementEnumerator) { ret32(ctx, 1168); }
+
+// ERROR_NO_MORE_FILES: enumerations are always empty.
+FA_IMPORT(XamEnumerate) { ret32(ctx, 18); }
