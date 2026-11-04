@@ -114,7 +114,7 @@ static void handler(int sig, siginfo_t* info, void* uc) {
 }
 
 // ---- stack sampler (debug aid): FA_DUMP_AFTER=<seconds> ----------------------------------------
-// After the delay, every thread is sent SIGUSR2 three times (1 s apart) and prints where it is,
+// After the delay, every thread is sent SIGUSR2 once, one thread at a time and prints where it is,
 // which shows what a stuck thread is executing.
 static void sample_handler(int) {
     char buf[64];
@@ -136,12 +136,16 @@ static void install_sampler() {
     sigaction(SIGUSR2, &sa, nullptr);
     std::thread([secs] {
         std::this_thread::sleep_for(std::chrono::seconds(secs));
-        for (int round = 0; round < 3; round++) {
+        for (int round = 0; round < 1; round++) {
             if (DIR* d = opendir("/proc/self/task")) {
                 while (dirent* de = readdir(d)) {
                     long tid = std::atol(de->d_name);
                     if (tid > 0 && tid != ::syscall(SYS_gettid))
+                    {
                         ::syscall(SYS_tgkill, ::getpid(), tid, SIGUSR2);
+                        // one thread at a time so the dumps do not interleave
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    }
                 }
                 closedir(d);
             }
