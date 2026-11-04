@@ -58,6 +58,9 @@ int main(int argc, char** argv) {
     install_crash_handler();
     install_profiler();
     install_memory_guard();
+#ifdef FA_BUILD_COMMIT
+    std::fprintf(stderr, "[build] commit %s ppc %s\n", FA_BUILD_COMMIT, FA_BUILD_PPC);
+#endif
     std::vector<uint8_t> xex;
     std::fprintf(stderr, "[boot] reading game\n");
     if (!read_game(argv[1], xex)) return 1;

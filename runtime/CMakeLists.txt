@@ -78,6 +78,23 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
         VERBATIM)
 
     add_executable(fullauto src/main.cpp ${STUBS} ${PPC_SOURCES})
+    # Printed at startup as "[build] commit ... ppc ...". tools/fa-build.sh passes both; a plain
+    # cmake run falls back to the git commit at configure time and ppc/.fa-inputs if present.
+    if(NOT FA_BUILD_COMMIT)
+        execute_process(COMMAND git rev-parse --short=12 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        OUTPUT_VARIABLE FA_BUILD_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(NOT FA_BUILD_PPC AND EXISTS ${FA_PPC_DIR}/.fa-inputs)
+        file(STRINGS ${FA_PPC_DIR}/.fa-inputs FA_BUILD_PPC LIMIT_COUNT 1)
+    endif()
+    if(NOT FA_BUILD_COMMIT)
+        set(FA_BUILD_COMMIT unknown)
+    endif()
+    if(NOT FA_BUILD_PPC)
+        set(FA_BUILD_PPC unknown)
+    endif()
+    set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS
+        "FA_BUILD_COMMIT=\"${FA_BUILD_COMMIT}\";FA_BUILD_PPC=\"${FA_BUILD_PPC}\"")
     target_link_libraries(fullauto PRIVATE fa_rt)
     target_include_directories(fullauto PRIVATE ${FA_PPC_DIR})
     target_link_options(fullauto PRIVATE -rdynamic)

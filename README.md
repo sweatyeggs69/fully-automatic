@@ -33,6 +33,18 @@ XAudio output, the XMA decoder, and `fawave` for listing/decoding the game's wav
     faiso game.iso extract default.xex ./default.xex
     faiso game.iso xex
 
+## One-step build (use this for every test run)
+    tools/fa-build.sh                  # latest origin/main
+    tools/fa-build.sh <branch|commit>  # a PR branch or a sha
+    tools/fa-build.sh --here           # the current checkout, local edits included
+
+It checks out a clean commit, re-applies the XenonRecomp patches and regenerates `ppc/` whenever the
+recompiler inputs changed (default.xex, `config/`, `patches/`), then builds `runtime/out/fullauto`.
+The input hash is kept in `ppc/.fa-inputs`, and the game log starts with `[build] commit <sha> ppc <hash>`,
+so every log says exactly what it ran. Rebuilding by hand without regenerating `ppc/` can leave old
+recompiled code in place (that is how switch fixes #75/#78 were missing from desktop tests for a day).
+Needs `private/default.xex` (first command below). The manual steps follow.
+
 ## Recompilation steps (local, needs your own game copy)
     ./build/faiso game.iso extract default.xex private/default.xex
     git clone --recursive https://github.com/hedge-dev/XenonRecomp third_party/XenonRecomp
