@@ -37,3 +37,183 @@ labels = [
     0x8230DDFC,
     0x8230DE7C,
 ]
+
+# Missed jump tables found by scanning the generated code for unresolved bctr lookups
+# (lis/addi/rlwinm/lwzx/mtctr/bctr emitted as PPC_CALL_INDIRECT_FUNC). 0x8242DAA8 is the least certain: only 2 labels.
+[[switch]]
+base = 0x8227ACBC
+r = 4
+labels = [
+    0x8227ACE0,
+    0x8227AD84,
+    0x8227ADA4,
+    0x8227ADBC,
+    0x8227ADF0,
+    0x8227ADA4,
+    0x8227AE10,
+    0x8227AD1C,
+]
+
+[[switch]]
+base = 0x82293E58
+r = 30
+labels = [
+    0x82293EB0,
+    0x82293EB8,
+    0x82293EC0,
+    0x82293EC8,
+    0x82293ED0,
+    0x82293ED8,
+    0x82293EE0,
+    0x82293EE8,
+    0x82293EF0,
+    0x82293EF8,
+    0x82293F00,
+    0x82293F08,
+    0x82293F10,
+    0x82293F18,
+    0x82293F20,
+    0x82293F28,
+    0x82293F30,
+    0x82293F38,
+    0x82293F40,
+    0x82293F48,
+    0x82293F50,
+]
+
+[[switch]]
+base = 0x8229EFA4
+r = 6
+labels = [
+    0x8229EFC8,
+    0x8229F4CC,
+    0x8229F3EC,
+    0x8229F40C,
+    0x8229F598,
+    0x8229F3EC,
+    0x8229F894,
+    0x8229F2CC,
+]
+
+[[switch]]
+base = 0x8229F6C4
+r = 4
+labels = [
+    0x8229F6E8,
+    0x8229FBF0,
+    0x8229FA8C,
+    0x8229FAAC,
+    0x8229FD70,
+    0x8229FA8C,
+    0x8229F894,
+    0x8229F8F0,
+]
+
+[[switch]]
+base = 0x822A51D8
+r = 8
+labels = [
+    0x822A51EC,
+    0x822A51F4,
+    0x822A5258,
+    0x822A52CC,
+]
+
+[[switch]]
+base = 0x822C4164
+r = 7
+labels = [
+    0x822C4180,
+    0x822C4180,
+    0x822C4240,
+    0x822C41E4,
+    0x822C4344,
+    0x822C4180,
+]
+
+[[switch]]
+base = 0x822CB0A4
+r = 10
+labels = [
+    0x822CB0C8,
+    0x822CB1C4,
+    0x822CB280,
+    0x822CB308,
+    0x822CB400,
+    0x822CB280,
+]
+
+[[switch]]
+base = 0x822EA2F0
+r = 10
+labels = [
+    0x822EA314,
+    0x822EA3B4,
+    0x822EA3EC,
+    0x822EA3FC,
+    0x822EA434,
+    0x822EA3EC,
+    0x822EA44C,
+    0x822EA314,
+]
+
+[[switch]]
+base = 0x822EA480
+r = 10
+labels = [
+    0x822EA50C,
+    0x822EA50C,
+    0x822EA514,
+    0x822EA568,
+    0x822EA5B0,
+    0x822EA524,
+    0x822EA50C,
+    0x822EA4A4,
+]
+
+[[switch]]
+base = 0x822EA650
+r = 11
+labels = [
+    0x822EA674,
+    0x822EA6D0,
+    0x822EA6F8,
+    0x822EA75C,
+    0x822EA77C,
+    0x822EA710,
+    0x822EA70C,
+    0x822EA674,
+]
+
+[[switch]]
+base = 0x822FE180
+r = 3
+labels = [
+    0x822FE198,
+    0x822FE1B4,
+    0x822FE1BC,
+    0x822FE1E8,
+    0x822FE204,
+]
+
+[[switch]]
+base = 0x8230E43C
+r = 4
+labels = [
+    0x8230E460,
+    0x8230E49C,
+    0x8230E500,
+    0x8230E648,
+    0x8230EA4C,
+    0x8230ECB4,
+    0x8230EE28,
+    0x8230EE48,
+]
+
+[[switch]]
+base = 0x8242DAA8
+r = 19
+labels = [
+    0x8242DB00,
+    0x8242DB00,
+]
