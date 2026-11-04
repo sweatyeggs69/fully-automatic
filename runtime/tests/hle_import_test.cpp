@@ -153,6 +153,8 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
         uint32_t dev = s + 0x308, ov = s + 0x310;
         std::memset(host(ov), 0, 0x1C);
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, ov) == 997);
+        CHECK(ld32(ov) == 997);  // pending first, finished by a host thread
+        for (int i = 0; i < 100 && ld32(ov) == 997; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         CHECK(ld32(dev) == 1 && ld32(ov) == 0);
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, 0) == 0);
     }
