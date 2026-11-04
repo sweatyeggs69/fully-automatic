@@ -56,6 +56,7 @@ Apply the patches before recompiling, in this order (each one builds on the ones
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-mulhd-fix.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-keep-entries.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-switch-u32.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-switch-trap.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp
 
 `xenonrecomp-keep-entries.patch` stops the jump table merge from deleting real function entries
@@ -67,6 +68,11 @@ finds no entry crashes in the runtime: add that address to `functions` and recom
 `xenonrecomp-switch-u32.patch` makes jump tables switch on the low 32 bits of the index register, like the
 PowerPC code does (`rlwinm ...,0,29`). With `.u64` and `__builtin_unreachable()` as default, clang indexed its
 host table with the full 64-bit register after only a 32-bit bound check, so stale upper bits jumped to a wild address.
+
+`xenonrecomp-switch-trap.patch` makes the `default:` of generated switches `__builtin_trap()` instead of `__builtin_unreachable()`. An index
+beyond the recorded labels (a table recorded too short) then stops with SIGILL and the crash report instead of jumping wild. It also lets a later `[[switch]]` with the same base replace an earlier one (it used to be ignored), so the extras can correct XenonAnalyse.
+Check the extra tables against the image with `xexscan default.xex --check-switches config/extra_switch_tables.toml`
+(also on `private/switch_tables.toml`): it reports label mismatches and tables that seem to continue past the last label.
 
 ## Check that the generated C++ compiles (slow, needs clang)
     cmake -S tools/recomp-build -B tools/recomp-build/out -G Ninja -DCMAKE_CXX_COMPILER=clang++
