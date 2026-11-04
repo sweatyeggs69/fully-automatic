@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -12,6 +13,34 @@
 namespace fa::hle {
 
 namespace {
+
+// FA_PRESS=<button>@<seconds>[:<hold seconds>][,...] (debug aid for headless runs): holds a
+// player 1 button at the given time after startup (a quarter second by default),
+// e.g. FA_PRESS=start@10,a@15:2.
+struct ScriptedPress { uint16_t bit; uint32_t at_ms, hold_ms; };
+
+std::vector<ScriptedPress> scripted_presses() {
+    static const std::unordered_map<std::string, uint16_t> names = {
+        {"up", xinput::kDpadUp}, {"down", xinput::kDpadDown}, {"left", xinput::kDpadLeft},
+        {"right", xinput::kDpadRight}, {"start", xinput::kStart}, {"back", xinput::kBack},
+        {"lb", xinput::kLeftShoulder}, {"rb", xinput::kRightShoulder}, {"a", xinput::kA},
+        {"b", xinput::kB}, {"x", xinput::kX}, {"y", xinput::kY}};
+    std::vector<ScriptedPress> out;
+    const char* e = std::getenv("FA_PRESS");
+    if (!e) return out;
+    std::stringstream ss(e);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t at = item.find('@');
+        if (at == std::string::npos) continue;
+        auto it = names.find(item.substr(0, at));
+        if (it == names.end()) continue;
+        size_t colon = item.find(':', at);
+        double hold = colon == std::string::npos ? 0.25 : std::atof(item.c_str() + colon + 1);
+        out.push_back({it->second, uint32_t(std::atof(item.c_str() + at + 1) * 1000), uint32_t(hold * 1000)});
+    }
+    return out;
+}
 
 std::string trim(std::string s) {
     while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
@@ -277,6 +306,11 @@ void Input::refresh() {
             int n = 0;
             const uint8_t* keys = SDL_GetKeyboardState(&n);
             if (keys) apply_keys(binds_, keys, n, g);
+        }
+        if (u == 0) {
+            static const std::vector<ScriptedPress> presses = scripted_presses();
+            for (const auto& p : presses)
+                if (now >= p.at_ms && now < p.at_ms + p.hold_ms) g.buttons |= p.bit;
         }
         if (!(g == s.state.gamepad)) {
             s.state.gamepad = g;

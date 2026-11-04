@@ -42,6 +42,8 @@ enum Opcode : uint32_t {
     kEventWriteExt = 0x5A,
     kSetConstant2 = 0x55,
     kSetShaderConstants = 0x56,
+    kSetBinMask = 0x50,
+    kSetBinSelect = 0x51,
     kSetBinMaskLo = 0x60,
     kSetBinMaskHi = 0x61,
     kSetBinSelectLo = 0x62,

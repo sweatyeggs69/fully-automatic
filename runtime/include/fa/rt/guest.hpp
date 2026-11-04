@@ -31,7 +31,9 @@ inline uint32_t arg32(PPCContext& c, int n) {
     switch (n) {
         case 0: return c.r3.u32; case 1: return c.r4.u32; case 2: return c.r5.u32;
         case 3: return c.r6.u32; case 4: return c.r7.u32; case 5: return c.r8.u32;
-        case 6: return c.r9.u32; default: return c.r10.u32;
+        case 6: return c.r9.u32; case 7: return c.r10.u32;
+        // Later arguments are in the caller's parameter save area, one 8-byte slot each.
+        default: return ld32(c.r1.u32 + 0x54 + (n - 8) * 8);
     }
 }
 inline void ret32(PPCContext& c, uint32_t v) { c.r3.u64 = v; }

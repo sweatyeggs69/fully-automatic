@@ -98,6 +98,14 @@ int main() {
     CHECK(mem.Read32(0x400) == 4);
     CHECK(mem.Read32(0x404) == 0);
 
+    // SET_BIN_MASK / SET_BIN_SELECT are accepted; an unknown opcode is counted by opcode.
+    put(T3(pm4::kSetBinMask, 2)); put(0xFFFFFFFF); put(0);
+    put(T3(pm4::kSetBinSelect, 2)); put(0xFFFFFFFF); put(0xFFFFFFFF);
+    put(T3(0x7E, 1)); put(0);
+    cp.SetWritePtr(w % (ringBytes / 4));
+    CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+    CHECK(cp.GetStats().unknown == 1 && cp.GetStats().unknownOps[0x7E] == 1);
+
     std::printf(failures ? "gpu_pm4_test: %d failure(s)\n" : "gpu_pm4_test: ok\n", failures);
     return failures ? 1 : 0;
 }

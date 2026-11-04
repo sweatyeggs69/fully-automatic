@@ -7,6 +7,7 @@
 #include "fa/rt/memory.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -28,7 +29,7 @@ struct KFile : KObject {
 };
 
 // Parameters past r10 live in the caller's frame, 8 byte slots with the value in the low word.
-uint32_t stack_arg(PPCContext& ctx, int n) { return ld32(ctx.r1.u32 + 0x54 + (n - 8) * 8); }
+uint32_t stack_arg(PPCContext& ctx, int n) { return arg32(ctx, n); }
 
 std::string ansi_string(uint32_t p) {  // guest ANSI_STRING {u16 len, u16 max, u32 buffer}
     if (!p) return {};
@@ -82,6 +83,8 @@ void create(PPCContext& ctx, uint32_t handle_ptr, uint32_t access, uint32_t oa, 
         f->set_guest_path(f->guest_path().empty() ? path_from_attributes(oa) : f->guest_path());
         st32(handle_ptr, g_kernel.add_handle(std::make_shared<KFile>(f)));
     }
+    if (g_trace_imports)
+        std::fprintf(stderr, "[file] open %s -> %08x\n", path_from_attributes(oa).c_str(), st);
     iosb(io, st, st == STATUS_SUCCESS ? info : 0);
     ret32(ctx, st);
 }

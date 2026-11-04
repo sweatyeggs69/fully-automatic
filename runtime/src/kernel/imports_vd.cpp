@@ -135,6 +135,15 @@ void gpu_thread() {
                              g_cp->ReadPtr(), (unsigned long long)g_cp->GetStats().packets,
                              (unsigned long long)g_cp->GetStats().draws, (unsigned long long)g_cp->GetStats().swaps,
                              (unsigned long long)g_cp->GetStats().unknown);
+            static auto last_hist = std::chrono::steady_clock::now();
+            if (std::getenv("FA_TRACE_GPU") && std::chrono::steady_clock::now() - last_hist > std::chrono::seconds(5)) {
+                last_hist = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu] unknown type-3 opcodes:");
+                for (int op = 0; op < 128; op++)
+                    if (g_cp->GetStats().unknownOps[op])
+                        std::fprintf(stderr, " %02x:%llu", op, (unsigned long long)g_cp->GetStats().unknownOps[op]);
+                std::fprintf(stderr, "\n");
+            }
         }
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
@@ -216,4 +225,25 @@ FA_IMPORT(VdGetCurrentDisplayInformation) {
 
 FA_IMPORT(VdSetDisplayMode) { ret32(ctx, 0); }
 FA_IMPORT(VdInitializeScalerCommandBuffer) { ret32(ctx, 0); }
-FA_IMPORT(VdSwap) { ret32(ctx, 0); }
+FA_IMPORT(VdSwap) {
+    // (buffer, fetch constant, writeback, system buffer, system buffer id, frontbuffer address ptr,
+    //  format ptr, color space ptr, width ptr, height ptr). The caller reserves 64 dwords of the
+    // ring at `buffer` for the swap: load the frontbuffer fetch constant into fetch slot 0, emit
+    // XE_SWAP, then pad with type-2 NOPs.
+    uint32_t buf = arg32(ctx, 0), fetch = arg32(ctx, 1), fb_ptr = arg32(ctx, 5);
+    uint32_t w_ptr = arg32(ctx, 8), h_ptr = arg32(ctx, 9);
+    uint32_t i = 0;
+    st32(buf + 4 * i++, (5u << 16) | 0x4800);  // type 0, 6 registers from SHADER_CONSTANT_FETCH_00_0
+    for (uint32_t k = 0; k < 6; k++) st32(buf + 4 * i++, fetch ? ld32(fetch + 4 * k) : 0);
+    st32(buf + 4 * i++, (3u << 30) | (3u << 16) | (0x64u << 8));  // XE_SWAP, 4 dwords
+    st32(buf + 4 * i++, 0x53574150);                                // 'SWAP'
+    st32(buf + 4 * i++, fb_ptr ? ld32(fb_ptr) & 0x1FFFFFFF : 0);
+    st32(buf + 4 * i++, w_ptr ? ld32(w_ptr) : 1280);
+    st32(buf + 4 * i++, h_ptr ? ld32(h_ptr) : 720);
+    while (i < 64) st32(buf + 4 * i++, 0x80000000u);
+    static int logged = 0;
+    if (logged++ < 3)
+        std::fprintf(stderr, "[vd] VdSwap buffer=%08x frontbuffer=%08x %ux%u\n", buf, fb_ptr ? ld32(fb_ptr) : 0,
+                     w_ptr ? ld32(w_ptr) : 0, h_ptr ? ld32(h_ptr) : 0);
+    ret32(ctx, 0);
+}

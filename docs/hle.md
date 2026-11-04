@@ -43,6 +43,10 @@ Keyboard bindings live in `~/.config/fully-automatic/input.ini` (written with de
 run). Default: W accelerate (RT), S brake (LT), A/D steer, Q/E bumpers, Space A, Left Shift B,
 F X, R Y, Enter Start, Escape/Backspace Back, arrows D-pad, I/J/K/L right stick, C/V stick clicks.
 
+For headless runs, `FA_PRESS=<button>@<seconds>[:<hold>]` (comma separated; a, b, x, y, start,
+back, lb, rb, up, down, left, right) holds a player 1 button at a time after startup, e.g.
+`FA_PRESS=a@6:2` gets past the SEGA splash, which waits for a button.
+
 Until a window exists the input layer pumps SDL itself. Once the window thread runs its event
 loop it should call `services().input.set_self_pump(false)` once and `services().input.pump()`
 every frame (or forward events with `handle_event`).
