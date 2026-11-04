@@ -80,7 +80,7 @@ public:
     // stereo out). Exposed for tests.
     static void downmix_frame(const float* planar6, float* stereo_out);
 
-    static constexpr int kMaxQueuedFrames = 24;   // ~128 ms of cushion so stalls (car select load) do not underrun
+    static constexpr int kMaxQueuedFrames = 8;    // ~43 ms
 
     // Counters for FA_AUDIO_STATS / FA_PROFILE (totals since start).
     struct Stats {
@@ -93,6 +93,9 @@ public:
         double sum_sq = 0;              // sum of squared samples since the last take_stats()
         uint64_t level_samples = 0;     // samples in sum_sq
         uint64_t silent_frames = 0;     // submitted frames that were all zero
+        uint64_t clipped_samples = 0;   // device samples past +-1 after summing clients
+        double max_gap_ms = 0;          // longest wait between device callbacks since the last take_stats()
+        int min_queued = 1 << 30;       // fewest stereo samples queued at a device callback since the last take_stats()
     };
     // Returns the totals; peak/sum_sq/level_samples are reset by the call.
     Stats take_stats();

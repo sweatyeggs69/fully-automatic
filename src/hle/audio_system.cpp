@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -59,7 +60,7 @@ bool AudioSystem::init(const GuestHooks& hooks, bool disable_output) {
         want.freq = kSampleRate;
         want.format = AUDIO_F32SYS;
         want.channels = 2;
-        want.samples = kFrameSamples * 4;  // 1024 frames (~21 ms) per device period
+        want.samples = kFrameSamples * 2;
         want.callback = &AudioSystem::sdl_callback;
         want.userdata = this;
         device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
@@ -224,6 +225,7 @@ void AudioSystem::consume(float* out, int frames) {
     std::memset(out, 0, sizeof(float) * size_t(frames) * 2);
     float vol = volume_.load();
     size_t most = 0;
+    size_t queued_before = SIZE_MAX;
     bool any_client = false;
     {
         std::lock_guard lk(queue_mu_);
@@ -232,12 +234,27 @@ void AudioSystem::consume(float* out, int frames) {
             any_client = true;
             ClientRing& r = g_rings[ci];
             const size_t cap = r.data.size();
+            queued_before = std::min(queued_before, r.size);
             size_t n = std::min<size_t>(r.size, size_t(frames) * 2);
             most = std::max(most, n);
             for (size_t k = 0; k < n; ++k) out[k] += r.data[(r.read + k) % cap] * vol;
             r.read = (r.read + n) % cap;
             r.size -= n;
         }
+    }
+    uint64_t clipped = 0;
+    for (int k = 0; k < frames * 2; ++k)
+        if (out[k] > 1.0f || out[k] < -1.0f) ++clipped;
+    {
+        using clk = std::chrono::steady_clock;
+        static clk::time_point last{};
+        auto now = clk::now();
+        double gap = last.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(now - last).count() : 0.0;
+        last = now;
+        std::lock_guard sl(stats_mu_);
+        stats_.clipped_samples += clipped;
+        stats_.max_gap_ms = std::max(stats_.max_gap_ms, gap);
+        if (any_client) stats_.min_queued = std::min<int>(stats_.min_queued, int(queued_before / 2));
     }
     if (any_client) {
         std::lock_guard sl(stats_mu_);
@@ -263,6 +280,8 @@ AudioSystem::Stats AudioSystem::take_stats() {
     stats_.peak = 0;
     stats_.sum_sq = 0;
     stats_.level_samples = 0;
+    stats_.max_gap_ms = 0;
+    stats_.min_queued = 1 << 30;
     return s;
 }
 
