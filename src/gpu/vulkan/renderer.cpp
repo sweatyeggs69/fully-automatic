@@ -5,6 +5,7 @@
 #include <shaderc/shaderc.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -173,6 +174,17 @@ uint16_t FloatToHalf(float f) {
     return uint16_t(sign | (uint32_t(e) << 10) | (m >> 13));
 }
 
+// The fixed-point 16_16 render targets (k_16_16, k_16_16_16_16) hold values in [-32, 32): the shader
+// output is stored as value / 32 in an int16. The host target keeps the real value in a float, so a
+// resolve into a 16-bit texture has to divide by 32 to put the same bits in guest memory.
+// Off by default: the shadow map the game resolves from a k_16_16 target is fetched as unsigned
+// normalised with no exponent adjust, and its fill writes 1.0 expecting 1.0 back. FA_RT1616=1
+// turns the divide by 32 on again.
+bool Rt1616Scaled() {
+    static const bool on = [] { const char* e = std::getenv("FA_RT1616"); return e && e[0] == '1'; }();
+    return on;
+}
+
 VkFormat ColorRtVkFormat(uint32_t f) {
     switch (f) {
         case xe::kRt8888: case xe::kRt8888Gamma: return VK_FORMAT_R8G8B8A8_UNORM;
@@ -236,6 +248,7 @@ void ClearColorFloat(uint32_t rtFormat, uint32_t hi, uint32_t lo, float out[4]) 
             break;
         case xe::kRt16_16:
             out[0] = float(int16_t(hi)) / 32767.0f; out[1] = float(int16_t(hi >> 16)) / 32767.0f;
+            if (Rt1616Scaled()) { out[0] *= 32.0f; out[1] *= 32.0f; }
             break;
         case xe::kRt16_16_16_16Float:
             out[0] = HalfToFloat(uint16_t(lo)); out[1] = HalfToFloat(uint16_t(lo >> 16));
@@ -244,6 +257,7 @@ void ClearColorFloat(uint32_t rtFormat, uint32_t hi, uint32_t lo, float out[4]) 
         case xe::kRt16_16_16_16:
             out[0] = float(int16_t(lo)) / 32767.0f; out[1] = float(int16_t(lo >> 16)) / 32767.0f;
             out[2] = float(int16_t(hi)) / 32767.0f; out[3] = float(int16_t(hi >> 16)) / 32767.0f;
+            if (Rt1616Scaled()) for (int c = 0; c < 4; c++) out[c] *= 32.0f;
             break;
         case xe::kRt32Float: out[0] = xe::AsFloat(hi); break;
         case xe::kRt32_32Float: out[0] = xe::AsFloat(lo); out[1] = xe::AsFloat(hi); break;
@@ -431,6 +445,27 @@ struct VulkanRenderer::Impl {
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
     VkPipeline curPipeline = VK_NULL_HANDLE;
+    // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
+    // and every time a texture fetch binds it (with whether the cached copy was reused).
+    uint32_t watchAddr = [] { const char* e = std::getenv("FA_WATCH_ADDR"); return e ? uint32_t(std::strtoul(e, nullptr, 16) & 0x1FFFFFFFu) : 0u; }();
+    void WatchBytes(const char* what, uint32_t base, uint32_t size, const char* extra = "") {
+        if (!watchAddr || (base & 0x1FFFFFFFu) != watchAddr) return;
+        static const uint64_t fromFrame = [] { const char* e = std::getenv("FA_WATCH_FROM_FRAME"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        static const int maxEvents = [] { const char* e = std::getenv("FA_WATCH_MAX"); return e ? std::atoi(e) : 400; }();
+        if (frame < fromFrame) return;
+        static int logged = 0;
+        if (logged++ >= maxEvents) return;
+        const uint8_t* p = mem.HostPtr(base, size);
+        if (!p) { std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x: not mapped (%u bytes) %s\n", (unsigned long long)frame, (unsigned long long)stats.draws.load(), what, base, size, extra); return; }
+        std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x size %u hash %016llx %s\n  @0:", (unsigned long long)frame,
+                     (unsigned long long)stats.draws.load(), what, base, size, (unsigned long long)HashBytes(p, size), extra);
+        const uint32_t offs[3] = {0, (size / 2) & ~15u, ((size / 4) * 3) & ~15u};
+        for (int k = 0; k < 3; k++) {
+            if (k) std::fprintf(stderr, "\n  @%x:", offs[k]);
+            for (int i = 0; i < 16; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", p[offs[k] + i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -693,6 +728,7 @@ struct VulkanRenderer::Impl {
     // FA_RENDER_PROBE=frame[-last],x,y[,x,y...]: in those frames, after every draw, read back those screen pixels and log
     // the draws that changed it, with their full trace ("who painted this pixel").
     bool probeOn = false;
+    bool probeOnTrigger = false;  // probe the frame the dump trigger fires on
     uint64_t probeFrame = 0, probeFrameEnd = 0;  // inclusive range
     std::vector<std::pair<int, int>> probePts;
     std::vector<std::array<float, 4>> probeLast;   // per point: value after the latest draw covering it
@@ -705,6 +741,12 @@ struct VulkanRenderer::Impl {
     int64_t dumpFrameSel = -1;
     uint64_t dumpDrawLo = 0, dumpDrawHi = ~0ull, drawInFrame = 0;
     std::set<uint32_t> dumpedTexBases;
+    // FA_RENDER_DUMP_TRIGGER=<file>: when that file appears (touch it), the next frame is dumped like
+    // FA_RENDER_DUMP_FRAME and the file is removed. FA_RENDER_DUMP_AFTER=<seconds>: the same, once,
+    // that many seconds after start. Both need FA_RENDER_DUMP=<dir>.
+    const char* dumpTrigger = nullptr;
+    double dumpAfterSec = -1.0;
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
     bool DumpFrame() const {
         if (!dumpDir) return false;
         if (dumpFrameSel >= 0) return uint64_t(dumpFrameSel) == frame;
@@ -720,6 +762,8 @@ struct VulkanRenderer::Impl {
         const char* d = std::getenv("FA_RENDER_DUMP");
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
+        if (const char* c = std::getenv("FA_RENDER_DUMP_TRIGGER")) if (*c) dumpTrigger = c;
+        if (const char* c = std::getenv("FA_RENDER_DUMP_AFTER")) dumpAfterSec = std::atof(c);
         if (const char* c = std::getenv("FA_RENDER_DUMP_FRAME")) dumpFrameSel = std::strtoll(c, nullptr, 10);
         if (const char* c = std::getenv("FA_RENDER_DUMP_DRAWS")) {
             char* e = nullptr;
@@ -729,9 +773,15 @@ struct VulkanRenderer::Impl {
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
         if (const char* c = std::getenv("FA_RENDER_PROBE")) {
             char* e = nullptr;
-            probeFrame = std::strtoull(c, &e, 10);
-            probeFrameEnd = probeFrame;
-            if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            if (std::strncmp(c, "trigger", 7) == 0) {  // FA_RENDER_PROBE=trigger,x,y,...: armed by FA_RENDER_DUMP_TRIGGER
+                probeOnTrigger = true;
+                probeFrame = probeFrameEnd = ~0ull;
+                e = const_cast<char*>(c + 7);
+            } else {
+                probeFrame = std::strtoull(c, &e, 10);
+                probeFrameEnd = probeFrame;
+                if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            }
             while (e && *e == ',') {
                 long x = std::strtol(e + 1, &e, 10);
                 if (!e || *e != ',') break;
@@ -1360,6 +1410,11 @@ struct VulkanRenderer::Impl {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
             if (cube || t.dimension == 3) return fell("dimension mismatch");
         }
+        if (watchAddr && (t.base & 0x1FFFFFFFu) == watchAddr) {
+            auto wit = textures.find(HashBytes(d, 6 * sizeof(uint32_t)) ^ (uint64_t(t.dimension) << 62));
+            const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
+            if (!reuse) WatchBytes("texture bind", t.base, HostTextureByteSize(t), "(will recheck memory)");  // reused binds are not logged
+        }
         if (snapEnabled && !cube && !snaps.empty())
             if (VkImageView sv = SnapView(t)) return sv;
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
@@ -1414,6 +1469,29 @@ struct VulkanRenderer::Impl {
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht, mipSrc)) return fell("decode failed");
+        // FA_TEX_FORCE=<hex phys addr>:r,g,b,a replaces that texture's texels with one constant colour (0..1,
+        // before the fetch swizzle): a debug aid to find what value a shader needs from a map.
+        {
+            static float force[4];
+            static const uint32_t forceAddr = [] {
+                const char* e = std::getenv("FA_TEX_FORCE");
+                if (!e) return 0u;
+                char* c = nullptr;
+                uint32_t a = uint32_t(std::strtoul(e, &c, 16) & 0x1FFFFFFFu);
+                for (int i = 0; i < 4; i++) {
+                    if (!c || *c != (i ? ',' : ':')) return 0u;
+                    force[i] = std::strtof(c + 1, &c);
+                }
+                return a;
+            }();
+            if (forceAddr && (t.base & 0x1FFFFFFFu) == forceAddr) {
+                const size_t n = ht.data.size() / (ht.isFloat ? 16 : 4);
+                for (size_t i = 0; i < n; i++) {
+                    if (ht.isFloat) std::memcpy(&ht.data[i * 16], force, 16);
+                    else for (int c = 0; c < 4; c++) ht.data[i * 4 + c] = uint8_t(std::clamp(force[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
+        }
         if (prof::g_enabled) {
             static uint64_t n = 0;
             static uint64_t decNs[64] = {};
@@ -1956,7 +2034,8 @@ struct VulkanRenderer::Impl {
     // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
     void DumpTarget(RenderTarget* rt, VkRect2D r, const char* what) {
         static int count = 0;
-        if (count >= 300 || !r.extent.width || !r.extent.height) return;
+        static const int maxPng = [] { const char* e = std::getenv("FA_RENDER_DUMP_MAXPNG"); return e ? std::atoi(e) : 300; }();
+        if (count >= maxPng || !r.extent.width || !r.extent.height) return;
         uint32_t bpp = VkFormatBytes(rt->image.format);
         VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
         EndRendering();
@@ -2265,6 +2344,8 @@ struct VulkanRenderer::Impl {
                 // Destination offset: the resolve rectangle's position in EDRAM.
                 std::vector<float>& px = resolvePx;  // reused: a fresh 15 MB vector per resolve was costly
                 px.resize(size_t(w) * h * 4);
+                const bool fix1616 = !isDepth && Rt1616Scaled() && (srcFormat == xe::kRt16_16 || srcFormat == xe::kRt16_16_16_16) &&
+                                     d.format >= 24 && d.format <= 26;
                 auto toFloat = [&](size_t i) {
                     if (isDepth) {
                         float z;
@@ -2276,6 +2357,8 @@ struct VulkanRenderer::Impl {
                         px[i * 4 + 3] = 1.0f;
                     } else {
                         ReadbackToFloat(src->image.format, rb + i * bpp, &px[i * 4]);
+                        if (fix1616)
+                            for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
                     }
                 };
                 uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
@@ -2298,13 +2381,14 @@ struct VulkanRenderer::Impl {
                         mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
                 }
                 InvalidateTextures(d.base, destBytes);
+                WatchBytes("after resolve", d.base, destBytes, dst ? "(direct write)" : "(dword write path)");
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
-                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s "
+                                 "[render] frame %llu resolve %s rt %u (%d,%d %ux%u) -> %08x fmt %u pitch %u height %u endian %u%s bias %d "
                                  "| src %03x/%u surf %08x wo %08x sc %08x vtx %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
                                  (unsigned long long)frame, isDepth ? "depth" : "color", srcSel, x0, y0, w, h, d.base, d.format, d.pitch, d.height,
-                                 d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
+                                 d.endian, d.swapRB ? " swapRB" : "", d.expBias, srcInfo & 0xFFF, srcFormat, surf,
                                  regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
                 DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
                 }
@@ -2466,6 +2550,27 @@ struct VulkanRenderer::Impl {
         frame++;
         drawInFrame = 0;
         dumpedTexBases.clear();
+        if (dumpDir && dumpTrigger && (frame & 7) == 0) {
+            if (FILE* tf = std::fopen(dumpTrigger, "r")) {
+                std::fclose(tf);
+                std::remove(dumpTrigger);
+                dumpFrameSel = int64_t(frame);
+                dumpDrawLo = 0;
+                dumpDrawHi = ~0ull;
+                std::fprintf(stderr, "[render] dump trigger: dumping frame %llu\n", (unsigned long long)frame);
+                if (probeOnTrigger && probeOn) {
+                    probeFrame = probeFrameEnd = frame;
+                    probeTraced.clear();
+                    for (auto& v : probeLast) v = {-1.0f, -1.0f, -1.0f, -1.0f};
+                }
+            }
+        }
+        if (dumpDir && dumpAfterSec >= 0.0 &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count() >= dumpAfterSec) {
+            dumpAfterSec = -1.0;
+            dumpFrameSel = int64_t(frame);
+            std::fprintf(stderr, "[render] timed dump: dumping frame %llu\n", (unsigned long long)frame);
+        }
     }
 };
 
