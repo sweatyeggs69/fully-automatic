@@ -88,8 +88,12 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     if(TARGET fa_render)
         target_link_libraries(fullauto PRIVATE fa_render)
     endif()
-    # The recompiled code is huge; keep per-file compile cheap by default.
-    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-fno-strict-aliasing")
+    # Optimisation for the recompiled game code. -O2 with AVX2 (x86-64-v3, Haswell and newer) lets
+    # simde map VMX to native SIMD; the movie decoder was CPU bound at -O1 without it. A full
+    # rebuild of ppc/ takes well under a minute on 16 threads. -ffp-contract=off keeps separate
+    # PowerPC multiplies and adds from being fused (FMA rounds differently). Older CPUs: -DFA_PPC_OPT="-O2;-march=x86-64-v2"
+    set(FA_PPC_OPT "-O2;-march=x86-64-v3" CACHE STRING "Compiler flags for the recompiled ppc/ sources")
+    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "${FA_PPC_OPT};-fno-strict-aliasing;-ffp-contract=off")
 else()
     message(STATUS "No ${FA_PPC_DIR}/ppc_config.h: skipping the fullauto target (run XenonRecomp first)")
 endif()
