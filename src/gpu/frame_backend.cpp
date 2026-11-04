@@ -129,7 +129,11 @@ void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const Re
     // Skip the decode while the window still has not shown the previous frame.
     // FA_RENDER_DUMP: the front buffer after every 30th frame (matches the renderer's dump frames).
     static const char* dumpDir = std::getenv("FA_RENDER_DUMP");
-    const bool dumpThis = dumpDir && *dumpDir && (seq <= 6 || ((seq - 1) % 30 == 0 && seq <= 30 * 12));
+    static const uint64_t dumpCount = [] {
+        const char* c = std::getenv("FA_RENDER_DUMP_COUNT");
+        return c ? std::strtoull(c, nullptr, 10) : 12ull;
+    }();
+    const bool dumpThis = dumpDir && *dumpDir && (seq <= 6 || ((seq - 1) % 30 == 0 && seq <= 30 * dumpCount));
     if (!enabled_.load(std::memory_order_relaxed) || (mailbox_.Pending() && !dumpThis)) return;
 
     const bool async = worker_.joinable();
