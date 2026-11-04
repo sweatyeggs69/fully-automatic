@@ -239,3 +239,19 @@ labels = [
     0x8242DB00,
     0x8242DB00,
 ]
+
+# sub_822CA728 (called from 82274194): the table at 0x822CA748, 8 entries. Without it the bctr is
+# compiled as an indirect call through the function table and the title screen crashes at rip 0.
+[[switch]]
+base = 0x822CA744
+r = 11
+labels = [
+    0x822CA768,
+    0x822CA780,
+    0x822CA790,
+    0x822CA7A0,
+    0x822CA7B0,
+    0x822CA790,
+    0x822CA7B8,
+    0x822CA768,
+]
