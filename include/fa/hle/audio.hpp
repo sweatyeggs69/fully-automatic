@@ -80,7 +80,7 @@ public:
     // stereo out). Exposed for tests.
     static void downmix_frame(const float* planar6, float* stereo_out);
 
-    static constexpr int kMaxQueuedFrames = 8;    // ~43 ms
+    static constexpr int kMaxQueuedFrames = 24;   // ~128 ms of cushion so stalls (car select load) do not underrun
 
     // Counters for FA_AUDIO_STATS / FA_PROFILE (totals since start).
     struct Stats {

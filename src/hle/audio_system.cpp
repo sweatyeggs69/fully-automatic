@@ -59,7 +59,7 @@ bool AudioSystem::init(const GuestHooks& hooks, bool disable_output) {
         want.freq = kSampleRate;
         want.format = AUDIO_F32SYS;
         want.channels = 2;
-        want.samples = kFrameSamples * 2;
+        want.samples = kFrameSamples * 4;  // 1024 frames (~21 ms) per device period
         want.callback = &AudioSystem::sdl_callback;
         want.userdata = this;
         device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
