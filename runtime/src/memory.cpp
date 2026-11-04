@@ -1,8 +1,12 @@
 #include "fa/rt/memory.hpp"
 #include "fa/rt/guest.hpp"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <algorithm>
 #include <cstdio>
+#include <initializer_list>
 
 namespace fa::rt {
 
@@ -21,13 +25,52 @@ bool GuestMemory::init() {
     // The generated code assumes the base is 32-byte aligned; mmap gives page alignment.
     base_ = static_cast<uint8_t*>(p);
     g_base = base_;
+    // Physical memory is one shared 512 MiB block seen through three views, as on the console:
+    // 0xA0000000 + p, 0xC0000000 + p and 0xE0000000 + p - 0x1000.
+    phys_fd_ = memfd_create("fa-physical", 0);
+    if (phys_fd_ < 0 || ftruncate(phys_fd_, kPhysicalSize) != 0) {
+        std::perror("physical memory");
+        return false;
+    }
+    for (uint32_t view : {0xA0000000u, 0xC0000000u}) {
+        if (mmap(base_ + view, kPhysicalSize, PROT_NONE, MAP_SHARED | MAP_FIXED, phys_fd_, 0) == MAP_FAILED) {
+            std::perror("mmap physical view");
+            return false;
+        }
+    }
+    if (mmap(base_ + 0xE0000000u, kPhysicalSize - 0x1000, PROT_NONE, MAP_SHARED | MAP_FIXED, phys_fd_, 0x1000) ==
+        MAP_FAILED) {
+        std::perror("mmap physical view");
+        return false;
+    }
     return true;
+}
+
+// Physical address behind a guest address in one of the physical views, or -1.
+static int64_t physical_of(uint32_t addr) {
+    if (addr < 0xA0000000u) return -1;
+    if (addr >= 0xE0000000u) return int64_t(addr & 0x1FFFFFFFu) + 0x1000;
+    return addr & 0x1FFFFFFFu;
+}
+
+// Applies `prot` to [addr, addr + size) and to the same physical pages in the other views.
+bool GuestMemory::protect(uint32_t addr, uint64_t size, int prot) {
+    int64_t phys = physical_of(addr);
+    if (phys < 0) return mprotect(base_ + addr, size, prot) == 0;
+    bool ok = true;
+    for (uint32_t view : {0xA0000000u, 0xC0000000u}) {
+        uint64_t end = std::min<uint64_t>(phys + size, kPhysicalSize);
+        if (uint64_t(phys) < end) ok &= mprotect(base_ + view + phys, end - phys, prot) == 0;
+    }
+    uint64_t lo = std::max<int64_t>(phys, 0x1000), end = std::min<uint64_t>(phys + size, kPhysicalSize);
+    if (lo < end) ok &= mprotect(base_ + 0xE0000000u + (lo - 0x1000), end - lo, prot) == 0;
+    return ok;
 }
 
 bool GuestMemory::commit_fixed(uint32_t addr, uint32_t size) {
     uint32_t a = addr & ~(kPageSize - 1);
     uint64_t end = (uint64_t(addr) + size + kPageSize - 1) & ~uint64_t(kPageSize - 1);
-    return mprotect(base_ + a, end - a, PROT_READ | PROT_WRITE) == 0;
+    return protect(a, end - a, PROT_READ | PROT_WRITE);
 }
 
 GuestMemory::Range GuestMemory::range_of(Heap h) {
@@ -35,7 +78,7 @@ GuestMemory::Range GuestMemory::range_of(Heap h) {
         case Heap::User: return {0x00010000, 0x40000000};
         case Heap::System: return {0x60000000, 0x70000000};
         case Heap::Malloc: return {0x70000000, 0x7F000000};
-        case Heap::Physical: return {0xA0000000, 0xE0000000};
+        case Heap::Physical: return {0xA0000000, 0xC0000000};
         case Heap::View: return {0x90000000, 0xA0000000};
     }
     return {0, 0};
@@ -72,7 +115,7 @@ uint32_t GuestMemory::alloc(Heap heap, uint32_t size, uint32_t align, uint32_t f
             cand = round_up(it->first + it->second, align);
         }
     }
-    if (mprotect(base_ + addr, size, PROT_READ | PROT_WRITE) != 0) return 0;
+    if (!protect(addr, size, PROT_READ | PROT_WRITE)) return 0;
     allocs_[addr] = size;
     return addr;
 }
@@ -83,8 +126,10 @@ bool GuestMemory::free(uint32_t addr, uint32_t* freed_size) {
     if (it == allocs_.end()) return false;
     uint32_t size = it->second;
     // Drop the pages so a later allocation sees zeroed memory, and trap stale accesses.
-    madvise(base_ + addr, size, MADV_DONTNEED);
-    mprotect(base_ + addr, size, PROT_NONE);
+    int64_t phys = physical_of(addr);
+    if (phys >= 0) fallocate(phys_fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, phys, size);
+    else madvise(base_ + addr, size, MADV_DONTNEED);
+    protect(addr, size, PROT_NONE);
     allocs_.erase(it);
     if (freed_size) *freed_size = size;
     return true;

@@ -1,6 +1,7 @@
 // Runtime test for the HLE imports: XamInput*, XAudio* render driver (with a
 // fake guest callback driven by the audio thread) and the XMA context exports.
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdio>

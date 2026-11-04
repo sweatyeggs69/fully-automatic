@@ -55,5 +55,8 @@ constexpr uint32_t kFetchConstBase = 0x4800;
 constexpr uint32_t kBoolConstBase = 0x4900;
 constexpr uint32_t kLoopConstBase = 0x4908;
 constexpr uint32_t kRegisterBase = 0x2000;
+constexpr uint32_t kScratchUmsk = 0x01DC;
+constexpr uint32_t kScratchAddr = 0x01DD;
+constexpr uint32_t kScratchReg0 = 0x0578;
 
 }  // namespace fa::gpu::pm4

@@ -7,10 +7,12 @@
 //   0x7FEA0000 - 0x7FEAFFFF  XMA/APU register page (plain memory, committed at startup)
 //   0x80000000 - 0x8FFFFFFF  XEX image at 0x82000000 + function table after it
 //   0xA0000000 - 0xBFFFFFFF  physical memory, 64 KiB pages (MmAllocatePhysicalMemoryEx)
-//   0xC0000000 - 0xDFFFFFFF  physical memory, 16 MiB pages (treated like 0xA0000000)
+//   0xC0000000 - 0xDFFFFFFF  physical memory, 16 MiB page view of the same memory
+//   0xE0000000 - 0xFFFFFFFF  physical memory, 4 KiB page view (offset by 0x1000)
 //
-// The physical ranges are not aliased the way real hardware does it; the physical
-// address returned by MmGetPhysicalAddress is the guest address masked to 29 bits.
+// The three physical views alias one 512 MiB block. Allocations are made in the 0xA0000000
+// view; the physical address returned by MmGetPhysicalAddress is the guest address masked to
+// 29 bits (plus 0x1000 for the 0xE0000000 view).
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -21,6 +23,7 @@ namespace fa::rt {
 constexpr uint64_t kGuestSpace = 0x100000000ull;
 constexpr uint32_t kPageSize = 0x1000;
 constexpr uint32_t kAllocGranularity = 0x10000;
+constexpr uint32_t kPhysicalSize = 0x20000000;
 
 enum class Heap { User, System, Malloc, Physical, View };
 
@@ -50,7 +53,9 @@ public:
 private:
     struct Range { uint32_t lo, hi; };
     static Range range_of(Heap h);
+    bool protect(uint32_t addr, uint64_t size, int prot);
     uint8_t* base_ = nullptr;
+    int phys_fd_ = -1;
     std::mutex mu_;
     std::mutex malloc_mu_;
     std::map<uint32_t, uint32_t> allocs_;  // start -> size (page rounded)

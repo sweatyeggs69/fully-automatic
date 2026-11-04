@@ -89,6 +89,15 @@ int main() {
     CHECK(cp.Pump() == CommandProcessor::Status::Idle);
     CHECK(be.draws.size() == n + 1 && be.draws.back().indexCount == 9);
 
+    // Scratch register writeback: SCRATCH_REG0/1 mirror to SCRATCH_ADDR when their UMSK bit is set.
+    put((0u << 16) | pm4::kScratchAddr); put(0x400);
+    put((0u << 16) | pm4::kScratchUmsk); put(0x1);
+    put((1u << 16) | pm4::kScratchReg0); put(4); put(9);
+    cp.SetWritePtr(w % (ringBytes / 4));
+    CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+    CHECK(mem.Read32(0x400) == 4);
+    CHECK(mem.Read32(0x404) == 0);
+
     std::printf(failures ? "gpu_pm4_test: %d failure(s)\n" : "gpu_pm4_test: ok\n", failures);
     return failures ? 1 : 0;
 }
