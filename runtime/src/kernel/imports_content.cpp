@@ -316,7 +316,13 @@ FA_IMPORT(XamContentGetCreator) {
 FA_IMPORT(XamShowDeviceSelectorUI) {
     uint32_t out = arg32(ctx, 4), ov = arg32(ctx, 5);
     if (!out) { ret32(ctx, kErrorInvalidParameter); return; }
+    auto dump = [](const char* when, uint32_t out, uint32_t ov) {
+        std::fprintf(stderr, "Content: selector %s out=%08X [%08X] ov=%08X:", when, out, ld32(out), ov);
+        for (int i = 0; i < 0x1C; i += 4) std::fprintf(stderr, " %08X", ld32(ov + i));
+        std::fprintf(stderr, "\n");
+    };
     if (!ov) { st32(out, kDeviceId); ret32(ctx, 0); return; }
+    dump("call", out, ov);
     static const long delay_ms = [] {
         const char* e = std::getenv("FA_DEVICE_SELECT_DELAY_MS");
         return e ? std::atol(e) : 200L;
@@ -330,11 +336,11 @@ FA_IMPORT(XamShowDeviceSelectorUI) {
     st32(ov + 0x00, kErrorIoPending);  // pending until the thread below finishes it
     st32(ov + 0x04, 0);
     st32(ov + 0x18, 0);
-    std::thread([out, ov] {
+    std::thread([out, ov, dump] {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         st32(out, kDeviceId);
         complete_overlapped(ov, 0);
-        std::fprintf(stderr, "Content: device selector finished (device %u)\n", kDeviceId);
+        dump("done", out, ov);
     }).detach();
     ret32(ctx, kErrorIoPending);
 }
