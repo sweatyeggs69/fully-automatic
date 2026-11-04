@@ -1,0 +1,199 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 92062a1..9c53cbc 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -168,8 +168,35 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    // Addresses known to be real function entries (called, listed in .pdata or the config, or
++    // referenced as code pointers). The jump table merge below never swallows these.
++    std::unordered_set<size_t> entries;
++
++    auto findCodeSection = [&](size_t address) -> const Section*
++        {
++            for (const auto& section : image.sections)
++            {
++                if ((section.flags & SectionFlags_Code) && address >= section.base && address < section.base + section.size)
++                    return &section;
++            }
++            return nullptr;
++        };
++
+     for (auto& [address, size] : config.functions)
+     {
++        entries.insert(address);
++        if (size == 0)
++        {
++            auto* section = findCodeSection(address);
++            if (section == nullptr)
++            {
++                fmt::println("ERROR: config function {:X} is not in a code section", address);
++                continue;
++            }
++            auto& fn = functions.emplace_back(Function::Analyze(section->data + address - section->base, section->base + section->size - address, address));
++            image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++            continue;
++        }
+         functions.emplace_back(address, size);
+         image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
+     }
+@@ -183,6 +210,7 @@ void Recompiler::Analyse()
+         fn.BeginAddress = ByteSwap(fn.BeginAddress);
+         fn.Data = ByteSwap(fn.Data);
+ 
++        entries.insert(fn.BeginAddress);
+         if (image.symbols.find(fn.BeginAddress) == image.symbols.end())
+         {
+             auto& f = functions.emplace_back();
+@@ -193,6 +221,83 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    // Functions that are only reached through a pointer (vtables, callbacks, thread entries) have
++    // no bl and often no .pdata entry (leaf functions). Find them from code pointers: 32-bit words
++    // in data sections, and lis + addi/ori pairs in code. To skip pointers to labels inside a
++    // function, the word before the target must end a function (blr, bctr, b) or be padding.
++    std::unordered_set<size_t> switchLabels;
++    for (auto& [tableBase, table] : config.switchTables)
++        switchLabels.insert(table.labels.begin(), table.labels.end());
++
++    size_t dataPointerCount = 0, immediatePointerCount = 0;
++    auto addPointerTarget = [&](size_t address, size_t& counter)
++        {
++            if ((address & 3) != 0 || switchLabels.count(address) != 0)
++                return;
++            auto* section = findCodeSection(address);
++            if (section == nullptr)
++                return;
++            auto* code = reinterpret_cast<const uint32_t*>(section->data + address - section->base);
++            uint32_t insn = ByteSwap(*code);
++            // Skip zero words and words that look like pointers into the image (tables in code).
++            if (insn == 0 || (insn >= image.base && insn < image.base + image.size))
++                return;
++            if (address > section->base)
++            {
++                uint32_t prev = ByteSwap(*(code - 1));
++                bool endsFunction = prev == 0 || prev == 0x60000000 || prev == 0x4E800020 || prev == 0x4E800420 ||
++                    (PPC_OP(prev) == PPC_OP_B && !PPC_BL(prev) && (prev & 2) == 0);
++                if (!endsFunction)
++                    return;
++            }
++            entries.insert(address);
++            if (image.symbols.find(address) != image.symbols.end())
++                return;
++            auto& fn = functions.emplace_back(Function::Analyze(code, section->base + section->size - address, address));
++            image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++            ++counter;
++        };
++
++    for (const auto& section : image.sections)
++    {
++        if (section.flags & SectionFlags_Code)
++        {
++            // lis rD, hi ; ... ; addi/ori rX, rD, lo within the next few instructions.
++            auto* words = reinterpret_cast<const uint32_t*>(section.data);
++            size_t count = section.size / 4;
++            for (size_t i = 0; i < count; i++)
++            {
++                uint32_t insn = ByteSwap(words[i]);
++                if (PPC_OP(insn) != 15 || ((insn >> 16) & 0x1F) != 0)  // lis = addis rD, 0, imm
++                    continue;
++                uint32_t reg = (insn >> 21) & 0x1F;
++                uint32_t hi = (insn & 0xFFFF) << 16;
++                for (size_t j = i + 1; j < count && j <= i + 8; j++)
++                {
++                    uint32_t next = ByteSwap(words[j]);
++                    uint32_t op = PPC_OP(next);
++                    if (op == 16 || op == 18 || op == 19)  // branch: stop at the block end
++                        break;
++                    if (op == 14 && ((next >> 16) & 0x1F) == reg)  // addi rX, rD, imm
++                        addPointerTarget(uint32_t(hi + int32_t(int16_t(next & 0xFFFF))), immediatePointerCount);
++                    else if (op == 24 && ((next >> 21) & 0x1F) == reg)  // ori rX, rD, imm
++                        addPointerTarget(hi | (next & 0xFFFF), immediatePointerCount);
++                    // Stop once rD is redefined (lis, or addi/ori writing back into rD).
++                    if ((op == 15 || op == 14) && ((next >> 21) & 0x1F) == reg)
++                        break;
++                    if (op == 24 && ((next >> 16) & 0x1F) == reg)
++                        break;
++                }
++            }
++        }
++        else
++        {
++            for (size_t offset = 0; offset + 4 <= section.size; offset += 4)
++                addPointerTarget(ByteSwap(*reinterpret_cast<const uint32_t*>(section.data + offset)), dataPointerCount);
++        }
++    }
++    fmt::println("Added {} functions from data pointers and {} from lis/addi pointers", dataPointerCount, immediatePointerCount);
++
+     for (const auto& section : image.sections)
+     {
+         if (!(section.flags & SectionFlags_Code))
+@@ -209,6 +314,7 @@ void Recompiler::Analyse()
+             if (PPC_OP(insn) == PPC_OP_B && PPC_BL(insn))
+             {
+                 size_t address = base + (data - section.data) + PPC_BI(insn);
++                entries.insert(address);
+ 
+                 if (address >= section.base && address < section.base + section.size && image.symbols.find(address) == image.symbols.end())
+                 {
+@@ -253,6 +359,8 @@ void Recompiler::Analyse()
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
+ 
++    size_t keptEntryCount = 0;
++
+     // Functions containing jump tables are often cut short by the boundary analysis, because
+     // the first blr ends them. Merge every function up to the last jump table label. Several
+     // overlapping functions can contain the same table, so extend all of them.
+@@ -281,8 +389,20 @@ void Recompiler::Analyse()
+             }
+             end = std::max(end, maxLabel + 4);
+ 
++            // Swallowed functions that are real entries stay as their own (overlapping) functions,
++            // otherwise indirect calls to them find no entry in the function table.
++            size_t write = index + 1;
+             for (size_t k = index; k < next; k++)
+             {
++                if (k != index && entries.count(functions[k].base) != 0)
++                {
++                    if (write != k)
++                        functions[write] = std::move(functions[k]);
++                    ++write;
++                    ++keptEntryCount;
++                    continue;
++                }
++
+                 auto range = image.symbols.equal_range(functions[k].base);
+                 for (auto sym = range.first; sym != range.second;)
+                 {
+@@ -293,12 +413,14 @@ void Recompiler::Analyse()
+                 }
+             }
+ 
+-            functions.erase(functions.begin() + index + 1, functions.begin() + next);
++            functions.erase(functions.begin() + write, functions.begin() + next);
+             functions[index].size = end - fnBase;
+             image.symbols.emplace(fmt::format("sub_{:X}", fnBase), fnBase, functions[index].size, Symbol_Function);
+         }
+     }
+ 
++    fmt::println("Kept {} function entries inside merged jump table functions", keptEntryCount);
++
+     // Diagnostics: report jump tables whose labels are not covered by every function containing them.
+     for (auto& [tableBase, table] : config.switchTables)
+     {
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..ea72f33 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -53,7 +53,7 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+             {
+                 auto& funcTable = *func.as_table();
+                 uint32_t address = *funcTable["address"].value<uint32_t>();
+-                uint32_t size = *funcTable["size"].value<uint32_t>();
++                uint32_t size = funcTable["size"].value_or(0u);  // 0: find the size with Function::Analyze
+                 functions.emplace(address, size);
+             }
+         }
