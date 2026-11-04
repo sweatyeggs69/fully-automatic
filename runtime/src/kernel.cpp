@@ -226,10 +226,12 @@ uint32_t Kernel::resume(KThread& t) {
 }
 
 uint32_t Kernel::suspend(KThread& t) {
-    // Only threads that have not started running yet can really be held back; a running
-    // host thread cannot be stopped portably. The count is still tracked for the guest.
-    std::lock_guard<std::mutex> lk(g_kmu);
-    return t.suspend_count++;
+    // A thread suspending itself blocks until it is resumed. Other running host threads cannot
+    // be stopped portably, so for them (and threads not started yet) only the count is tracked.
+    std::unique_lock<std::mutex> lk(g_kmu);
+    uint32_t prev = t.suspend_count++;
+    if (&t == t_current) g_kcv.wait(lk, [&] { return t.suspend_count <= 0; });
+    return prev;
 }
 
 uint32_t Kernel::run_main_thread(uint32_t entry, uint32_t stack_size) {
