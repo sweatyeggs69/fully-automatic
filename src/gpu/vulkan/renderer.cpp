@@ -2562,6 +2562,15 @@ struct VulkanRenderer::Impl {
         }
         Begin();
         generation++;
+        {   // Frames that take over 250 ms (e.g. the first-use texture burst) are always reported.
+            static uint64_t lastNs = 0, lastUploads = 0;
+            const uint64_t now = prof::NowNs();
+            if (lastNs && now - lastNs > 250000000ull)
+                std::fprintf(stderr, "[slowframe] frame %llu took %.0f ms, %llu texture uploads\n", (unsigned long long)frame,
+                             double(now - lastNs) / 1e6, (unsigned long long)(stats.textureUploads - lastUploads));
+            lastNs = now;
+            lastUploads = stats.textureUploads;
+        }
         if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
             std::fprintf(stderr, "[probe-frame] frame %llu final:", (unsigned long long)frame);
             for (size_t k = 0; k < probePts.size(); k++)
