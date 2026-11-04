@@ -1354,6 +1354,31 @@ struct VulkanRenderer::Impl {
                          s, t.type, t.format, t.width, t.height, t.depth, t.dimension, t.base, t.pitch,
                          t.tiled ? "tiled" : "linear", t.endian, t.swizzle, t.clamp[0], t.clamp[1], t.magFilter, t.minFilter,
                          d[0], d[1], d[2], d[3], d[4], d[5]);
+            // The texture as the CPU decoder sees it in guest memory, plus whether each row of
+            // blocks is made of identical blocks (a sign of degenerate source data).
+            static int texDumps = 0;
+            if (texDumps < 120 && t.dimension == 1 && GetFormatInfo(t.format).supported) {
+                const uint8_t* src = mem.HostPtr(t.base, TextureByteSize(t));
+                std::vector<uint8_t> rgba;
+                if (src && DecodeTexture(t, src, rgba)) {
+                    texDumps++;
+                    char path[512];
+                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
+                                  t.base, t.format, t.width, t.height);
+                    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+                    WritePng(path, t.width, t.height, rgba.data());
+                    uint32_t constRows = 0;
+                    for (uint32_t y = 0; y < t.height; y++) {
+                        const uint8_t* row = &rgba[size_t(y) * t.width * 4];
+                        bool same = true;
+                        for (uint32_t x = 1; x < t.width && same; x++) same = !std::memcmp(row, row + x * 4, 3);
+                        constRows += same;
+                    }
+                    std::fprintf(stderr, "[render]     decoded: %u of %u rows are one colour; raw:", constRows, t.height);
+                    for (int i = 0; i < 32; i++) std::fprintf(stderr, "%s%02x", i % 4 ? "" : " ", src[i]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
         }
         for (uint32_t s = 0; s < 96; s++) {
             if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32)))) continue;
