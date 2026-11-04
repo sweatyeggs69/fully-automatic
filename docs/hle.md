@@ -96,5 +96,5 @@ also runs the hardware-path test on a real stereo XMA file.
 ## Not done yet
 
 - XMA loop sub-frame precision (loops land on frame boundaries), multi-stream (more than 2 channel) XMA contexts.
-- `XamContentCreateEnumerator` (empty), `XamShowDeviceSelectorUI` (auto-picks device 1) and the wide printf pair `_vscwprintf` / `vswprintf` are in `runtime/src/kernel/imports_content.cpp`. Content packages (`XamContentCreate` etc.) still need mapping onto `hdd:`.
+- Content (`runtime/src/kernel/imports_content.cpp`): one virtual HDD, device id 1, "Hard Drive". `XamContentCreateDeviceEnumerator` plus `XamEnumerate` list it, `XamContentGetDeviceData/Name/State` answer for it, `XamShowDeviceSelectorUI` auto-picks it. Saves live in `hdd/Content/0000000000000000/534507D5/<type>/<file>/` (display name in `<file>.meta`). `XamContentCreate/Ex` mounts that folder under the root name, `XamContentClose` unmounts, `XamContentDelete/GetCreator/Flush` work. `_vscwprintf` and `vswprintf` live there too.
 - Keystroke queues (`XamInputGetKeystroke`) always report no input.
