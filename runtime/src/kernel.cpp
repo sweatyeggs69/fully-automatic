@@ -182,6 +182,7 @@ void Kernel::thread_main(std::shared_ptr<KThread> t) {
         char name[16];
         std::snprintf(name, sizeof name, "guest-%u", t->tid);
         set_host_thread_name(name);
+        fpe_enable_this_thread();
     }
     {
         std::unique_lock<std::mutex> lk(g_kmu);
@@ -340,6 +341,7 @@ void attach_guest_thread(const std::string& name) {
     t->tid = g_kernel.next_tid();
     t->name = name;
     set_host_thread_name(name.c_str());
+    fpe_enable_this_thread();
     t->stack_size = kDefaultStack;
     if (!g_kernel.setup_thread_memory_public(*t)) return;
     t_current = t.get();

@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <xmmintrin.h>
 
 #include <atomic>
 #include <chrono>
@@ -66,7 +67,55 @@ static bool watch_fault(siginfo_t* info, void* uc) {
     return true;
 }
 
+// ---- invalid-operation trap (debug aid): FA_FPE=1 --------------------------------------------------
+// Finds the host instruction that first creates a NaN (0/0, inf-inf, 0*inf, sqrt(-x), NaN to int).
+// Guest threads run with the SSE invalid-operation exception unmasked. The SIGFPE handler logs the
+// instruction (recompiled functions keep their sub_XXXXXXXX names) and the guest registers, then
+// single-steps it with the exception masked and unmasks again in the SIGTRAP handler.
+static bool g_fpe_on = false;
+static thread_local bool t_fpe_stepping = false;
+static std::chrono::steady_clock::time_point g_fpe_t0;
+
+void fpe_enable_this_thread() {
+    if (!g_fpe_on) return;
+    unsigned csr = _mm_getcsr();
+    _mm_setcsr(csr & ~0x80u);  // IM bit: unmask invalid operation
+}
+
+static void fpe_handler(int, siginfo_t* info, void* uc) {
+    auto* ctx = static_cast<ucontext_t*>(uc);
+    uint64_t rip = uint64_t(ctx->uc_mcontext.gregs[REG_RIP]);
+    struct Hit { uint64_t rip; uint32_t count; };
+    static Hit hits[512];
+    static int nhits = 0;
+    Hit* h = nullptr;
+    for (int i = 0; i < nhits; i++) if (hits[i].rip == rip) { h = &hits[i]; break; }
+    if (!h && nhits < 512) { h = &hits[nhits++]; h->rip = rip; h->count = 0; }
+    uint32_t n = h ? ++h->count : 1;
+    if (h && (n & (n - 1)) == 0 && n <= (1u << 20)) {  // log the 1st, 2nd, 4th, 8th ... hit of each instruction
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_fpe_t0).count();
+        Dl_info di{};
+        const char* sym = dladdr(reinterpret_cast<void*>(rip), &di) && di.dli_sname ? di.dli_sname : "?";
+        char buf[256];
+        int len = std::snprintf(buf, sizeof buf, "[fpe] t=%.2fs invalid op #%u in %s +0x%llx (rip %llx, code %d)\n", secs, n, sym,
+                                (unsigned long long)(di.dli_saddr ? rip - reinterpret_cast<uint64_t>(di.dli_saddr) : 0),
+                                (unsigned long long)rip, info->si_code);
+        ssize_t r = ::write(2, buf, len); (void)r;
+        if (n == 1) dump_guest_context_short();
+    }
+    ctx->uc_mcontext.fpregs->mxcsr |= 0x80;      // mask invalid for the one instruction
+    ctx->uc_mcontext.fpregs->mxcsr &= ~0x3Fu;    // clear the sticky flags
+    ctx->uc_mcontext.gregs[REG_EFL] |= 0x100;    // trap flag: SIGTRAP after it
+    t_fpe_stepping = true;
+}
+
 static void trap_handler(int, siginfo_t*, void* uc) {
+    if (t_fpe_stepping) {
+        t_fpe_stepping = false;
+        static_cast<ucontext_t*>(uc)->uc_mcontext.fpregs->mxcsr &= ~0x80u;
+        static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_EFL] &= ~0x100ull;
+        return;
+    }
     static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_EFL] &= ~0x100ull;
     if (g_step_page) mprotect(g_step_page, 0x1000, PROT_READ);
     g_stepping = false;
@@ -228,6 +277,20 @@ void install_crash_handler() {
     sa.sa_sigaction = handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
+    if (const char* e = std::getenv("FA_FPE"); e && e[0] == '1') {
+        g_fpe_on = true;
+        g_fpe_t0 = std::chrono::steady_clock::now();
+        struct sigaction fa{};
+        fa.sa_sigaction = fpe_handler;
+        fa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+        sigaction(SIGFPE, &fa, nullptr);
+        struct sigaction ta{};
+        ta.sa_sigaction = trap_handler;
+        ta.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(SIGTRAP, &ta, nullptr);
+        std::fprintf(stderr, "[fpe] invalid-operation trapping on guest threads\n");
+        fpe_enable_this_thread();
+    }
 }
 
 }  // namespace fa::rt
