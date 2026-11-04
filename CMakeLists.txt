@@ -9,15 +9,19 @@ add_library(fa_core STATIC src/xdvdfs.cpp src/xex.cpp)
 target_include_directories(fa_core PUBLIC include)
 
 # Xenos GPU layer: PM4 command processor + backend interface (no graphics deps).
-add_library(fa_gpu src/gpu/command_processor.cpp)
+add_library(fa_gpu src/gpu/command_processor.cpp src/gpu/texture.cpp src/gpu/frame_backend.cpp)
 target_include_directories(fa_gpu PUBLIC include)
 
 # Command line tool: list/extract ISO contents, inspect default.xex.
 add_executable(faiso tools/faiso.cpp)
 target_link_libraries(faiso fa_core)
 
-# The Vulkan/GLFW bootloader prototype is parked in prototype/ and is not built
-# yet. It will be revived once the recompilation pipeline produces something to run.
+# The game window (SDL2 + Vulkan presenter). fawindow shows a test pattern through it.
+include(cmake/fa_present.cmake)
+if(TARGET fa_present)
+  add_executable(fawindow tools/fawindow.cpp)
+  target_link_libraries(fawindow fa_present)
+endif()
 
 enable_testing()
 add_test(NAME iso_roundtrip
@@ -27,6 +31,10 @@ add_test(NAME iso_roundtrip
 add_executable(gpu_pm4_test tests/gpu_pm4_test.cpp)
 target_link_libraries(gpu_pm4_test fa_gpu)
 add_test(NAME gpu_pm4 COMMAND gpu_pm4_test)
+
+add_executable(gpu_texture_test tests/gpu_texture_test.cpp)
+target_link_libraries(gpu_texture_test fa_gpu)
+add_test(NAME gpu_texture COMMAND gpu_texture_test)
 
 # HLE services used by the runtime: file system (ISO / folders), controller
 # input (SDL2), audio output (SDL2) and XMA decoding (system FFmpeg).

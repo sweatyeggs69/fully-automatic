@@ -24,7 +24,10 @@ file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
     src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 # The GPU command processor lives in the top-level src/gpu.
-list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp)
+list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/texture.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/frame_backend.cpp)
+# The game window (SDL2 + Vulkan). Optional: FA_NO_WINDOW=ON or no Vulkan -> headless build.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_present.cmake)
 
 function(fa_rt_library name ppc_include)
     add_library(${name} STATIC ${FA_RT_SOURCES} src/loader.cpp)
@@ -77,6 +80,10 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     target_link_libraries(fullauto PRIVATE fa_rt)
     target_include_directories(fullauto PRIVATE ${FA_PPC_DIR})
     target_link_options(fullauto PRIVATE -rdynamic)
+    if(TARGET fa_present)
+        target_link_libraries(fullauto PRIVATE fa_present)
+        target_compile_definitions(fullauto PRIVATE FA_WITH_PRESENTER)
+    endif()
     # The recompiled code is huge; keep per-file compile cheap by default.
     set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-fno-strict-aliasing")
 else()

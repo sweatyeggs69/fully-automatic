@@ -2,7 +2,7 @@
 // Rendering backend interface. The command processor decodes PM4 and tracks Xenos
 // register state, then calls into a backend to actually draw. Implementations:
 //   NullBackend    - logs/counts only (tests, headless runs)
-//   VulkanBackend  - real output (src/gpu/vulkan, built when Vulkan is found)
+//   FrameBackend   - decodes the swapped front buffer to RGBA8 for the window (src/gpu)
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -33,8 +33,9 @@ public:
     virtual void Draw(const DrawCall& draw, const RegisterFile& regs) = 0;
     // EVENT_WRITE_EXT resolve: copy EDRAM contents to a texture in guest memory.
     virtual void Resolve(const RegisterFile& regs) = 0;
-    // Present: the game finished a frame (VdSwap / PM4 XE_SWAP).
-    virtual void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height) = 0;
+    // Present: the game finished a frame (VdSwap / PM4 XE_SWAP). VdSwap loads the front
+    // buffer's texture fetch constant into fetch slot 0 (regs 0x4800..0x4805) first.
+    virtual void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height, const RegisterFile& regs) = 0;
 };
 
 }  // namespace fa::gpu

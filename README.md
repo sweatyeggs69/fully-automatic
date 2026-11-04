@@ -6,7 +6,7 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
 2. Parse the XEX header                                   (basic info done)
 3. Decrypt/decompress the XEX image and feed it to XenonRecomp (PPC -> C++)
 4. Convert shaders with XenosRecomp
-5. Build a native runtime (Vulkan, GLFW, audio, input) around the recompiled code
+5. Build a native runtime (Vulkan, SDL2 window, audio, input) around the recompiled code
 
 `prototype/` holds the earlier Vulkan/GLFW bootloader sketch. It does not build and is not part of the CMake targets.
 
@@ -14,6 +14,13 @@ Full Auto (Xbox 360) running natively on Linux via static recompilation.
     cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 Needs SDL2 and FFmpeg (libavcodec/libavutil): `sudo pacman -S --needed sdl2 ffmpeg` on CachyOS.
+The game window also needs Vulkan: `sudo pacman -S --needed vulkan-headers vulkan-icd-loader` plus
+your driver (`vulkan-radeon`, `nvidia-utils` or `vulkan-intel`). Without them everything still builds
+and the game runs headless.
+
+## Game window
+See [docs/window.md](docs/window.md). `./build/fawindow` opens the window with a moving test
+pattern, which checks SDL2 + Vulkan without the game.
 
 ## Files, input and audio
 See [docs/hle.md](docs/hle.md): `game:\` over the ISO, save folders, controllers and keyboard,

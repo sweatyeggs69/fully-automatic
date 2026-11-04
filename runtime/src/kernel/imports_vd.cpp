@@ -1,13 +1,15 @@
 // Video driver (Vd*) glue. The game talks to the GPU through the ring buffer and a few
 // kernel calls. For now this records the state it sets up, answers display queries for
 // 1280x720 and delivers a 60 Hz vsync interrupt to the registered graphics callback. The
-// command processor (src/gpu) is attached to the recorded ring buffer later.
+// command processor (src/gpu) runs the ring buffer into a FrameBackend, whose frames the
+// window in main.cpp shows.
 #include "fa/rt/import.hpp"
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/memory.hpp"
 
 #include "fa/gpu/command_processor.hpp"
-#include "fa/gpu/null_backend.hpp"
+#include "fa/gpu/frame_backend.hpp"
+#include "fa/rt/video.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -94,9 +96,17 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
         uint32_t g = tr(a);
         if (mapped(g, a)) st32(g, v);
     }
-    const uint8_t* HostPtr(uint32_t a, uint32_t) const override {
+    const uint8_t* HostPtr(uint32_t a, uint32_t size) const override {
         uint32_t g = tr(a);
-        return mapped(g, a) ? host(g) : nullptr;
+        uint32_t st, sz;
+        // The whole range must sit inside one allocation (textures, front buffer).
+        if (!g_mem.find_allocation(g, st, sz) || uint64_t(g) + size > uint64_t(st) + sz) {
+            static std::atomic<int> warned{0};
+            if (warned.fetch_add(1) < 20)
+                std::fprintf(stderr, "[gpu] %u bytes at %08x (guest %08x) not inside one allocation\n", size, a, g);
+            return nullptr;
+        }
+        return host(g);
     }
 };
 
@@ -104,7 +114,7 @@ constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
 constexpr uint32_t kCpRbWptr = 0x7FC80000 + 0x1C5 * 4;
 
 RtGuestMemory g_gpu_mem;
-fa::gpu::NullBackend g_gpu_backend;
+fa::gpu::FrameBackend g_gpu_backend(g_gpu_mem);
 fa::gpu::CommandProcessor* g_cp = nullptr;
 std::atomic<bool> g_gpu_started{false};
 
@@ -157,6 +167,8 @@ void start_gpu() {
     std::thread(gpu_thread).detach();
 }
 }  // namespace
+
+fa::gpu::FrameBackend& fa::rt::gpu_frame_backend() { return g_gpu_backend; }
 
 FA_IMPORT(VdInitializeRingBuffer) {
     // (physical base, log2 of the size in 8-byte units)
