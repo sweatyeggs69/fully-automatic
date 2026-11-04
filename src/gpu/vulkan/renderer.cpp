@@ -492,8 +492,8 @@ struct VulkanRenderer::Impl {
     // images hold the data and the guest memory is written in one batch (one GPU wait) when something
     // can observe it: a swap, a fence / interrupt / memory write from the command stream, a texture
     // fetch that cannot use a snapshot, or a resolve that overlaps a pending one.
-    // Deferring the guest memory write is experimental (FA_RESOLVE_LAZY=1); by default each snapshotted resolve is written right away.
-    const bool lazyWriteback = [] { const char* e = std::getenv("FA_RESOLVE_LAZY"); return e && e[0] == '1'; }();
+    // Snapshotted resolves are written into guest memory in batches at sync points; FA_RESOLVE_LAZY=0 writes each one right away.
+    const bool lazyWriteback = [] { const char* e = std::getenv("FA_RESOLVE_LAZY"); return !(e && e[0] == '0'); }();
     std::vector<uint32_t> pendingKeys;
     uint64_t pendingBytes = 0;
     bool PendingOverlaps(uint32_t base, uint32_t size) {
