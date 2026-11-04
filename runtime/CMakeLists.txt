@@ -21,7 +21,7 @@ set(THIRDPARTY_ROOT ${FA_XENONRECOMP}/thirdparty)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
 
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
-    src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/kernel/*.cpp
+    src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/profiler.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 # The GPU command processor lives in the top-level src/gpu.
 list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp)
