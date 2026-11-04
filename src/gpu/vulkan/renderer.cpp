@@ -11,9 +11,11 @@
 #include <thread>
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -638,6 +640,14 @@ struct VulkanRenderer::Impl {
     // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
     const char* dumpDir = nullptr;
     bool dbgNoAtest = false, dbgNoBlend = false;
+    // FA_RENDER_PROBE=frame[-last],x,y[,x,y...]: in those frames, after every draw, read back those screen pixels and log
+    // the draws that changed it, with their full trace ("who painted this pixel").
+    bool probeOn = false;
+    uint64_t probeFrame = 0, probeFrameEnd = 0;  // inclusive range
+    std::vector<std::pair<int, int>> probePts;
+    std::vector<std::array<float, 4>> probeLast;   // per point: value after the latest draw covering it
+    std::vector<uint64_t> probeLastDraw;           // per point: that draw's number
+    std::set<std::pair<uint64_t, uint64_t>> probeTraced;  // (vs, ps) pairs whose full trace was already printed
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
     bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount)); }
 
@@ -646,6 +656,21 @@ struct VulkanRenderer::Impl {
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
+        if (const char* c = std::getenv("FA_RENDER_PROBE")) {
+            char* e = nullptr;
+            probeFrame = std::strtoull(c, &e, 10);
+            probeFrameEnd = probeFrame;
+            if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            while (e && *e == ',') {
+                long x = std::strtol(e + 1, &e, 10);
+                if (!e || *e != ',') break;
+                long y = std::strtol(e + 1, &e, 10);
+                probePts.push_back({int(x), int(y)});
+            }
+            probeOn = !probePts.empty();
+            probeLast.assign(probePts.size(), {-1.0f, -1.0f, -1.0f, -1.0f});
+            probeLastDraw.assign(probePts.size(), 0);
+        }
         if (const char* c = std::getenv("FA_DBG_RENDER")) {
             dbgNoAtest = std::strstr(c, "noatest") != nullptr;
             dbgNoBlend = std::strstr(c, "noblend") != nullptr;
@@ -1706,6 +1731,68 @@ struct VulkanRenderer::Impl {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
         }
+        if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
+            RenderTarget* rt = nullptr;
+            for (int i = 0; i < 4 && !rt; i++) rt = curColor[i];
+            std::vector<size_t> idx;
+            std::vector<std::pair<int, int>> pos;
+            for (size_t k = 0; rt && k < probePts.size(); k++) {
+                const int tx = probePts[k].first + int(wox), ty = probePts[k].second + int(woy);
+                if (tx < scissor.offset.x || ty < scissor.offset.y || tx >= scissor.offset.x + int(scissor.extent.width) ||
+                    ty >= scissor.offset.y + int(scissor.extent.height) || tx >= int(rt->image.w) || ty >= int(rt->image.h))
+                    continue;
+                idx.push_back(k);
+                pos.push_back({tx, ty});
+            }
+            if (!idx.empty()) {
+                std::vector<std::array<float, 4>> vals;
+                ProbePixels(rt, pos, vals);
+                for (size_t j = 0; j < idx.size(); j++) {
+                    const size_t k = idx[j];
+                    const auto& f = vals[j];
+                    probeLastDraw[k] = stats.draws.load();
+                    if (!std::memcmp(probeLast[k].data(), f.data(), sizeof(float) * 4)) continue;
+                    probeLast[k] = f;
+                    std::fprintf(stderr, "[probe] frame %llu draw %llu pixel(%d,%d) -> %.3f %.3f %.3f %.3f | prim %u idx %zu vs %016llx ps %016llx blend %08x\n",
+                                 (unsigned long long)frame, (unsigned long long)stats.draws.load(), probePts[k].first, probePts[k].second,
+                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), hd.indices.size(), (unsigned long long)dc.vsHash,
+                                 (unsigned long long)dc.psHash, regs[xe::RB_BLENDCONTROL0]);
+                    if (probeTraced.insert({dc.vsHash, dc.psHash}).second) TraceInputs(regs, vs, ps, sys);
+                }
+            }
+        }
+    }
+
+    // Reads several pixels of a colour target in one submit.
+    void ProbePixels(RenderTarget* rt, const std::vector<std::pair<int, int>>& pts, std::vector<std::array<float, 4>>& out) {
+        const uint32_t bpp = VkFormatBytes(rt->image.format);
+        const VkDeviceSize stride = 32;
+        const VkDeviceSize need = stride * pts.size();
+        EndRendering();
+        if (need > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, std::max<VkDeviceSize>(need, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Barrier();
+        for (size_t i = 0; i < pts.size(); i++) {
+            VkBufferImageCopy bic{};
+            bic.bufferOffset = stride * i;
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageOffset = {pts[i].first, pts[i].second, 0};
+            bic.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(cmd, rt->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        }
+        Barrier();
+        SubmitAndWait();
+        Begin();
+        out.assign(pts.size(), {0, 0, 0, 0});
+        for (size_t i = 0; i < pts.size(); i++)
+            ReadbackToFloat(rt->image.format, static_cast<const uint8_t*>(readback.map) + stride * i, out[i].data());
+        (void)bpp;
+        for (auto& c : curColor) c = nullptr;
+        curDepth = nullptr;
     }
 
     // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
@@ -1773,10 +1860,10 @@ struct VulkanRenderer::Impl {
                     const double n = double(rgba.size() / 4) * 255.0;
                     std::fprintf(stderr, "[render]     mean rgba %.3f %.3f %.3f %.3f\n", sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
                     char path[512];
-                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
+                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir ? dumpDir : ".", (unsigned long long)frame,
                                   t.base, t.format, t.width, t.height);
                     for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
-                    if (texDumps < 400) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
+                    if (dumpDir && texDumps < 400) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
                     uint32_t constRows = 0;
                     for (uint32_t y = 0; y < t.height; y++) {
                         const uint8_t* row = &rgba[size_t(y) * t.width * 4];
@@ -2168,6 +2255,15 @@ struct VulkanRenderer::Impl {
         }
         Begin();
         generation++;
+        if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
+            std::fprintf(stderr, "[probe-frame] frame %llu final:", (unsigned long long)frame);
+            for (size_t k = 0; k < probePts.size(); k++)
+                std::fprintf(stderr, " (%d,%d)=%d,%d,%d@draw%llu", probePts[k].first, probePts[k].second,
+                             int(std::lround(std::clamp(probeLast[k][0], 0.0f, 1.0f) * 255.0f)),
+                             int(std::lround(std::clamp(probeLast[k][1], 0.0f, 1.0f) * 255.0f)),
+                             int(std::lround(std::clamp(probeLast[k][2], 0.0f, 1.0f) * 255.0f)), (unsigned long long)probeLastDraw[k]);
+            std::fprintf(stderr, "\n");
+        }
         frame++;
     }
 };
