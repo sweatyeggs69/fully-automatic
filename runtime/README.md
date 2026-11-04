@@ -16,7 +16,7 @@ Needs `third_party/XenonRecomp` (with submodules) as described in the top level 
 - `src/memory.cpp`: one 4 GiB mmap, guest address = offset from `g_base`. Heap ranges are in `include/fa/rt/memory.hpp`.
 - `src/loader.cpp`: decodes default.xex with XenonUtils, maps it at 0x82000000, fills the indirect-call function table from `PPCFuncMappings`, links kernel data imports (`KeTimeStampBundle`, ...).
 - `src/kernel.cpp`: handles, dispatcher objects, waits, guest threads (one host thread each, own `PPCContext`, PCR in r13, TLS).
-- `src/timebase.cpp`: XenonRecomp emits mftb as `__rdtsc()` (host TSC, GHz). At startup the runtime patches those inlined sites in the executable to jump to trampolines that rescale the TSC to the 50 MHz guest timebase, so no ppc/ recompile is needed. `FA_TIMEBASE=off` turns it off, `FA_TIMEBASE_HZ=<n>` changes the guest rate. The startup log says how many sites were patched.
+- `src/timebase.cpp` and `include/fa/rt/force_mftb.h`: XenonRecomp emits mftb as `__rdtsc()` (host TSC, GHz) but the game expects 50 MHz. The ppc/ sources are compiled with `-include force_mftb.h`, which turns every `__rdtsc()` into a call to `fa_guest_mftb()` returning the rescaled timebase (the generated ppc/ code is unchanged, only its object files rebuild). The older startup binary patcher is still there as a safety net and should report 0 sites. `FA_TIMEBASE=off` returns the raw TSC, `FA_TIMEBASE_HZ=<n>` changes the guest rate.
 - `src/kernel/*.cpp`: kernel imports (memory, events/semaphores/mutants/critical sections, threads, TLS, time, misc).
 - `tools/gen_import_stubs.py`: at build time, creates a logging no-op for every import the game uses that nobody implemented, so gaps show up in the log as `unimplemented import: Name`.
 

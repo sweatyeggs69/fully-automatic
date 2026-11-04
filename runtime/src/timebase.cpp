@@ -159,6 +159,13 @@ uint64_t calibrate_guest_timebase(uint64_t guest_hz) {
     return uint64_t(tsc_hz);
 }
 
+namespace { bool g_raw_tsc = false; }
+
+// Called by the recompiled mftb (include/fa/rt/force_mftb.h).
+extern "C" uint64_t fa_guest_mftb() {
+    return g_raw_tsc ? __builtin_ia32_rdtsc() : fa::rt::guest_timebase_now();
+}
+
 uint64_t guest_timebase_now() {
     unsigned __int128 v = (unsigned __int128)(host_tsc() - g_scale->tsc0) * g_scale->mult;
     return uint64_t(v >> 32);
@@ -208,6 +215,7 @@ size_t patch_rdtsc_sites(uint8_t* begin, uint8_t* end, size_t* skipped) {
 void install_guest_timebase() {
     const char* mode = std::getenv("FA_TIMEBASE");
     if (mode && (!std::strcmp(mode, "off") || !std::strcmp(mode, "0"))) {
+        g_raw_tsc = true;
         std::fprintf(stderr, "timebase: FA_TIMEBASE=off, mftb reads the raw host TSC\n");
         return;
     }

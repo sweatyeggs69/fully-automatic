@@ -93,7 +93,10 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     # rebuild of ppc/ takes well under a minute on 16 threads. -ffp-contract=off keeps separate
     # PowerPC multiplies and adds from being fused (FMA rounds differently). Older CPUs: -DFA_PPC_OPT="-O2;-march=x86-64-v2"
     set(FA_PPC_OPT "-O2;-march=x86-64-v3" CACHE STRING "Compiler flags for the recompiled ppc/ sources")
-    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "${FA_PPC_OPT};-fno-strict-aliasing;-ffp-contract=off")
+    # force_mftb.h turns the recompiled mftb (__rdtsc()) into a call that returns the 50 MHz guest timebase.
+    set(FA_FORCE_MFTB ${CMAKE_CURRENT_SOURCE_DIR}/include/fa/rt/force_mftb.h)
+    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "${FA_PPC_OPT};-fno-strict-aliasing;-ffp-contract=off;-include;${FA_FORCE_MFTB}"
+                                OBJECT_DEPENDS ${FA_FORCE_MFTB})
 else()
     message(STATUS "No ${FA_PPC_DIR}/ppc_config.h: skipping the fullauto target (run XenonRecomp first)")
 endif()
