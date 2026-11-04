@@ -47,6 +47,9 @@ For headless runs, `FA_PRESS=<button>@<seconds>[:<hold>]` (comma separated; a, b
 back, lb, rb, up, down, left, right) holds a player 1 button at a time after startup, e.g.
 `FA_PRESS=a@6:2` gets past the SEGA splash, which waits for a button.
 
+`FA_SKIP_MOVIES=1` reports the `.wmv` movies (intro, attract loop) as missing, which the game
+skips cleanly; they can also be skipped in-game with A.
+
 Until a window exists the input layer pumps SDL itself. Once the window thread runs its event
 loop it should call `services().input.set_self_pump(false)` once and `services().input.pump()`
 every frame (or forward events with `handle_event`).
