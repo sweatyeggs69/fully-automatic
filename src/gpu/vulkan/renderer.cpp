@@ -466,6 +466,19 @@ struct VulkanRenderer::Impl {
         }
         std::fprintf(stderr, "\n");
     }
+    // FA_SNAPLOG=1: log (once per base and reason) why a resolve was not kept as a GPU snapshot and why a
+    // texture fetch of a snapshotted surface could not use it. These are the per-frame render target re-uploads.
+    static void SnapLog(const char* kind, const char* why, uint32_t base, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f) {
+        static const bool on = [] { const char* v = std::getenv("FA_SNAPLOG"); return v && v[0] == '1'; }();
+        if (!on) return;
+        static std::set<uint64_t> seen;
+        static int n = 0;
+        uint64_t k = (uint64_t(base) << 24) ^ (uint64_t(why[0]) << 16) ^ (uint64_t(why[1]) << 8) ^ uint64_t(kind[0]) ^ (uint64_t(a) << 48);
+        if (n < 400 && seen.insert(k).second) {
+            n++;
+            std::fprintf(stderr, "[snaplog] %s %s base %08x: %u %u %u %u %u %u\n", kind, why, base, a, b, c, d, e, f);
+        }
+    }
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -647,20 +660,22 @@ struct VulkanRenderer::Impl {
     // View of a still valid snapshot that matches this texture fetch, or null.
     VkImageView SnapView(const TextureFetch& t) {
         auto it = snaps.find(t.base & 0x1FFFFFFFu);
-        if (it == snaps.end() || !it->second.valid) return VK_NULL_HANDLE;
+        if (it == snaps.end()) return VK_NULL_HANDLE;
+        if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, 0, 0, 0); return VK_NULL_HANDLE; }
         Snap& e = it->second;
         const bool fmt8888 = e.img.format == VK_FORMAT_R8G8B8A8_UNORM && (t.format == 6 || t.format == 14 || t.format == 50);
         const bool fmt1010 = e.img.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (t.format == 7 || t.format == 54);
-        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return VK_NULL_HANDLE;
-        if (t.endian != e.endian || t.expAdjust != 0) return VK_NULL_HANDLE;
+        auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
+        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return rej("tile/dim/fmt");
+        if (t.endian != e.endian || t.expAdjust != 0) return rej("endian/exp");
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
-        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return VK_NULL_HANDLE;
-        for (int c = 0; c < 4; c++) if (t.sign[c]) return VK_NULL_HANDLE;
-        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return VK_NULL_HANDLE;
+        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
+        for (int c = 0; c < 4; c++) if (t.sign[c]) return rej("sign");
+        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return rej("pitch");
         const uint8_t* src = mem.HostPtr(t.base, e.size);
         if (!src) return VK_NULL_HANDLE;
         uint32_t cur[64];
-        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return VK_NULL_HANDLE; }
+        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
         VkImage image = e.img.img;
         std::unordered_map<uint32_t, VkImageView>* views = &e.views;
         if (t.width != e.w || t.height != e.h) {
@@ -2319,6 +2334,8 @@ struct VulkanRenderer::Impl {
                         goto clears;
                     }
                 }
+                SnapLog("resolve", isDepth ? "depth" : (x0 || y0) ? "offset" : d.endian > 3 ? "endian" : d.expBias ? "expbias" : "format", d.base & 0x1FFFFFFFu,
+                        d.format, src->image.format, w, h, d.endian, uint32_t(x0 | y0));
                 if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending(prof::kFlushOverlap);
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
