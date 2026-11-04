@@ -449,6 +449,14 @@ struct VulkanRenderer::Impl {
     struct Snap {
         Image img;
         std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
+        // Textures a few texels smaller than the (8-aligned) resolve rectangle sample a cropped copy.
+        struct Crop {
+            Image img;
+            uint64_t version = 0;
+            std::unordered_map<uint32_t, VkImageView> views;
+        };
+        std::unordered_map<uint32_t, Crop> crops;  // by width << 16 | height
+        uint64_t version = 0;                       // bumped whenever the snapshot is rewritten
         bool valid = false;
         uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
         bool swapRB = false;
@@ -469,6 +477,11 @@ struct VulkanRenderer::Impl {
     void ReleaseSnapImage(Snap& e) {
         for (auto& [k, v] : e.views) garbageViews.push_back(v);
         e.views.clear();
+        for (auto& [k, c] : e.crops) {
+            for (auto& [sw, v] : c.views) garbageViews.push_back(v);
+            if (c.img.img) garbageImages.push_back(c.img);
+        }
+        e.crops.clear();
         if (e.img.img) garbageImages.push_back(e.img);
         e.img = Image{};
         e.valid = false;
@@ -492,17 +505,18 @@ struct VulkanRenderer::Impl {
     // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
     bool SnapStore(RenderTarget* src, const ResolveDest& d, uint32_t destBytes, uint32_t key, uint32_t w, uint32_t h) {
         Snap& e = snaps[key];
+        const VkFormat fmt = src->image.format;
         // A pending surface of another base overlapping this one is written first (order matters).
         for (uint32_t k : pendingKeys) {
             const Snap& o = snaps[k];
             if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(); break; }
         }
-        if (e.img.img && (e.img.w != w || e.img.h != h)) {
+        if (e.img.img && (e.img.w != w || e.img.h != h || e.img.format != fmt)) {
             if (e.pending) FlushPending();
             ReleaseSnapImage(e);
         }
         if (!e.img.img) {
-            if (!CreateImage(e.img, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            if (!CreateImage(e.img, fmt, w, h, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT)) {
                 ReleaseSnapImage(e);
                 return false;
@@ -534,6 +548,7 @@ struct VulkanRenderer::Impl {
         e.h = h;
         e.dest = d;
         std::memcpy(e.samples, samples, sizeof samples);
+        e.version++;
         e.valid = true;
         if (pendingBytes > (96u << 20)) FlushPending();
         return true;
@@ -579,7 +594,7 @@ struct VulkanRenderer::Impl {
             e.pending = false;
             if (!e.valid) continue;  // overwritten since: nothing to write
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
-            if (ResolveRaw(e.dest, VK_FORMAT_R8G8B8A8_UNORM, false, 0, 0, e.w, e.h, rb + offs[i], destBytes)) {
+            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + offs[i], destBytes)) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes);  // other textures over this memory are stale now
                 e.valid = keep;
@@ -595,16 +610,49 @@ struct VulkanRenderer::Impl {
         auto it = snaps.find(t.base & 0x1FFFFFFFu);
         if (it == snaps.end() || !it->second.valid) return VK_NULL_HANDLE;
         Snap& e = it->second;
-        if (!t.tiled || t.dimension != 1 || (t.format != 6 && t.format != 14 && t.format != 50)) return VK_NULL_HANDLE;
-        if (t.endian != e.endian || t.width != e.w || t.height != e.h || t.expAdjust != 0) return VK_NULL_HANDLE;
+        const bool fmt8888 = e.img.format == VK_FORMAT_R8G8B8A8_UNORM && (t.format == 6 || t.format == 14 || t.format == 50);
+        const bool fmt1010 = e.img.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (t.format == 7 || t.format == 54);
+        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return VK_NULL_HANDLE;
+        if (t.endian != e.endian || t.expAdjust != 0) return VK_NULL_HANDLE;
+        // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
+        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return VK_NULL_HANDLE;
         for (int c = 0; c < 4; c++) if (t.sign[c]) return VK_NULL_HANDLE;
         if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return VK_NULL_HANDLE;
         const uint8_t* src = mem.HostPtr(t.base, e.size);
         if (!src) return VK_NULL_HANDLE;
         uint32_t cur[64];
         if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return VK_NULL_HANDLE; }
-        auto v = e.views.find(t.swizzle);
-        if (v != e.views.end()) return v->second;
+        VkImage image = e.img.img;
+        std::unordered_map<uint32_t, VkImageView>* views = &e.views;
+        if (t.width != e.w || t.height != e.h) {
+            Snap::Crop& c = e.crops[(t.width << 16) | t.height];
+            Begin();
+            if (!c.img.img) {
+                if (!CreateImage(c.img, e.img.format, t.width, t.height, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 false, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                    DestroyImage(c.img);
+                    e.crops.erase((t.width << 16) | t.height);
+                    return VK_NULL_HANDLE;
+                }
+                EndRendering();
+                ImageToGeneral(c.img.img, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            }
+            if (c.version != e.version) {
+                EndRendering();
+                Barrier();
+                VkImageCopy ic{};
+                ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.extent = {t.width, t.height, 1};
+                vkCmdCopyImage(cmd, e.img.img, VK_IMAGE_LAYOUT_GENERAL, c.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                Barrier();
+                c.version = e.version;
+            }
+            image = c.img.img;
+            views = &c.views;
+        }
+        auto v = views->find(t.swizzle);
+        if (v != views->end()) return v->second;
         VkComponentMapping cm;
         VkComponentSwizzle* comps[4] = {&cm.r, &cm.g, &cm.b, &cm.a};
         for (int c = 0; c < 4; c++) {
@@ -614,14 +662,14 @@ struct VulkanRenderer::Impl {
                       : sw == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
         }
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = e.img.img;
+        vi.image = image;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = e.img.format;
         vi.components = cm;
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageView view = VK_NULL_HANDLE;
         if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-        e.views[t.swizzle] = view;
+        (*views)[t.swizzle] = view;
         return view;
     }
 
@@ -1041,6 +1089,10 @@ struct VulkanRenderer::Impl {
             for (auto& im : garbageImages) DestroyImage(im);
             for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
             for (auto& [k, e] : snaps) {
+                for (auto& [ck, c] : e.crops) {
+                    for (auto& [sw, v] : c.views) vkDestroyImageView(dev, v, nullptr);
+                    DestroyImage(c.img);
+                }
                 for (auto& [sw, v] : e.views) vkDestroyImageView(dev, v, nullptr);
                 DestroyImage(e.img);
             }
@@ -1939,8 +1991,10 @@ struct VulkanRenderer::Impl {
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
             } else {
                 // Snapshot-able 8888 surface from the top-left corner: keep it on the GPU, write guest memory later.
-                if (snapEnabled && !isDepth && d.expBias == 0 && src->image.format == VK_FORMAT_R8G8B8A8_UNORM &&
-                    (d.format == 6 || d.format == 14 || d.format == 50) && d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
+                if (snapEnabled && !isDepth && d.expBias == 0 &&
+                    ((src->image.format == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50)) ||
+                     (src->image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54))) &&
+                    d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
                     if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) {
