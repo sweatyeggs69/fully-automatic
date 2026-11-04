@@ -1254,7 +1254,10 @@ struct VulkanRenderer::Impl {
                      std::string& err) {
         shaderc_compile_options_t o = shaderc_compile_options_initialize();
         shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-        shaderc_compile_options_set_optimization_level(o, shaderc_optimization_level_performance);
+        // shaderc's -O pass takes ~25 ms per translated shader and the driver compiler optimises anyway: skip it
+        // unless FA_SHADER_OPT=1 (races compile a new shader about every frame while streaming in).
+        static const bool optimise = [] { const char* e = std::getenv("FA_SHADER_OPT"); return e && e[0] == '1'; }();
+        shaderc_compile_options_set_optimization_level(o, optimise ? shaderc_optimization_level_performance : shaderc_optimization_level_zero);
         shaderc_compilation_result_t r = shaderc_compile_into_spv(compiler, src.data(), src.size(), kind, name, "main", o);
         bool ok = shaderc_result_get_compilation_status(r) == shaderc_compilation_status_success;
         if (ok) {
