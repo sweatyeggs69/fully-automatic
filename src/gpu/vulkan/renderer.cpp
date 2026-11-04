@@ -349,7 +349,7 @@ struct VulkanRenderer::Impl {
     // FA_RENDER_DUMP=<dir>: every 30th frame (12 of them) gets all its draws logged and all its
     // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
     const char* dumpDir = nullptr;
-    bool DumpFrame() const { return dumpDir && frame % 30 == 0 && frame / 30 < 12; }
+    bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < 12)); }
 
     Impl(GuestMemory& m, Backend* n) : mem(m), next(n) {
         const char* d = std::getenv("FA_RENDER_DUMP");
@@ -1437,6 +1437,11 @@ struct VulkanRenderer::Impl {
             for (uint32_t i = 0; i < std::min<uint32_t>(vf.sizeWords, 24); i++) std::fprintf(stderr, " %08x", mem.Read32(vf.address + i * 4));
             std::fprintf(stderr, "\n");
         }
+        auto c = [&](uint32_t i, int k) { return xe::AsFloat(regs[pm4::kAluConstBase + i * 4 + k]); };
+        std::fprintf(stderr, "[render]   blend %08x colorctl %08x depthctl %08x | ps c0..c3", regs[xe::RB_BLENDCONTROL0],
+                     regs[xe::RB_COLORCONTROL], regs[xe::RB_DEPTHCONTROL]);
+        for (uint32_t i = 256; i < 260; i++) std::fprintf(stderr, " (%g %g %g %g)", c(i, 0), c(i, 1), c(i, 2), c(i, 3));
+        std::fprintf(stderr, " | vs c255 (%g %g %g %g)\n", c(255, 0), c(255, 1), c(255, 2), c(255, 3));
         std::fprintf(stderr, "[render]   vport scale %g %g %g offset %g %g %g ndc scale %g %g offset %g %g flags %x %x %x\n",
                      sys.vportScale[0], sys.vportScale[1], sys.vportScale[2], sys.vportOffset[0], sys.vportOffset[1],
                      sys.vportOffset[2], sys.ndcScale[0], sys.ndcScale[1], sys.ndcOffset[0], sys.ndcOffset[1], sys.flags[0],
