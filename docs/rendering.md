@@ -49,6 +49,7 @@ the window shows the texture debug view.
 | `FA_RENDER_DUMP_AFTER=secs` | With `FA_RENDER_DUMP`: dump the first frame at least that many seconds after start |
 | `FA_RT1616=0` | Store the fixed-point 16_16 render targets as is on resolve. Default: resolves into 16-bit texture formats divide by 32 (the hardware range of these targets is [-32, 32)) |
 | `FA_WATCH_ADDR=hex` | Log the guest bytes of the surface at that physical address after each resolve into it and at each texture bind, with a hash; only binds that recheck memory are logged. `FA_WATCH_FROM_FRAME=N` skips earlier frames, `FA_WATCH_MAX=N` sets the event cap (default 400) |
+| `FA_TEX_FORCE=addr:r,g,b,a` | Debug: replace every texel of the texture at that physical address (hex) with one colour, e.g. `02fd0000:0,1,0,1` |
 | `FA_MIPS=0` | Sample only the base level of every texture (default: mip levels 1.. are read from the fetch constant's mip address) |
 | `FA_RENDER_DUMP_FRAME=N` | With `FA_RENDER_DUMP`: dump only swap N (all its resolves, targets and textures) instead of the early frames; the 3D menu is around swap 600+ |
 | `FA_RENDER_DUMP_DRAWS=A-B` | With `FA_RENDER_DUMP_FRAME`: trace and dump only draws A..B of that frame (numbered from 0). Texture lines carry a mean colour for every format, including cube, 3D and compressed ones |

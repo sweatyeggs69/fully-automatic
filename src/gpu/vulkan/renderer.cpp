@@ -1467,6 +1467,29 @@ struct VulkanRenderer::Impl {
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht, mipSrc)) return fell("decode failed");
+        // FA_TEX_FORCE=<hex phys addr>:r,g,b,a replaces that texture's texels with one constant colour (0..1,
+        // before the fetch swizzle): a debug aid to find what value a shader needs from a map.
+        {
+            static float force[4];
+            static const uint32_t forceAddr = [] {
+                const char* e = std::getenv("FA_TEX_FORCE");
+                if (!e) return 0u;
+                char* c = nullptr;
+                uint32_t a = uint32_t(std::strtoul(e, &c, 16) & 0x1FFFFFFFu);
+                for (int i = 0; i < 4; i++) {
+                    if (!c || *c != (i ? ',' : ':')) return 0u;
+                    force[i] = std::strtof(c + 1, &c);
+                }
+                return a;
+            }();
+            if (forceAddr && (t.base & 0x1FFFFFFFu) == forceAddr) {
+                const size_t n = ht.data.size() / (ht.isFloat ? 16 : 4);
+                for (size_t i = 0; i < n; i++) {
+                    if (ht.isFloat) std::memcpy(&ht.data[i * 16], force, 16);
+                    else for (int c = 0; c < 4; c++) ht.data[i * 4 + c] = uint8_t(std::clamp(force[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
+        }
         if (prof::g_enabled) {
             static uint64_t n = 0;
             static uint64_t decNs[64] = {};
