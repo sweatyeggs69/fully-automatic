@@ -11,9 +11,11 @@
 #include <thread>
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <optional>
 #include <set>
 #include <string>
@@ -435,10 +437,243 @@ struct VulkanRenderer::Impl {
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size) {
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (auto& [k, e] : snaps)
+            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) e.valid = false;
         for (auto& [k, t] : textures) {
             const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
             if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
         }
+    }
+
+    // ---- resolved surfaces kept on the GPU ---------------------------------------------------------
+    // A resolve of an 8888 target to guest memory also copies the pixels into an image of its own. A
+    // texture fetch that reads exactly that surface samples the image instead of hashing, decoding and
+    // uploading the guest bytes again (FA_RESOLVE_GPU=0 turns this off).
+    struct Snap {
+        Image img;
+        std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
+        // Textures a few texels smaller than the (8-aligned) resolve rectangle sample a cropped copy.
+        struct Crop {
+            Image img;
+            uint64_t version = 0;
+            std::unordered_map<uint32_t, VkImageView> views;
+        };
+        std::unordered_map<uint32_t, Crop> crops;  // by width << 16 | height
+        uint64_t version = 0;                       // bumped whenever the snapshot is rewritten
+        bool valid = false;
+        uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
+        bool swapRB = false;
+        bool pending = false;       // guest memory not written yet (see FlushPending)
+        ResolveDest dest{};         // how to write it when it is
+        uint32_t samples[64] = {};  // dwords of the guest surface when it was resolved
+    };
+    std::unordered_map<uint32_t, Snap> snaps;  // by destination base (masked to 512 MB)
+    std::vector<VkImageView> garbageViews;
+    const bool snapEnabled = [] { const char* e = std::getenv("FA_RESOLVE_GPU"); return !(e && e[0] == '0'); }();
+
+    static bool SnapSample(const uint8_t* p, uint32_t size, uint32_t out[64]) {
+        const uint32_t words = size / 4;
+        if (words < 64) return false;
+        for (uint32_t i = 0; i < 64; i++) std::memcpy(&out[i], p + size_t(i) * (words / 64) * 4, 4);
+        return true;
+    }
+    void ReleaseSnapImage(Snap& e) {
+        for (auto& [k, v] : e.views) garbageViews.push_back(v);
+        e.views.clear();
+        for (auto& [k, c] : e.crops) {
+            for (auto& [sw, v] : c.views) garbageViews.push_back(v);
+            if (c.img.img) garbageImages.push_back(c.img);
+        }
+        e.crops.clear();
+        if (e.img.img) garbageImages.push_back(e.img);
+        e.img = Image{};
+        e.valid = false;
+    }
+    // Lazy writeback: snapshotted resolves do not read their pixels back right away. The snapshot
+    // images hold the data and the guest memory is written in one batch (one GPU wait) when something
+    // can observe it: a swap, a fence / interrupt / memory write from the command stream, a texture
+    // fetch that cannot use a snapshot, or a resolve that overlaps a pending one.
+    // Deferring the guest memory write is experimental (FA_RESOLVE_LAZY=1); by default each snapshotted resolve is written right away.
+    const bool lazyWriteback = [] { const char* e = std::getenv("FA_RESOLVE_LAZY"); return e && e[0] == '1'; }();
+    std::vector<uint32_t> pendingKeys;
+    uint64_t pendingBytes = 0;
+    bool PendingOverlaps(uint32_t base, uint32_t size) {
+        const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (uint32_t k : pendingKeys) {
+            const Snap& e = snaps[k];
+            if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) return true;
+        }
+        return false;
+    }
+    // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
+    bool SnapStore(RenderTarget* src, const ResolveDest& d, uint32_t destBytes, uint32_t key, uint32_t w, uint32_t h) {
+        Snap& e = snaps[key];
+        const VkFormat fmt = src->image.format;
+        // A pending surface of another base overlapping this one is written first (order matters).
+        for (uint32_t k : pendingKeys) {
+            const Snap& o = snaps[k];
+            if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(); break; }
+        }
+        if (e.img.img && (e.img.w != w || e.img.h != h || e.img.format != fmt)) {
+            if (e.pending) FlushPending();
+            ReleaseSnapImage(e);
+        }
+        if (!e.img.img) {
+            if (!CreateImage(e.img, fmt, w, h, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                ReleaseSnapImage(e);
+                return false;
+            }
+            ImageToGeneral(e.img.img, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        }
+        const uint8_t* gp = mem.HostPtr(d.base, destBytes);
+        uint32_t samples[64];
+        if (!gp || !SnapSample(gp, destBytes, samples)) return false;
+        InvalidateTextures(d.base, destBytes);  // other textures over this memory are stale (may drop a pending write of e)
+        Barrier();
+        VkImageCopy ic{};
+        ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        ic.extent = {w, h, 1};
+        vkCmdCopyImage(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, e.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+        Barrier();
+        if (!e.pending) {
+            e.pending = true;
+            pendingKeys.push_back(key);
+        }
+        pendingBytes += uint64_t(w) * h * 4;
+        e.base = key;
+        e.size = destBytes;
+        e.pitch = (std::max(d.pitch, 32u) + 31) & ~31u;
+        e.endian = d.endian;
+        e.swapRB = d.swapRB;
+        e.w = w;
+        e.h = h;
+        e.dest = d;
+        std::memcpy(e.samples, samples, sizeof samples);
+        e.version++;
+        e.valid = true;
+        if (pendingBytes > (96u << 20)) FlushPending();
+        return true;
+    }
+    void FlushPending() {
+        if (pendingKeys.empty()) return;
+        std::vector<uint32_t> keys;
+        keys.swap(pendingKeys);
+        pendingBytes = 0;
+        VkDeviceSize total = 0;
+        std::vector<VkDeviceSize> offs;
+        for (uint32_t k : keys) {
+            offs.push_back(total);
+            total += (VkDeviceSize(snaps[k].w) * snaps[k].h * 4 + 15) & ~VkDeviceSize(15);
+        }
+        EndRendering();
+        if (total > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Begin();
+        Barrier();
+        for (size_t i = 0; i < keys.size(); i++) {
+            Snap& e = snaps[keys[i]];
+            VkBufferImageCopy bic{};
+            bic.bufferOffset = offs[i];
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageExtent = {e.w, e.h, 1};
+            vkCmdCopyImageToBuffer(cmd, e.img.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        }
+        Barrier();
+        {
+            prof::Scope pw_(prof::kResolveWait);
+            SubmitAndWait();
+        }
+        Begin();
+        prof::Scope pc_(prof::kResolveCpu);
+        const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
+        for (size_t i = 0; i < keys.size(); i++) {
+            Snap& e = snaps[keys[i]];
+            e.pending = false;
+            if (!e.valid) continue;  // overwritten since: nothing to write
+            const uint32_t destBytes = ResolveDestByteSize(e.dest);
+            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + offs[i], destBytes)) {
+                const bool keep = e.valid;
+                InvalidateTextures(e.dest.base, destBytes);  // other textures over this memory are stale now
+                e.valid = keep;
+                if (const uint8_t* gp = mem.HostPtr(e.dest.base, destBytes)) SnapSample(gp, destBytes, e.samples);
+            } else {
+                e.valid = false;
+            }
+        }
+    }
+
+    // View of a still valid snapshot that matches this texture fetch, or null.
+    VkImageView SnapView(const TextureFetch& t) {
+        auto it = snaps.find(t.base & 0x1FFFFFFFu);
+        if (it == snaps.end() || !it->second.valid) return VK_NULL_HANDLE;
+        Snap& e = it->second;
+        const bool fmt8888 = e.img.format == VK_FORMAT_R8G8B8A8_UNORM && (t.format == 6 || t.format == 14 || t.format == 50);
+        const bool fmt1010 = e.img.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (t.format == 7 || t.format == 54);
+        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return VK_NULL_HANDLE;
+        if (t.endian != e.endian || t.expAdjust != 0) return VK_NULL_HANDLE;
+        // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
+        if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return VK_NULL_HANDLE;
+        for (int c = 0; c < 4; c++) if (t.sign[c]) return VK_NULL_HANDLE;
+        if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return VK_NULL_HANDLE;
+        const uint8_t* src = mem.HostPtr(t.base, e.size);
+        if (!src) return VK_NULL_HANDLE;
+        uint32_t cur[64];
+        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return VK_NULL_HANDLE; }
+        VkImage image = e.img.img;
+        std::unordered_map<uint32_t, VkImageView>* views = &e.views;
+        if (t.width != e.w || t.height != e.h) {
+            Snap::Crop& c = e.crops[(t.width << 16) | t.height];
+            Begin();
+            if (!c.img.img) {
+                if (!CreateImage(c.img, e.img.format, t.width, t.height, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 false, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                    DestroyImage(c.img);
+                    e.crops.erase((t.width << 16) | t.height);
+                    return VK_NULL_HANDLE;
+                }
+                EndRendering();
+                ImageToGeneral(c.img.img, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            }
+            if (c.version != e.version) {
+                EndRendering();
+                Barrier();
+                VkImageCopy ic{};
+                ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.extent = {t.width, t.height, 1};
+                vkCmdCopyImage(cmd, e.img.img, VK_IMAGE_LAYOUT_GENERAL, c.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                Barrier();
+                c.version = e.version;
+            }
+            image = c.img.img;
+            views = &c.views;
+        }
+        auto v = views->find(t.swizzle);
+        if (v != views->end()) return v->second;
+        VkComponentMapping cm;
+        VkComponentSwizzle* comps[4] = {&cm.r, &cm.g, &cm.b, &cm.a};
+        for (int c = 0; c < 4; c++) {
+            uint32_t sw = (t.swizzle >> (3 * c)) & 7;
+            if (e.swapRB && sw < 4 && sw != 1 && sw != 3) sw = sw == 0 ? 2 : 0;  // the resolve swapped R and B
+            *comps[c] = sw < 4 ? VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + sw)
+                      : sw == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+        }
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = e.img.format;
+        vi.components = cm;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        (*views)[t.swizzle] = view;
+        return view;
     }
 
     std::vector<float> resolvePx;  // scratch for resolves that go through floats
@@ -454,6 +689,14 @@ struct VulkanRenderer::Impl {
     // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
     const char* dumpDir = nullptr;
     bool dbgNoAtest = false, dbgNoBlend = false;
+    // FA_RENDER_PROBE=frame[-last],x,y[,x,y...]: in those frames, after every draw, read back those screen pixels and log
+    // the draws that changed it, with their full trace ("who painted this pixel").
+    bool probeOn = false;
+    uint64_t probeFrame = 0, probeFrameEnd = 0;  // inclusive range
+    std::vector<std::pair<int, int>> probePts;
+    std::vector<std::array<float, 4>> probeLast;   // per point: value after the latest draw covering it
+    std::vector<uint64_t> probeLastDraw;           // per point: that draw's number
+    std::set<std::pair<uint64_t, uint64_t>> probeTraced;  // (vs, ps) pairs whose full trace was already printed
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
     // FA_RENDER_DUMP_FRAME=N dumps swap N (all resolves, textures and targets), restricted to draws
     // A..B of that frame with FA_RENDER_DUMP_DRAWS=A-B (draw numbers count from 0 in each frame).
@@ -483,6 +726,21 @@ struct VulkanRenderer::Impl {
             dumpDrawHi = (e && *e == '-') ? std::strtoull(e + 1, nullptr, 10) : dumpDrawLo;
         }
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
+        if (const char* c = std::getenv("FA_RENDER_PROBE")) {
+            char* e = nullptr;
+            probeFrame = std::strtoull(c, &e, 10);
+            probeFrameEnd = probeFrame;
+            if (e && *e == '-') probeFrameEnd = std::strtoull(e + 1, &e, 10);
+            while (e && *e == ',') {
+                long x = std::strtol(e + 1, &e, 10);
+                if (!e || *e != ',') break;
+                long y = std::strtol(e + 1, &e, 10);
+                probePts.push_back({int(x), int(y)});
+            }
+            probeOn = !probePts.empty();
+            probeLast.assign(probePts.size(), {-1.0f, -1.0f, -1.0f, -1.0f});
+            probeLastDraw.assign(probePts.size(), 0);
+        }
         if (const char* c = std::getenv("FA_DBG_RENDER")) {
             dbgNoAtest = std::strstr(c, "noatest") != nullptr;
             dbgNoBlend = std::strstr(c, "noblend") != nullptr;
@@ -640,6 +898,8 @@ struct VulkanRenderer::Impl {
         lastConstsOff = ~0ull;
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
+        for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
+        garbageViews.clear();
         stats.submits++;
         prof::Add(prof::kSubmits, 1);
     }
@@ -874,6 +1134,15 @@ struct VulkanRenderer::Impl {
             for (auto& [k, t] : textures) DestroyImage(t.image);
             for (auto& [k, s] : samplers) vkDestroySampler(dev, s, nullptr);
             for (auto& im : garbageImages) DestroyImage(im);
+            for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
+            for (auto& [k, e] : snaps) {
+                for (auto& [ck, c] : e.crops) {
+                    for (auto& [sw, v] : c.views) vkDestroyImageView(dev, v, nullptr);
+                    DestroyImage(c.img);
+                }
+                for (auto& [sw, v] : e.views) vkDestroyImageView(dev, v, nullptr);
+                DestroyImage(e.img);
+            }
             DestroyImage(dummy2D);
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
@@ -1086,6 +1355,8 @@ struct VulkanRenderer::Impl {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
             if (cube || t.dimension == 3) return fell("dimension mismatch");
         }
+        if (snapEnabled && !cube && !snaps.empty())
+            if (VkImageView sv = SnapView(t)) return sv;
         uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
@@ -1093,6 +1364,7 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
+        if (!pendingKeys.empty() && PendingOverlaps(t.base, size)) FlushPending();
         const uint8_t* src = mem.HostPtr(t.base, size);
         std::vector<uint8_t> padded;
         if (!src) {
@@ -1129,8 +1401,20 @@ struct VulkanRenderer::Impl {
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
 
+        const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht)) return fell("decode failed");
+        if (prof::g_enabled) {
+            static uint64_t n = 0;
+            static uint64_t decNs[64] = {};
+            // Aggregate decode time per texture format and report every 400 uploads.
+            decNs[t.format & 63] += prof::NowNs() - upT0;
+            if (++n % 400 == 0) {
+                std::fprintf(stderr, "[texup] decode ms by format over 400 uploads:");
+                for (int f = 0; f < 64; f++) if (decNs[f]) { std::fprintf(stderr, " fmt%d=%.1f", f, double(decNs[f]) / 1e6); decNs[f] = 0; }
+                std::fprintf(stderr, " | last: fmt %u %ux%u float %d tiled %d\n", t.format, t.width, t.height, ht.isFloat ? 1 : 0, t.tiled ? 1 : 0);
+            }
+        }
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
                        tex.image.layers != ht.layers;
@@ -1573,6 +1857,68 @@ struct VulkanRenderer::Impl {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
         }
+        if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
+            RenderTarget* rt = nullptr;
+            for (int i = 0; i < 4 && !rt; i++) rt = curColor[i];
+            std::vector<size_t> idx;
+            std::vector<std::pair<int, int>> pos;
+            for (size_t k = 0; rt && k < probePts.size(); k++) {
+                const int tx = probePts[k].first + int(wox), ty = probePts[k].second + int(woy);
+                if (tx < scissor.offset.x || ty < scissor.offset.y || tx >= scissor.offset.x + int(scissor.extent.width) ||
+                    ty >= scissor.offset.y + int(scissor.extent.height) || tx >= int(rt->image.w) || ty >= int(rt->image.h))
+                    continue;
+                idx.push_back(k);
+                pos.push_back({tx, ty});
+            }
+            if (!idx.empty()) {
+                std::vector<std::array<float, 4>> vals;
+                ProbePixels(rt, pos, vals);
+                for (size_t j = 0; j < idx.size(); j++) {
+                    const size_t k = idx[j];
+                    const auto& f = vals[j];
+                    probeLastDraw[k] = stats.draws.load();
+                    if (!std::memcmp(probeLast[k].data(), f.data(), sizeof(float) * 4)) continue;
+                    probeLast[k] = f;
+                    std::fprintf(stderr, "[probe] frame %llu draw %llu pixel(%d,%d) -> %.3f %.3f %.3f %.3f | prim %u idx %zu vs %016llx ps %016llx blend %08x\n",
+                                 (unsigned long long)frame, (unsigned long long)stats.draws.load(), probePts[k].first, probePts[k].second,
+                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), hd.indices.size(), (unsigned long long)dc.vsHash,
+                                 (unsigned long long)dc.psHash, regs[xe::RB_BLENDCONTROL0]);
+                    if (probeTraced.insert({dc.vsHash, dc.psHash}).second) TraceInputs(regs, vs, ps, sys);
+                }
+            }
+        }
+    }
+
+    // Reads several pixels of a colour target in one submit.
+    void ProbePixels(RenderTarget* rt, const std::vector<std::pair<int, int>>& pts, std::vector<std::array<float, 4>>& out) {
+        const uint32_t bpp = VkFormatBytes(rt->image.format);
+        const VkDeviceSize stride = 32;
+        const VkDeviceSize need = stride * pts.size();
+        EndRendering();
+        if (need > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, std::max<VkDeviceSize>(need, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Barrier();
+        for (size_t i = 0; i < pts.size(); i++) {
+            VkBufferImageCopy bic{};
+            bic.bufferOffset = stride * i;
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageOffset = {pts[i].first, pts[i].second, 0};
+            bic.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(cmd, rt->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        }
+        Barrier();
+        SubmitAndWait();
+        Begin();
+        out.assign(pts.size(), {0, 0, 0, 0});
+        for (size_t i = 0; i < pts.size(); i++)
+            ReadbackToFloat(rt->image.format, static_cast<const uint8_t*>(readback.map) + stride * i, out[i].data());
+        (void)bpp;
+        for (auto& c : curColor) c = nullptr;
+        curDepth = nullptr;
     }
 
     // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
@@ -1640,10 +1986,10 @@ struct VulkanRenderer::Impl {
                     const double n = double(rgba.size() / 4) * 255.0;
                     std::fprintf(stderr, "[render]     mean rgba %.3f %.3f %.3f %.3f\n", sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
                     char path[512];
-                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir, (unsigned long long)frame,
+                    std::snprintf(path, sizeof path, "%s/f%04llu_tex_%08x_fmt%u_%ux%u.png", dumpDir ? dumpDir : ".", (unsigned long long)frame,
                                   t.base, t.format, t.width, t.height);
                     for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
-                    if (texDumps < 400 && dumpedTexBases.insert(t.base).second) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
+                    if (dumpDir && texDumps < 400 && dumpedTexBases.insert(t.base).second) { texDumps++; WritePng(path, t.width, t.height, rgba.data()); }
                     uint32_t constRows = 0;
                     for (uint32_t y = 0; y < t.height; y++) {
                         const uint8_t* row = &rgba[size_t(y) * t.width * 4];
@@ -1822,6 +2168,19 @@ struct VulkanRenderer::Impl {
                 static int warned = 0;
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
             } else {
+                // Snapshot-able 8888 surface from the top-left corner: keep it on the GPU, write guest memory later.
+                if (snapEnabled && !isDepth && d.expBias == 0 &&
+                    ((src->image.format == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50)) ||
+                     (src->image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54))) &&
+                    d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
+                    const uint32_t destBytes = ResolveDestByteSize(d);
+                    const uint32_t key = d.base & 0x1FFFFFFFu;
+                    if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) {
+                        if (!lazyWriteback) FlushPending();  // eager: write guest memory right away
+                        goto clears;
+                    }
+                }
+                if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending();
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
                 if (bytes > readback.size) {
@@ -2034,12 +2393,22 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
+        FlushPending();
         {
             prof::Scope ps_(prof::kOtherWait);
             SubmitAndWait();
         }
         Begin();
         generation++;
+        if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
+            std::fprintf(stderr, "[probe-frame] frame %llu final:", (unsigned long long)frame);
+            for (size_t k = 0; k < probePts.size(); k++)
+                std::fprintf(stderr, " (%d,%d)=%d,%d,%d@draw%llu", probePts[k].first, probePts[k].second,
+                             int(std::lround(std::clamp(probeLast[k][0], 0.0f, 1.0f) * 255.0f)),
+                             int(std::lround(std::clamp(probeLast[k][1], 0.0f, 1.0f) * 255.0f)),
+                             int(std::lround(std::clamp(probeLast[k][2], 0.0f, 1.0f) * 255.0f)), (unsigned long long)probeLastDraw[k]);
+            std::fprintf(stderr, "\n");
+        }
         frame++;
         drawInFrame = 0;
         dumpedTexBases.clear();
@@ -2069,8 +2438,14 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
     if (p_->next) p_->next->Swap(addr, width, height, regs);
 }
 
+void VulkanRenderer::Sync() {
+    if (p_->ready && !p_->broken) p_->FlushPending();
+    if (p_->next) p_->next->Sync();
+}
+
 void VulkanRenderer::Flush() {
     if (p_->ready && !p_->broken) {
+        p_->FlushPending();
         p_->SubmitAndWait();
         p_->Begin();
     }
