@@ -521,6 +521,7 @@ struct VulkanRenderer::Impl {
         };
         std::unordered_map<uint32_t, Crop> crops;  // by width << 16 | height
         uint64_t version = 0;                       // bumped whenever the snapshot is rewritten
+        uint64_t checkedGen = 0, checkedVer = ~0ull;  // frame and version at which the guest memory samples last matched
         bool valid = false;
         uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
         bool swapRB = false;
@@ -686,8 +687,14 @@ struct VulkanRenderer::Impl {
         if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return rej("pitch");
         const uint8_t* src = mem.HostPtr(t.base, e.size);
         if (!src) return VK_NULL_HANDLE;
-        uint32_t cur[64];
-        if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
+        // Sampling 64 dwords spread over the surface costs a cache miss each: once per frame and snapshot version
+        // is enough (the CPU writes textures between frames, as for ordinary textures).
+        if (e.checkedGen != generation || e.checkedVer != e.version) {
+            uint32_t cur[64];
+            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
+            e.checkedGen = generation;
+            e.checkedVer = e.version;
+        }
         VkImage image = e.img.img;
         std::unordered_map<uint32_t, VkImageView>* views = &e.views;
         if (t.width != e.w || t.height != e.h) {
