@@ -37,6 +37,7 @@ struct TranslatedShader {
     // Dwords one vertex index can reach in vertex fetch constant i: index * vfetchStride[i] +
     // vfetchEnd[i]. vfetchStride[i] == 0 means the extent is unknown (computed index).
     uint32_t vfetchStride[96] = {};
+    uint32_t vfetchWhy[96] = {};  // why the extent is unknown: 1 src reg!=r0, 2 src relative, 4 src comp!=x, 8 stride 0, 16 offset<0, 32 r0.x written first
     uint32_t vfetchEnd[96] = {};
     uint32_t texUsed = 0;                // bit n: texture fetch constant n (0..31)
     uint8_t texDim[32] = {};             // dimension per used texture slot

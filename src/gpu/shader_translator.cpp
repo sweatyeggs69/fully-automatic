@@ -196,6 +196,7 @@ private:
     bool r0Written_ = false;
     uint32_t vfStride_[96] = {}, vfEnd_[96] = {};
     uint32_t vfUnbounded_[3] = {0, 0, 0};
+    uint32_t vfWhy_[96] = {};
 };
 
 void Translator::WriteFetchResult(uint32_t dst, bool dstRel, uint32_t dstSwz, const std::string& value) {
@@ -250,7 +251,10 @@ void Translator::EmitVfetch(const uint32_t* w) {
         out_.vfetchUsed[slot / 32] |= 1u << (slot % 32);
         // Extent is only known when the index is the vertex index in r0.x (r0 not written before this fetch) and the
         // stride is explicit and the offset non-negative.
-        if (src != 0 || srcRel || srcComp != 0 || stride == 0 || offset < 0 || r0Written_) vfUnbounded_[slot / 32] |= 1u << (slot % 32);
+        const uint32_t why = (src != 0 ? 1u : 0u) | (srcRel ? 2u : 0u) | (srcComp != 0 ? 4u : 0u) | (stride == 0 ? 8u : 0u) |
+                             (offset < 0 ? 16u : 0u) | (r0Written_ ? 32u : 0u);
+        if (why) vfUnbounded_[slot / 32] |= 1u << (slot % 32);
+        vfWhy_[slot] |= why;
         vfStride_[slot] = std::max(vfStride_[slot], stride);
         vfEnd_[slot] = std::max<uint32_t>(vfEnd_[slot], uint32_t(std::max(offset, 0)) + 4);
     }
@@ -915,6 +919,7 @@ void Translator::Run() {
         bool bounded = !(vfUnbounded_[i / 32] & (1u << (i % 32)));
         out_.vfetchStride[i] = bounded ? vfStride_[i] : 0;  // 0 = extent unknown, upload the whole buffer
         out_.vfetchEnd[i] = vfEnd_[i];
+        out_.vfetchWhy[i] = vfWhy_[i];
     }
     out_.ok = true;
 }

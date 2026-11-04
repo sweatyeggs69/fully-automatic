@@ -1949,6 +1949,13 @@ struct VulkanRenderer::Impl {
                                  vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
                 }
             }
+            if (prof::g_enabled && !vs->info.vfetchStride[s] && vs->info.vfetchUsed[s / 32]) {
+                // Unbounded fetch: log each shader/slot once with why (see ShaderInfo::vfetchWhy).
+                static std::set<uint64_t> seenUnb;
+                if (seenUnb.size() < 60 && seenUnb.insert(dc.vsHash ^ (uint64_t(s) << 56)).second)
+                    std::fprintf(stderr, "[vbunb] vs %016llx slot %u: why 0x%x fetch words %u, indices %zu\n",
+                                 (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, hd.indices.size());
+            }
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
             VkDeviceSize at;
