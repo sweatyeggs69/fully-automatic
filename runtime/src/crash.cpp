@@ -126,6 +126,33 @@ static void sample_handler(int) {
     dump_guest_context_short();
 }
 
+// FA_PEEK=<chain>[,<chain>...] prints guest words after the samples. A chain is hex values joined
+// by '>': the first is an address, each later one is an offset added to the word loaded so far,
+// e.g. 827007e8>2890>0 reads the pointer at 827007e8, then the pointer at +0x2890, then that word.
+static void dump_peeks() {
+    const char* e = std::getenv("FA_PEEK");
+    if (!e) return;
+    const char* p = e;
+    while (*p) {
+        char* end;
+        uint32_t a = uint32_t(std::strtoul(p, &end, 16));
+        std::fprintf(stderr, "[peek] %08x", a);
+        p = end;
+        bool ok = true;
+        while (*p == '>') {
+            uint32_t off = uint32_t(std::strtoul(p + 1, &end, 16));
+            p = end;
+            if (a >= kGuestWindow - 4) { ok = false; break; }
+            a = ld32(a) + off;
+            std::fprintf(stderr, " -> %08x", a);
+        }
+        if (ok && a < kGuestWindow - 4) std::fprintf(stderr, " = %08x\n", ld32(a));
+        else std::fprintf(stderr, " (out of range)\n");
+        if (*p == ',') p++;
+        else if (*p) break;
+    }
+}
+
 static void install_sampler() {
     const char* e = std::getenv("FA_DUMP_AFTER");
     if (!e) return;
@@ -151,6 +178,7 @@ static void install_sampler() {
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
+        dump_peeks();
     }).detach();
 }
 

@@ -407,4 +407,8 @@ uint32_t invoke_guest(uint32_t func, uint32_t arg, uint32_t arg2) {
     return t->ctx->r3.u32;
 }
 
+void set_current_processor(uint8_t cpu) {
+    if (t_current) st8(t_current->pcr + 0x10C, cpu);
+}
+
 }  // namespace fa::rt

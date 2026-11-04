@@ -110,9 +110,17 @@ std::atomic<bool> g_gpu_started{false};
 
 void gpu_thread() {
     attach_guest_thread("gpu");
-    g_cp->SetInterruptHandler([](uint32_t) {
+    g_cp->SetInterruptHandler([](uint32_t cpu_mask) {
         uint32_t cb = g_vd.callback.load();
-        if (cb) invoke_guest(cb, 1, g_vd.callback_ctx.load());  // source 1 = command processor
+        if (!cb) return;
+        // The interrupt is raised on every CPU in the mask. D3D's handler acknowledges it by
+        // clearing its own processor's bit in the scratch block the GPU then waits on.
+        for (uint8_t cpu = 0; cpu < 6; cpu++) {
+            if (!(cpu_mask & (1u << cpu))) continue;
+            set_current_processor(cpu);
+            invoke_guest(cb, 1, g_vd.callback_ctx.load());  // source 1 = command processor
+        }
+        set_current_processor(0);
     });
     uint32_t last_wptr = 0;
     for (;;) {
@@ -153,6 +161,7 @@ FA_IMPORT(VdInitializeRingBuffer) {
 FA_IMPORT(VdEnableRingBufferRPtrWriteBack) {
     g_vd.rptr_writeback = phys_to_guest(arg32(ctx, 0));
     g_vd.rptr_block_log2 = arg32(ctx, 1);
+    std::fprintf(stderr, "[gpu] rptr writeback at %08x (block log2 %u)\n", g_vd.rptr_writeback, g_vd.rptr_block_log2);
     if (g_cp) g_cp->SetReadPtrWriteback(g_vd.rptr_writeback);
 }
 

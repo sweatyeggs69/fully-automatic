@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
     g_mem.commit_fixed(0x7FEA0000, 0x10000);
     // GPU register page: plain memory for now (reads as zero) until the GPU layer takes it over.
     g_mem.commit_fixed(0x7FC80000, 0x80000);
+    // D1MODE_VIEWPORT_SIZE (reg 0x1961): 1280x720. D3D divides by the height.
+    st32(0x7FC80000 + 0x1961 * 4, (1280u << 16) | 720u);
 
     // File system (game:, d:, hdd:, cache:), controllers, audio output and XMA.
     // FA_NO_AUDIO=1 runs the audio clock silently (headless/CI).

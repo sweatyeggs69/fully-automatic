@@ -36,7 +36,14 @@ uint32_t CommandProcessor::ReadDword(uint32_t base, uint32_t sizeDwords, uint32_
 }
 
 void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
-    if (reg < kRegisterCount) regs_[reg] = value;
+    if (reg >= kRegisterCount) return;
+    regs_[reg] = value;
+    // Scratch registers are mirrored to memory (SCRATCH_ADDR + 4 * i) when their SCRATCH_UMSK bit
+    // is set. D3D's fences are written this way.
+    if (reg >= pm4::kScratchReg0 && reg < pm4::kScratchReg0 + 8) {
+        uint32_t i = reg - pm4::kScratchReg0;
+        if (regs_[pm4::kScratchUmsk] & (1u << i)) mem_.Write32(regs_[pm4::kScratchAddr] + i * 4, value);
+    }
 }
 
 CommandProcessor::Status CommandProcessor::Pump() {
