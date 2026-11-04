@@ -90,10 +90,16 @@ inline uint32_t CfPairs(size_t cfCount) { return uint32_t((cfCount + 1) / 2); }
 
 // A vertex shader: position float3 + colour float4 from fetch slot 0 (stride 7 dwords), exports
 // oPos = (pos, 1) and o0 = colour.
-inline std::vector<uint32_t> ColorVS() {
+// With withW, the position is (x, y, z, w) and vertices are 8 floats instead of 7.
+inline std::vector<uint32_t> ColorVS(bool withW = false) {
     std::vector<uint32_t> ins;
-    EmitVfetch(ins, 1, 0, 0, 0, /*k_32_32_32_FLOAT*/ 57, 7, 0, FetchSwz(0, 1, 2, 5));
-    EmitVfetch(ins, 2, 0, 0, 0, /*k_32_32_32_32_FLOAT*/ 38, 7, 3, FetchSwz(0, 1, 2, 3), true);
+    if (withW) {
+        EmitVfetch(ins, 1, 0, 0, 0, /*k_32_32_32_32_FLOAT*/ 38, 8, 0, FetchSwz(0, 1, 2, 3));
+        EmitVfetch(ins, 2, 0, 0, 0, /*k_32_32_32_32_FLOAT*/ 38, 8, 4, FetchSwz(0, 1, 2, 3), true);
+    } else {
+        EmitVfetch(ins, 1, 0, 0, 0, /*k_32_32_32_FLOAT*/ 57, 7, 0, FetchSwz(0, 1, 2, 5));
+        EmitVfetch(ins, 2, 0, 0, 0, /*k_32_32_32_32_FLOAT*/ 38, 7, 3, FetchSwz(0, 1, 2, 3), true);
+    }
     Alu pos; pos.exp = true; pos.vdst = 62; pos.vmask = 0xF; pos.s1 = R(1); pos.s2 = R(1);
     Emit(ins, pos);
     Alu col; col.exp = true; col.vdst = 0; col.vmask = 0xF; col.s1 = R(2); col.s2 = R(2);

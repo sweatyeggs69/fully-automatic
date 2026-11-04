@@ -199,6 +199,53 @@ int main() {
     }
     CHECK(ref.size() >= 16 && ref[0] == 255 && ref[1] == 0 && ref[2] == 0);  // texel (0,0) is red
 
+    // Perspective: clip-space positions with w = 2 through the viewport transform (VTE 0x43f, the
+    // usual D3D setting), a green triangle over the top-left half again.
+    {
+        const uint32_t pvb = 0x104000, dest2 = 0x240000;
+        const float ptri[3][8] = {{-2, 2, 0, 2, 0, 1, 0, 1}, {0, 2, 0, 2, 0, 1, 0, 1}, {-2, -2, 0, 2, 0, 1, 0, 1}};
+        for (int v = 0; v < 3; v++)
+            for (int c = 0; c < 8; c++) mem.Write32(pvb + (v * 8 + c) * 4, F(ptri[v][c]));
+        Stream q{mem, ring, ringBytes / 4, s.w};
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::PA_CL_VTE_CNTL, 0);
+        q.reg(xe::RB_COPY_CONTROL, (1u << 8) | (3u << 20));  // clear to blue
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+
+        q.shader(0, xasm::ColorVS(true));
+        q.shader(1, xasm::ColorPS());
+        q.reg(xe::PA_CL_VTE_CNTL, 0x43f);
+        q.reg(xe::PA_CL_VPORT_XSCALE, F(64));
+        q.reg(xe::PA_CL_VPORT_XOFFSET, F(64));
+        q.reg(xe::PA_CL_VPORT_YSCALE, F(-32));
+        q.reg(xe::PA_CL_VPORT_YOFFSET, F(32));
+        q.reg(xe::PA_CL_VPORT_ZSCALE, F(1));
+        q.reg(xe::PA_CL_VPORT_ZOFFSET, F(0));
+        q.vfetch0(pvb, 24);
+        q.draw(xe::kPrimTriangleList, 3);
+
+        q.reg(xe::PA_CL_VTE_CNTL, 0);
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::RB_COPY_CONTROL, 0);
+        q.reg(xe::RB_COPY_DEST_BASE, dest2);
+        q.reg(xe::RB_COPY_DEST_PITCH, (64u << 16) | 128);
+        q.reg(xe::RB_COPY_DEST_INFO, (kFmt8_8_8_8 << 7) | kEndian8in32);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        r.Flush();
+        Pixel(mem, dest2, 128, 64, 4, 4, p);
+        std::printf("  perspective (4,4)   = %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
+        CHECK(p[0] == 0 && p[1] == 255 && p[2] == 0 && p[3] == 255);
+        Pixel(mem, dest2, 128, 64, 60, 60, p);
+        std::printf("  perspective (60,60) = %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
+        CHECK(p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255);
+    }
+
     if (failures) { std::printf("gpu_render_test: %d failure(s)\n", failures); return 1; }
     std::printf("gpu_render_test: ok\n");
     return 0;

@@ -862,7 +862,9 @@ void Translator::Run() {
         g += "  xe_body();\n";
         for (int i = 0; i < 16; i++) g += "  xe_interp" + Num(i) + " = xe_o[" + Num(i) + "];\n";
         g += R"(  vec4 p = xe_pos;
-  float w = (xe_s.flags.x & 4u) != 0u ? 1.0 / p.w : p.w;
+  // PA_CL_VTE_CNTL.VTX_W0_FMT set: the shader wrote W itself (the usual D3D case); clear: it
+  // wrote 1/W. Either way w below is the real clip W.
+  float w = (xe_s.flags.x & 4u) != 0u ? p.w : 1.0 / p.w;
   vec3 n = p.xyz;
   if ((xe_s.flags.x & 1u) == 0u) n.xy /= w;
   if ((xe_s.flags.x & 2u) == 0u) n.z /= w;
