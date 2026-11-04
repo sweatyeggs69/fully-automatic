@@ -44,6 +44,9 @@ void vsync_thread() {
                 std::fprintf(stderr, "[vd] vsync callback #%llu cb=%08x ctx=%08x\n", (unsigned long long)n,
                              cb, g_vd.callback_ctx.load());
             n++;
+            // The game's callback only does its vblank work when bit 0 of the display interrupt
+            // status register (GPU register page + 0x6544) is set, as the hardware would at vblank.
+            st32(0x7FC86544, 1);
             invoke_guest(cb, 0, g_vd.callback_ctx.load());  // source 0 = vsync
         }
     }
