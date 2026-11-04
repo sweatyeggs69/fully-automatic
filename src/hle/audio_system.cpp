@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -86,6 +87,14 @@ void AudioSystem::shutdown() {
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
     }
     if (clock_running_.exchange(false) && clock_.joinable()) clock_.join();
+    {
+        std::lock_guard lk(dump_mu_);
+        if (dump_) {
+            dump_patch_header();
+            std::fclose(dump_);
+            dump_ = nullptr;
+        }
+    }
     initialised_ = false;
 }
 
@@ -150,7 +159,11 @@ void AudioSystem::client_main(int index) {
             if (!c.running) break;
             --c.credits;
         }
-        if (hooks_.invoke && c.callback) hooks_.invoke(c.callback, c.wrapped_arg);
+        if (hooks_.invoke && c.callback) {
+            hooks_.invoke(c.callback, c.wrapped_arg);
+            std::lock_guard sl(stats_mu_);
+            ++stats_.callbacks;
+        }
     }
 }
 
@@ -177,12 +190,29 @@ void AudioSystem::submit_frame_host(int client, const uint8_t* be) {
     for (int i = 0; i < kChannels * kFrameSamples; ++i) planar[i] = be_float(be + 4 * i);
     float stereo[kFrameFloats];
     downmix_frame(planar, stereo);
+    {
+        float peak = 0;
+        double sq = 0;
+        for (float v : stereo) {
+            peak = std::max(peak, std::fabs(v));
+            sq += double(v) * v;
+        }
+        std::lock_guard sl(stats_mu_);
+        ++stats_.frames;
+        if (peak == 0) ++stats_.silent_frames;
+        stats_.peak = std::max(stats_.peak, peak);
+        stats_.sum_sq += sq;
+        stats_.level_samples += kFrameFloats;
+    }
+    if (dump_) dump_frame(stereo);
     std::lock_guard lk(queue_mu_);
     ClientRing& r = g_rings[client];
     const size_t cap = r.data.size();
     if (r.size + kFrameFloats > cap) {  // overflow: drop the oldest frame
         r.read = (r.read + kFrameFloats) % cap;
         r.size -= kFrameFloats;
+        std::lock_guard sl(stats_mu_);
+        ++stats_.dropped;
     }
     size_t w = (r.read + r.size) % cap;
     for (int k = 0; k < kFrameFloats; ++k) r.data[(w + size_t(k)) % cap] = stereo[k];
@@ -193,17 +223,26 @@ void AudioSystem::consume(float* out, int frames) {
     // frames = stereo sample pairs requested by the device.
     std::memset(out, 0, sizeof(float) * size_t(frames) * 2);
     float vol = volume_.load();
+    size_t most = 0;
+    bool any_client = false;
     {
         std::lock_guard lk(queue_mu_);
         for (int ci = 0; ci < kMaxClients; ++ci) {
             if (!clients_[ci].in_use) continue;
+            any_client = true;
             ClientRing& r = g_rings[ci];
             const size_t cap = r.data.size();
             size_t n = std::min<size_t>(r.size, size_t(frames) * 2);
+            most = std::max(most, n);
             for (size_t k = 0; k < n; ++k) out[k] += r.data[(r.read + k) % cap] * vol;
             r.read = (r.read + n) % cap;
             r.size -= n;
         }
+    }
+    if (any_client) {
+        std::lock_guard sl(stats_mu_);
+        stats_.device_samples += uint64_t(frames);
+        stats_.underrun_samples += uint64_t(frames) - most / 2;
     }
     // One credit (one callback) per 256 samples of device time.
     period_pos_ += frames;
@@ -216,6 +255,59 @@ void AudioSystem::consume(float* out, int frames) {
 void AudioSystem::sdl_callback(void* user, uint8_t* stream, int len) {
     auto* self = static_cast<AudioSystem*>(user);
     self->consume(reinterpret_cast<float*>(stream), len / int(sizeof(float) * 2));
+}
+
+AudioSystem::Stats AudioSystem::take_stats() {
+    std::lock_guard sl(stats_mu_);
+    Stats s = stats_;
+    stats_.peak = 0;
+    stats_.sum_sq = 0;
+    stats_.level_samples = 0;
+    return s;
+}
+
+// ------------------------------------------------------------ WAV dump
+
+bool AudioSystem::start_dump(const std::string& path) {
+    std::lock_guard lk(dump_mu_);
+    if (dump_) return true;
+    dump_ = std::fopen(path.c_str(), "wb");
+    if (!dump_) {
+        std::fprintf(stderr, "[audio] cannot write %s\n", path.c_str());
+        return false;
+    }
+    dump_bytes_ = 0;
+    dump_patch_header();
+    std::fprintf(stderr, "[audio] writing the game's audio to %s\n", path.c_str());
+    return true;
+}
+
+// RIFF/WAVE header for 32-bit float stereo at kSampleRate; rewritten every
+// second so the file stays playable if the game is killed.
+void AudioSystem::dump_patch_header() {
+    auto le32 = [](uint8_t* p, uint32_t v) { p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); p[2] = uint8_t(v >> 16); p[3] = uint8_t(v >> 24); };
+    auto le16 = [](uint8_t* p, uint16_t v) { p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); };
+    uint8_t h[44];
+    uint32_t data = uint32_t(std::min<uint64_t>(dump_bytes_, 0xFFFFFFFFull - 36));
+    std::memcpy(h, "RIFF", 4); le32(h + 4, 36 + data);
+    std::memcpy(h + 8, "WAVEfmt ", 8); le32(h + 16, 16);
+    le16(h + 20, 3); le16(h + 22, 2);  // IEEE float, stereo
+    le32(h + 24, kSampleRate); le32(h + 28, kSampleRate * 8); le16(h + 32, 8); le16(h + 34, 32);
+    std::memcpy(h + 36, "data", 4); le32(h + 40, data);
+    long pos = std::ftell(dump_);
+    std::fseek(dump_, 0, SEEK_SET);
+    std::fwrite(h, 1, sizeof h, dump_);
+    if (pos > long(sizeof h)) std::fseek(dump_, pos, SEEK_SET);
+    std::fflush(dump_);
+}
+
+void AudioSystem::dump_frame(const float* stereo) {
+    std::lock_guard lk(dump_mu_);
+    if (!dump_) return;
+    std::fwrite(stereo, sizeof(float), kFrameFloats, dump_);  // host little-endian floats
+    uint64_t before = dump_bytes_;
+    dump_bytes_ += sizeof(float) * kFrameFloats;
+    if (before / (kSampleRate * 8) != dump_bytes_ / (kSampleRate * 8)) dump_patch_header();
 }
 
 void AudioSystem::clock_main() {

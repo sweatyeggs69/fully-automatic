@@ -417,6 +417,7 @@ struct XmaDecoder::Context {
                 continue;
             }
             if (r == Extract::Invalid) {
+                st_bad_frames_.fetch_add(1, std::memory_order_relaxed);
                 carry.reset();
                 uint32_t nb;
                 if (seek_frame_from_packet(in, count, p + 1 + packet_skip(in + size_t(p) * kBytesPerPacket), nb)) {
@@ -428,7 +429,8 @@ struct XmaDecoder::Context {
             }
 
             bool trailer = get_bit(carry.bits, carry.len - 1) != 0;
-            dec.decode(carry.bits, carry.len, pcm);
+            if (!dec.decode(carry.bits, carry.len, pcm)) st_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+            st_frames_.fetch_add(1, std::memory_order_relaxed);
             carry.reset();
             to_be16(pcm, channels, be);
             for (uint32_t i = 0; i < frame_bytes; ++i) out[(wr + i) % cap] = be[i];
@@ -451,7 +453,21 @@ struct XmaDecoder::Context {
 
 // ------------------------------------------------------------ decoder
 
+std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0};
+
 XmaDecoder::XmaDecoder() = default;
+
+XmaDecoder::Stats XmaDecoder::stats() {
+    Stats s;
+    s.kicks = st_kicks_.load(std::memory_order_relaxed);
+    s.passes = st_passes_.load(std::memory_order_relaxed);
+    s.frames = st_frames_.load(std::memory_order_relaxed);
+    s.bad_frames = st_bad_frames_.load(std::memory_order_relaxed);
+    s.decode_errors = st_decode_errors_.load(std::memory_order_relaxed);
+    std::lock_guard lk(alloc_mu_);
+    for (auto& c : contexts_) s.allocated += c->allocated ? 1 : 0;
+    return s;
+}
 XmaDecoder::~XmaDecoder() { shutdown(); }
 
 bool XmaDecoder::init(const GuestHooks& hooks, bool start_thread) {
@@ -525,6 +541,7 @@ void XmaDecoder::release_context(uint32_t ptr) {
 void XmaDecoder::enable_context(uint32_t ptr) {
     int i = context_index(ptr);
     if (i < 0) return;
+    st_kicks_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard cl(contexts_[size_t(i)]->mu);
         contexts_[size_t(i)]->enabled = true;
@@ -631,6 +648,7 @@ bool XmaDecoder::work_once() {
         d.load(g);
         c.decode(d, hooks_);
         d.store(g);
+        st_passes_.fetch_add(1, std::memory_order_relaxed);
         did = true;
     }
     return did;

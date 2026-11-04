@@ -21,6 +21,7 @@
 // runtime fills in (runtime/src/audio/xaudio_imports.cpp).
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -80,6 +81,25 @@ public:
 
     static constexpr int kMaxQueuedFrames = 8;    // ~43 ms
 
+    // Counters for FA_AUDIO_STATS / FA_PROFILE (totals since start).
+    struct Stats {
+        uint64_t callbacks = 0;         // guest render callbacks run
+        uint64_t frames = 0;            // frames the guest submitted
+        uint64_t dropped = 0;           // frames dropped because the queue was full
+        uint64_t device_samples = 0;    // stereo samples the device (or silent clock) asked for
+        uint64_t underrun_samples = 0;  // of those, samples we had nothing for
+        float peak = 0;                 // largest |sample| since the last take_stats()
+        double sum_sq = 0;              // sum of squared samples since the last take_stats()
+        uint64_t level_samples = 0;     // samples in sum_sq
+        uint64_t silent_frames = 0;     // submitted frames that were all zero
+    };
+    // Returns the totals; peak/sum_sq/level_samples are reset by the call.
+    Stats take_stats();
+
+    // FA_AUDIO_DUMP=path.wav: writes everything the game submits (after the
+    // stereo downmix) to a 48 kHz float WAV, for checking without speakers.
+    bool start_dump(const std::string& path);
+
 private:
     struct Client {
         bool in_use = false;
@@ -113,6 +133,14 @@ private:
     std::atomic<bool> clock_running_{false};
     std::thread clock_;
     bool initialised_ = false;
+
+    std::mutex stats_mu_;
+    Stats stats_;
+    std::mutex dump_mu_;
+    std::FILE* dump_ = nullptr;
+    uint64_t dump_bytes_ = 0;
+    void dump_frame(const float* stereo);
+    void dump_patch_header();
 };
 
 // ------------------------------------------------------------ XMA decoder
@@ -210,6 +238,17 @@ public:
 
     struct Context;
 
+    // Counters for FA_AUDIO_STATS / FA_PROFILE (totals since start).
+    struct Stats {
+        uint64_t kicks = 0;          // XMAEnableContext calls and kick register bits
+        uint64_t passes = 0;         // context decode passes
+        uint64_t frames = 0;         // XMA frames decoded
+        uint64_t bad_frames = 0;     // invalid frame lengths skipped
+        uint64_t decode_errors = 0;  // frames FFmpeg rejected
+        int allocated = 0;           // contexts currently allocated
+    };
+    Stats stats();
+
 private:
     void poll_registers();
     void worker_main();
@@ -223,6 +262,9 @@ private:
     std::mutex wake_mu_;
     std::condition_variable wake_cv_;
     bool wake_ = false;
+    std::atomic<uint64_t> st_kicks_{0}, st_passes_{0};
+    // Bumped by the per-context decode loop (Context is a nested class).
+    static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_;
 };
 
 }  // namespace fa::hle
