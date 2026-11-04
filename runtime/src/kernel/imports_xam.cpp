@@ -4,6 +4,9 @@
 #include "fa/rt/memory.hpp"
 
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 
 using namespace fa::rt;
 
@@ -46,11 +49,52 @@ FA_IMPORT(ExRegisterTitleTerminateNotification) { }
 FA_IMPORT(XamLoaderGetLaunchData) { ret32(ctx, STATUS_NO_SUCH_FILE); }
 FA_IMPORT(XamLoaderSetLaunchData) { ret32(ctx, STATUS_SUCCESS); }
 
-FA_IMPORT(XamNotifyCreateListener) {
-    // (mask, max_version) -> handle. Notifications are never delivered yet.
-    ret32(ctx, g_kernel.add_handle(std::make_shared<KEvent>(true, false)));
+// ---- notifications ------------------------------------------------------------------
+// Listeners are created with an area mask; system notifications (storage device changed, UI
+// opened/closed) are posted with post_notification() and read with XNotifyGetNext.
+namespace {
+struct Listener {
+    uint32_t mask = 0;
+    std::deque<std::pair<uint32_t, uint32_t>> queue;  // id, param
+};
+std::mutex g_notify_mu;
+std::map<uint32_t, Listener> g_listeners;
+constexpr uint32_t kAreaSystem = 0x1;
+}  // namespace
+
+// Posts a system-area notification (e.g. 0x9 XN_SYS_UI, 0xB XN_SYS_STORAGEDEVICESCHANGED).
+void post_system_notification(uint32_t id, uint32_t param) {
+    std::lock_guard<std::mutex> lk(g_notify_mu);
+    for (auto& [h, l] : g_listeners)
+        if (l.mask & kAreaSystem) l.queue.emplace_back(id, param);
 }
-FA_IMPORT(XNotifyGetNext) { ret32(ctx, 0); }  // nothing pending
+
+FA_IMPORT(XamNotifyCreateListener) {
+    // (mask, max_version) -> handle.
+    uint32_t h = g_kernel.add_handle(std::make_shared<KEvent>(true, false));
+    std::lock_guard<std::mutex> lk(g_notify_mu);
+    g_listeners[h].mask = arg32(ctx, 0);
+    ret32(ctx, h);
+}
+
+// (handle, match_id (0 = any), id*, param*) -> 1 and the notification if one is pending
+FA_IMPORT(XNotifyGetNext) {
+    uint32_t h = arg32(ctx, 0), match = arg32(ctx, 1), id_out = arg32(ctx, 2), param_out = arg32(ctx, 3);
+    std::lock_guard<std::mutex> lk(g_notify_mu);
+    auto it = g_listeners.find(h);
+    if (it == g_listeners.end()) { ret32(ctx, 0); return; }
+    auto& q = it->second.queue;
+    for (auto n = q.begin(); n != q.end(); ++n) {
+        if (match && n->first != match) continue;
+        if (id_out) st32(id_out, n->first);
+        if (param_out) st32(param_out, n->second);
+        q.erase(n);
+        ret32(ctx, 1);
+        return;
+    }
+    if (id_out) st32(id_out, 0);
+    ret32(ctx, 0);
+}
 
 FA_IMPORT(XamGetExecutionId) { ret32(ctx, STATUS_NOT_IMPLEMENTED); }
 FA_IMPORT(XGetLanguage) { ret32(ctx, 1); }  // English
