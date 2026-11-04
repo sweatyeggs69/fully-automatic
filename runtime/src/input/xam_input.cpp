@@ -57,6 +57,13 @@ FA_IMPORT(XamInputGetState) {
     if (rc == 0) {
         st32(out, s.packet_number);
         store_gamepad(out + 4, s.gamepad);
+        static const bool trace = std::getenv("FA_TRACE_INPUT") != nullptr;
+        static uint32_t last_packet = ~0u;
+        if (trace && s.packet_number != last_packet) {
+            last_packet = s.packet_number;
+            std::fprintf(stderr, "[input] getstate packet=%u buttons=%04X lx=%d ly=%d\n", s.packet_number,
+                         unsigned(s.gamepad.buttons), int(s.gamepad.thumb_lx), int(s.gamepad.thumb_ly));
+        }
     }
     ret32(ctx, rc);
 }
