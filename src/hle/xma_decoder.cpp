@@ -320,6 +320,7 @@ struct XmaDecoder::Context {
     FrameDecoder dec;
     Carry carry;
     bool carry_crossed = false;
+    int trace_count = 0;
 
     void reset_stream() {
         carry.reset();
@@ -417,6 +418,7 @@ struct XmaDecoder::Context {
                 continue;
             }
             if (r == Extract::Invalid) {
+                st_bad_frames_.fetch_add(1, std::memory_order_relaxed);
                 carry.reset();
                 uint32_t nb;
                 if (seek_frame_from_packet(in, count, p + 1 + packet_skip(in + size_t(p) * kBytesPerPacket), nb)) {
@@ -428,7 +430,8 @@ struct XmaDecoder::Context {
             }
 
             bool trailer = get_bit(carry.bits, carry.len - 1) != 0;
-            dec.decode(carry.bits, carry.len, pcm);
+            if (!dec.decode(carry.bits, carry.len, pcm)) st_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+            st_frames_.fetch_add(1, std::memory_order_relaxed);
             carry.reset();
             to_be16(pcm, channels, be);
             for (uint32_t i = 0; i < frame_bytes; ++i) out[(wr + i) % cap] = be[i];
@@ -451,7 +454,22 @@ struct XmaDecoder::Context {
 
 // ------------------------------------------------------------ decoder
 
+std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0};
+
 XmaDecoder::XmaDecoder() = default;
+
+XmaDecoder::Stats XmaDecoder::stats() {
+    Stats s;
+    s.kicks = st_kicks_.load(std::memory_order_relaxed);
+    s.passes = st_passes_.load(std::memory_order_relaxed);
+    s.loops = st_loops_.load(std::memory_order_relaxed);
+    s.frames = st_frames_.load(std::memory_order_relaxed);
+    s.bad_frames = st_bad_frames_.load(std::memory_order_relaxed);
+    s.decode_errors = st_decode_errors_.load(std::memory_order_relaxed);
+    std::lock_guard lk(alloc_mu_);
+    for (auto& c : contexts_) s.allocated += c->allocated ? 1 : 0;
+    return s;
+}
 XmaDecoder::~XmaDecoder() { shutdown(); }
 
 bool XmaDecoder::init(const GuestHooks& hooks, bool start_thread) {
@@ -525,8 +543,12 @@ void XmaDecoder::release_context(uint32_t ptr) {
 void XmaDecoder::enable_context(uint32_t ptr) {
     int i = context_index(ptr);
     if (i < 0) return;
+    uint64_t nk = st_kicks_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard cl(contexts_[size_t(i)]->mu);
+        if (trace_ctx_ && nk < 20)
+            std::fprintf(stderr, "[xma] kick #%llu ctx %d allocated=%d\n", (unsigned long long)nk, i,
+                         int(contexts_[size_t(i)]->allocated));
         contexts_[size_t(i)]->enabled = true;
     }
     {
@@ -613,7 +635,10 @@ void XmaDecoder::poll_registers() {
             auto* w = reinterpret_cast<uint32_t*>(regs + base + r * 4);
             if (__atomic_load_n(w, __ATOMIC_RELAXED) == 0) continue;
             uint32_t raw = __atomic_exchange_n(w, 0u, __ATOMIC_ACQ_REL);
-            if (raw) write_register(base + r * 4, __builtin_bswap32(raw));
+            // Device registers are little-endian: the game writes them with byte-reversed
+            // stores (stwbrx), so memory already holds the little-endian value, which is
+            // what a host load returns. (Swapping here turned a kick of context 0 into 24.)
+            if (raw) write_register(base + r * 4, raw);
         }
     }
 }
@@ -629,8 +654,23 @@ bool XmaDecoder::work_once() {
         uint8_t* g = hooks_.host(c.guest_ptr);
         XmaContextData d;
         d.load(g);
+        uint64_t frames_before = st_frames_.load(std::memory_order_relaxed);
+        XmaContextData before = d;
         c.decode(d, hooks_);
         d.store(g);
+        st_passes_.fetch_add(1, std::memory_order_relaxed);
+        if (trace_ctx_ && st_frames_.load(std::memory_order_relaxed) == frames_before && c.trace_count++ < 12) {
+            // FA_XMA_DEBUG: a kicked context that decoded nothing; show why.
+            std::fprintf(stderr,
+                "[xma] ctx %d kicked, no frame: in0 valid=%u ptr=%08x pk=%u | in1 valid=%u ptr=%08x pk=%u | "
+                "cur=%u rd=%u | out valid=%u ptr=%08x blocks=%u wr=%u rd=%u | stereo=%u rate=%u loop=%u\n",
+                int((c.guest_ptr - array_ptr_) / kContextSize), before.input_buffer_0_valid, before.input_buffer_0_ptr,
+                before.input_buffer_0_packet_count, before.input_buffer_1_valid, before.input_buffer_1_ptr,
+                before.input_buffer_1_packet_count, before.current_buffer, before.input_buffer_read_offset,
+                before.output_buffer_valid, before.output_buffer_ptr, before.output_buffer_block_count,
+                before.output_buffer_write_offset, before.output_buffer_read_offset, before.is_stereo,
+                before.sample_rate, before.loop_count);
+        }
         did = true;
     }
     return did;
@@ -639,6 +679,7 @@ bool XmaDecoder::work_once() {
 void XmaDecoder::worker_main() {
     int idle = 0;
     while (running_) {
+        st_loops_.fetch_add(1, std::memory_order_relaxed);
         bool did = work_once();
         idle = did ? 0 : idle + 1;
         if (idle > 200) {

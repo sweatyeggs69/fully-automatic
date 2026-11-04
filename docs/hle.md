@@ -70,6 +70,17 @@ Checked so far: on public Xbox 360 XMA1 voice samples the decoder matches FFmpeg
 at about 75 dB SNR (rounding only), and the hardware path (rolling 3-packet input buffers, frames
 split across buffers, ring buffer wrap) gives bit-identical output to the offline decoder.
 
+### Checking audio without listening
+
+    FA_AUDIO_STATS=5 fullauto ...               # one [audio] line every 5 s (FA_PROFILE=N prints it too)
+    FA_AUDIO_DUMP=/tmp/fa-audio.wav fullauto ...  # everything the game submits, as a 48 kHz float WAV
+
+The `[audio]` line shows guest render callbacks and submitted frames per second (187.5/s is real
+time), frames that were all zero, frames dropped because the queue was full, how much of the
+device's time we had nothing to play (underrun), the level of what was submitted, and the XMA side:
+allocated contexts, kicks, decoded frames, and frames that were skipped as invalid or that FFmpeg
+rejected. The WAV is written in submission order, so gaps in it are the game's, not the device's.
+
 ## Wave bank tool (`fawave`)
 
 Full Auto uses early XACT 2 wave banks (tool version 21 or lower) with XMA1 audio.
@@ -85,5 +96,5 @@ also runs the hardware-path test on a real stereo XMA file.
 ## Not done yet
 
 - XMA loop sub-frame precision (loops land on frame boundaries), multi-stream (more than 2 channel) XMA contexts.
-- Content/save APIs (`XamContentCreate` etc.) still need mapping onto `hdd:`.
+- `XamContentCreateEnumerator` (empty), `XamShowDeviceSelectorUI` (auto-picks device 1) and the wide printf pair `_vscwprintf` / `vswprintf` are in `runtime/src/kernel/imports_content.cpp`. Content packages (`XamContentCreate` etc.) still need mapping onto `hdd:`.
 - Keystroke queues (`XamInputGetKeystroke`) always report no input.

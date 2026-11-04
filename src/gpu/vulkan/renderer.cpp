@@ -1034,7 +1034,7 @@ struct VulkanRenderer::Impl {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
             if (cube || t.dimension == 3) return fallback.view;
         }
-        uint64_t key = HashBytes(d, 4);  // dwords 0..3: type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
+        uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
         uint32_t size = HostTextureByteSize(t);
