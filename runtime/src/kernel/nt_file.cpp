@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <string>
 
 using namespace fa::rt;
@@ -78,13 +80,17 @@ void create(PPCContext& ctx, uint32_t handle_ptr, uint32_t access, uint32_t oa, 
     req.options = options;
     std::shared_ptr<hle::VfsFile> f;
     uint32_t info = 0;
-    uint32_t st = hle::services().vfs.open(path_from_attributes(oa), req, f, info);
+    std::string path = path_from_attributes(oa);
+    // FA_SKIP_MOVIES=1 hides the .wmv movies (intro, attract loop) so the game skips them.
+    static const bool skip_movies = std::getenv("FA_SKIP_MOVIES") != nullptr;
+    bool movie = path.size() > 4 && strcasecmp(path.c_str() + path.size() - 4, ".wmv") == 0;
+    uint32_t st = skip_movies && movie ? STATUS_OBJECT_NAME_NOT_FOUND : hle::services().vfs.open(path, req, f, info);
     if (st == STATUS_SUCCESS) {
-        f->set_guest_path(f->guest_path().empty() ? path_from_attributes(oa) : f->guest_path());
+        f->set_guest_path(f->guest_path().empty() ? path : f->guest_path());
         st32(handle_ptr, g_kernel.add_handle(std::make_shared<KFile>(f)));
     }
     if (g_trace_imports)
-        std::fprintf(stderr, "[file] open %s -> %08x\n", path_from_attributes(oa).c_str(), st);
+        std::fprintf(stderr, "[file] open %s -> %08x\n", path.c_str(), st);
     iosb(io, st, st == STATUS_SUCCESS ? info : 0);
     ret32(ctx, st);
 }
