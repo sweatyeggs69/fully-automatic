@@ -448,8 +448,11 @@ struct VulkanRenderer::Impl {
     uint32_t watchAddr = [] { const char* e = std::getenv("FA_WATCH_ADDR"); return e ? uint32_t(std::strtoul(e, nullptr, 16) & 0x1FFFFFFFu) : 0u; }();
     void WatchBytes(const char* what, uint32_t base, uint32_t size, const char* extra = "") {
         if (!watchAddr || (base & 0x1FFFFFFFu) != watchAddr) return;
+        static const uint64_t fromFrame = [] { const char* e = std::getenv("FA_WATCH_FROM_FRAME"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+        static const int maxEvents = [] { const char* e = std::getenv("FA_WATCH_MAX"); return e ? std::atoi(e) : 400; }();
+        if (frame < fromFrame) return;
         static int logged = 0;
-        if (logged++ >= 400) return;
+        if (logged++ >= maxEvents) return;
         const uint8_t* p = mem.HostPtr(base, size);
         if (!p) { std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x: not mapped (%u bytes) %s\n", (unsigned long long)frame, (unsigned long long)stats.draws.load(), what, base, size, extra); return; }
         std::fprintf(stderr, "[watch] frame %llu draws %llu %s %08x size %u hash %016llx %s\n  @0:", (unsigned long long)frame,
@@ -1408,7 +1411,7 @@ struct VulkanRenderer::Impl {
         if (watchAddr && (t.base & 0x1FFFFFFFu) == watchAddr) {
             auto wit = textures.find(HashBytes(d, 6 * sizeof(uint32_t)) ^ (uint64_t(t.dimension) << 62));
             const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
-            WatchBytes("texture bind", t.base, HostTextureByteSize(t), reuse ? "(cached view reused without rechecking)" : "(will recheck memory)");
+            if (!reuse) WatchBytes("texture bind", t.base, HostTextureByteSize(t), "(will recheck memory)");  // reused binds are not logged
         }
         if (snapEnabled && !cube && !snaps.empty())
             if (VkImageView sv = SnapView(t)) return sv;
