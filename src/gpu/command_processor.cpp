@@ -65,18 +65,20 @@ CommandProcessor::Status CommandProcessor::Pump() {
         while (ib_.active) {
             if (ib_.pos >= ib_.size) { ib_.active = false; break; }
             uint32_t avail = ib_.size - ib_.pos;
-            if (ExecutePacket(ib_.pos, ib_.base, ib_.size, avail, 1) == Result::Blocked) return Status::Blocked;
+            if (ExecutePacket(ib_.pos, ib_.base, ib_.size, avail, 1) == Result::Blocked) { backend_.Sync(); return Status::Blocked; }
         }
         if (rptr_ == wptr_) break;
         uint32_t avail = (wptr_ - rptr_) % ringSizeDwords_;
         if (avail == 0) break;
         uint32_t pos = rptr_;
         Result r = ExecutePacket(pos, ringBase_, ringSizeDwords_, avail, 0);
-        if (r == Result::Blocked) return Status::Blocked;
+        if (r == Result::Blocked) { backend_.Sync(); return Status::Blocked; }
         if (r == Result::Incomplete) break;
         rptr_ = pos % ringSizeDwords_;
         if (rptrWriteback_) mem_.Write32(rptrWriteback_, rptr_);
     }
+    // Everything submitted so far is done: the guest may now read the results (it polls the read pointer).
+    backend_.Sync();
     return Status::Idle;
 }
 
