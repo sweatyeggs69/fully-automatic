@@ -1,5 +1,6 @@
 #include "fa/gpu/frame_backend.hpp"
 
+#include "fa/gpu/gpu_profile.hpp"
 #include "fa/gpu/png.hpp"
 #include "fa/gpu/pm4.hpp"
 
@@ -83,6 +84,8 @@ static bool HasContent(const std::vector<uint8_t>& rgba) {
 
 void FrameBackend::Swap(uint32_t addr, uint32_t width, uint32_t height, const RegisterFile& regs) {
     uint64_t seq = stats_.swaps.fetch_add(1, std::memory_order_relaxed) + 1;
+    prof::OnSwap();
+    prof::Scope ps_(prof::kFrameDecode);
     stats_.drawsLastFrame.store(drawsThisFrame_, std::memory_order_relaxed);
     drawsThisFrame_ = 0;
     bool haveTex = haveBest_;

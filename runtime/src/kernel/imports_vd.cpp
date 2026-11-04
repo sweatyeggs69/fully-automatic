@@ -9,6 +9,7 @@
 
 #include "fa/gpu/command_processor.hpp"
 #include "fa/gpu/frame_backend.hpp"
+#include "fa/gpu/gpu_profile.hpp"
 #include "fa/rt/video.hpp"
 
 #include <atomic>
@@ -140,7 +141,10 @@ void gpu_thread() {
     for (;;) {
         uint32_t w = ld32(kCpRbWptr);
         g_cp->SetWritePtr(w);
-        g_cp->Pump();
+        {
+            fa::gpu::prof::Scope ps(fa::gpu::prof::kPump);
+            g_cp->Pump();
+        }
         st32(kCpRbRptr, g_cp->ReadPtr());
         if (w != last_wptr) {
             last_wptr = w;

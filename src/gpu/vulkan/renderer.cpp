@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "fa/gpu/gpu_profile.hpp"
 #include "fa/gpu/pm4.hpp"
 #include "fa/gpu/png.hpp"
 #include "fa/gpu/primitive.hpp"
@@ -786,6 +787,7 @@ struct VulkanRenderer::Impl {
     Shader* GetShader(ShaderStage stage, const uint32_t* ucode, uint32_t dwords, uint64_t hash) {
         auto it = shaders.find(hash);
         if (it != shaders.end()) return &it->second;
+        prof::Scope ps_(prof::kShader);
         Shader& s = shaders[hash];
         s.info = TranslateShader(stage, ucode, dwords);
         std::string err = s.info.error;
@@ -943,9 +945,14 @@ struct VulkanRenderer::Impl {
             tex.validatedGen = generation;
             return tex.ok ? tex.image.view : fallback.view;
         }
-        uint64_t h = HashBytes(src, size);
+        uint64_t h;
+        {
+            prof::Scope ps_(prof::kTexCheck);
+            h = HashBytes(src, size);
+        }
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
+        prof::Scope ps_(prof::kTexUpload);
 
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht)) return fallback.view;
@@ -1004,6 +1011,7 @@ struct VulkanRenderer::Impl {
         std::string k(reinterpret_cast<const char*>(&key), sizeof key);
         auto it = pipelines.find(k);
         if (it != pipelines.end()) return it->second;
+        prof::Scope ps_(prof::kPipeline);
 
         VkPipelineShaderStageCreateInfo st[3] = {};
         uint32_t ns = 0;
@@ -1110,6 +1118,7 @@ struct VulkanRenderer::Impl {
 
     // ---- draws -------------------------------------------------------------------------------
     void Draw(const DrawCall& dc, const RegisterFile& regs) {
+        prof::Scope ps_(prof::kDraw);
         uint32_t mode = regs[xe::RB_MODECONTROL] & 7;
         if (mode != xe::kEdramColorDepth && mode != xe::kEdramDepthOnly) { stats.drawsSkipped++; return; }
         if (!dc.vsUcode || !dc.psUcode) { stats.drawsSkipped++; return; }
@@ -1497,6 +1506,7 @@ struct VulkanRenderer::Impl {
 
     // ---- resolves ----------------------------------------------------------------------------
     void Resolve(const RegisterFile& regs) {
+        prof::Scope ps_(prof::kResolve);
         stats.resolves++;
         Begin();
         const uint32_t copyCtl = regs[xe::RB_COPY_CONTROL];
@@ -1576,8 +1586,12 @@ struct VulkanRenderer::Impl {
                 bic.imageExtent = {w, h, 1};
                 vkCmdCopyImageToBuffer(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
                 Barrier();
-                SubmitAndWait();
+                {
+                    prof::Scope pw_(prof::kResolveWait);
+                    SubmitAndWait();
+                }
                 Begin();
+                prof::Scope pc_(prof::kResolveCpu);
                 // Destination offset: the resolve rectangle's position in EDRAM.
                 std::vector<float> px(size_t(w) * h * 4);
                 const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
@@ -1696,7 +1710,10 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
-        SubmitAndWait();
+        {
+            prof::Scope ps_(prof::kOtherWait);
+            SubmitAndWait();
+        }
         Begin();
         generation++;
         frame++;
