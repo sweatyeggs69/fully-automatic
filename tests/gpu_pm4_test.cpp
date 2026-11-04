@@ -76,6 +76,23 @@ int main() {
     CHECK(cp.Pump() == CommandProcessor::Status::Idle);
     CHECK(be.draws.size() == drawsBefore + 1);
 
+    // Predicated tiling: with bin select & mask == 0, predicated packets (header bit 0) are
+    // skipped; unpredicated ones still run.
+    drawsBefore = be.draws.size();
+    put(T3(pm4::kSetBinMask, 2)); put(0); put(0x2);
+    put(T3(pm4::kSetBinSelect, 2)); put(0); put(0x1);
+    put(T3(pm4::kDrawIndx2, 1) | 1); put((3u << 16) | (2u << 6) | 4);   // predicated: skipped
+    put(T3(pm4::kSetConstant, 2) | 1); put(4u << 16 | 0x80); put(0x1234);  // predicated register write: skipped
+    put(T3(pm4::kDrawIndx2, 1)); put((3u << 16) | (2u << 6) | 4);       // runs
+    put(T3(pm4::kSetBinSelectLo, 1)); put(0x2);
+    put(T3(pm4::kDrawIndx2, 1) | 1); put((3u << 16) | (2u << 6) | 4);   // predicated, now selected: runs
+    put(T3(pm4::kSetBinMask, 2)); put(0xFFFFFFFF); put(0xFFFFFFFF);
+    cp.SetWritePtr(w);
+    CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+    CHECK(be.draws.size() == drawsBefore + 2);
+    CHECK(cp.Regs()[pm4::kRegisterBase + 0x80] != 0x1234);
+    CHECK(cp.GetStats().predicatedSkips == 2);
+
     // Indirect buffer.
     mem.Write32(0x2000, T3(pm4::kDrawIndx2, 1)); mem.Write32(0x2004, (6u << 16) | (2u << 6) | 4);
     put(T3(pm4::kIndirectBuffer, 2)); put(0x2000); put(2);
