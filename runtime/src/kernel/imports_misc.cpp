@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#include <unistd.h>
 
 using namespace fa::rt;
 
@@ -64,6 +68,32 @@ FA_IMPORT(KeBugCheckEx) { die("KeBugCheckEx", arg32(ctx, 0)); }
 
 FA_IMPORT(HalReturnToFirmware) { std::fflush(stderr); std::_Exit(0); }
 FA_IMPORT(XamLoaderTerminateTitle) { std::fflush(stderr); std::_Exit(0); }
+
+// Launching another title (or relaunching this one, which is how the game leaves a race) means
+// replacing the running process on a console. We cannot load another title, so log the request and
+// end the process cleanly. FA_RELAUNCH=1 restarts this program with the same arguments instead.
+// (path*, flags)
+FA_IMPORT(XamLoaderLaunchTitle) {
+    uint32_t path = arg32(ctx, 0);
+    std::fprintf(stderr, "XamLoaderLaunchTitle(\"%s\", flags=%08X): ending the process\n",
+                 path ? reinterpret_cast<const char*>(host(path)) : "", arg32(ctx, 1));
+    std::fflush(stderr);
+    if (std::getenv("FA_RELAUNCH")) {
+        std::string cmd;
+        if (FILE* f = std::fopen("/proc/self/cmdline", "rb")) {
+            char buf[4096];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) cmd.append(buf, n);
+            std::fclose(f);
+        }
+        std::vector<char*> argv;
+        for (size_t i = 0; i < cmd.size(); i += std::strlen(cmd.c_str() + i) + 1) argv.push_back(&cmd[i]);
+        argv.push_back(nullptr);
+        if (argv.size() > 1) execv("/proc/self/exe", argv.data());
+        std::fprintf(stderr, "XamLoaderLaunchTitle: relaunch failed, exiting\n");
+    }
+    std::_Exit(0);
+}
 
 FA_IMPORT(XexCheckExecutablePrivilege) { ret32(ctx, 0); }
 
