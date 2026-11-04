@@ -462,6 +462,7 @@ XmaDecoder::Stats XmaDecoder::stats() {
     Stats s;
     s.kicks = st_kicks_.load(std::memory_order_relaxed);
     s.passes = st_passes_.load(std::memory_order_relaxed);
+    s.loops = st_loops_.load(std::memory_order_relaxed);
     s.frames = st_frames_.load(std::memory_order_relaxed);
     s.bad_frames = st_bad_frames_.load(std::memory_order_relaxed);
     s.decode_errors = st_decode_errors_.load(std::memory_order_relaxed);
@@ -542,9 +543,12 @@ void XmaDecoder::release_context(uint32_t ptr) {
 void XmaDecoder::enable_context(uint32_t ptr) {
     int i = context_index(ptr);
     if (i < 0) return;
-    st_kicks_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t nk = st_kicks_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard cl(contexts_[size_t(i)]->mu);
+        if (trace_ctx_ && nk < 20)
+            std::fprintf(stderr, "[xma] kick #%llu ctx %d allocated=%d\n", (unsigned long long)nk, i,
+                         int(contexts_[size_t(i)]->allocated));
         contexts_[size_t(i)]->enabled = true;
     }
     {
@@ -672,6 +676,7 @@ bool XmaDecoder::work_once() {
 void XmaDecoder::worker_main() {
     int idle = 0;
     while (running_) {
+        st_loops_.fetch_add(1, std::memory_order_relaxed);
         bool did = work_once();
         idle = did ? 0 : idle + 1;
         if (idle > 200) {
