@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1042,10 +1043,27 @@ struct VulkanRenderer::Impl {
         TextureFetch t = ParseTextureFetch(d);
         sampler = GetSampler(t);
         Image& fallback = cube ? dummyCube : dummy2D;
-        if (!t.IsTexture() || !t.base || !GetHostFormatInfo(t.format).supported) return fallback.view;
+        // Every fall back to the black dummy texture is logged once per (reason, format, size),
+        // since a black building or shadow means a texture that never made it to the GPU.
+        auto fell = [&](const char* why) -> VkImageView {
+            static std::set<uint64_t> seen;
+            static int logged = 0;
+            uint64_t k = (uint64_t(t.format) << 40) ^ (uint64_t(t.width) << 20) ^ t.height ^ (uint64_t(t.dimension) << 56) ^
+                         (uint64_t(why[0]) << 48) ^ (uint64_t(why[1]) << 32);
+            if (logged < 80 && seen.insert(k).second) {
+                logged++;
+                std::fprintf(stderr, "[render] texture slot %u falls back to black (%s): type %u fmt %u %ux%u dim %u base %08x %s | %08x %08x %08x %08x %08x %08x\n",
+                             slot, why, t.type, t.format, t.width, t.height, t.dimension, t.base, t.tiled ? "tiled" : "linear",
+                             d[0], d[1], d[2], d[3], d[4], d[5]);
+            }
+            return fallback.view;
+        };
+        if (!t.IsTexture()) return fell("not a texture fetch");
+        if (!t.base) return fell("no base address");
+        if (!GetHostFormatInfo(t.format).supported) return fell("unsupported format");
         if (cube != (t.dimension == 3)) {
             // Shader and fetch constant disagree (e.g. a 3D / stacked texture sampled as 2D).
-            if (cube || t.dimension == 3) return fallback.view;
+            if (cube || t.dimension == 3) return fell("dimension mismatch");
         }
         uint64_t key = HashBytes(d, 4 * sizeof(uint32_t));  // bytes of dwords 0..3 (HashBytes counts bytes): type, signs, pitch, tiling, format, endian, base, size, swizzle, exp
         key ^= uint64_t(t.dimension) << 62;
@@ -1055,9 +1073,31 @@ struct VulkanRenderer::Impl {
         tex.guestBase = t.base;
         tex.guestSize = size;
         const uint8_t* src = mem.HostPtr(t.base, size);
+        std::vector<uint8_t> padded;
+        if (!src) {
+            // The padded tile footprint can run past the end of the allocation holding the
+            // texture: use what is mapped and zero fill the rest.
+            for (uint32_t part = size; part > 4096 && !src;) {
+                part = (part / 2) & ~4095u;
+                if (!part) break;
+                const uint8_t* q = mem.HostPtr(t.base, part);
+                if (q) {
+                    // Grow back toward the full size to find the largest mapped prefix.
+                    uint32_t lo = part, hi = size;
+                    while (hi - lo > 4096) {
+                        uint32_t mid = (lo + (hi - lo) / 2) & ~4095u;
+                        if (mid == lo) break;
+                        if (mem.HostPtr(t.base, mid)) lo = mid; else hi = mid;
+                    }
+                    padded.assign(size, 0);
+                    std::memcpy(padded.data(), mem.HostPtr(t.base, lo), lo);
+                    src = padded.data();
+                }
+            }
+        }
         if (!src) {
             tex.validatedGen = generation;
-            return tex.ok ? tex.image.view : fallback.view;
+            return tex.ok ? tex.image.view : fell("guest memory not mapped");
         }
         uint64_t h;
         {
@@ -1069,7 +1109,7 @@ struct VulkanRenderer::Impl {
         prof::Scope ps_(prof::kTexUpload);
 
         HostTexture ht;
-        if (!DecodeTextureHost(t, src, ht)) return fallback.view;
+        if (!DecodeTextureHost(t, src, ht)) return fell("decode failed");
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
                        tex.image.layers != ht.layers;
