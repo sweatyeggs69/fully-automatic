@@ -280,7 +280,7 @@ constexpr uint16_t kVkOthers[] = {
     xinput::kVkPadRThumbUp, xinput::kVkPadRThumbDown, xinput::kVkPadRThumbRight, xinput::kVkPadRThumbLeft,
 };
 constexpr int kNumVk = 14 + 10;
-constexpr int kStickThreshold = 20000, kTriggerThreshold = 30;
+constexpr int kStickThreshold = 24000, kStickRelease = 12000, kTriggerThreshold = 30;
 constexpr uint32_t kRepeatDelayMs = 400, kRepeatRateMs = 100;
 }  // namespace
 
@@ -295,14 +295,21 @@ void Input::generate_keystrokes(int user, Slot& s, uint32_t now) {
     for (int i = 0; i < 10; ++i) vks[14 + i] = kVkOthers[i];
     down[14] = g.left_trigger > kTriggerThreshold;
     down[15] = g.right_trigger > kTriggerThreshold;
-    down[16] = g.thumb_ly > kStickThreshold;
-    down[17] = g.thumb_ly < -kStickThreshold;
-    down[18] = g.thumb_lx > kStickThreshold;
-    down[19] = g.thumb_lx < -kStickThreshold;
-    down[20] = g.thumb_ry > kStickThreshold;
-    down[21] = g.thumb_ry < -kStickThreshold;
-    down[22] = g.thumb_rx > kStickThreshold;
-    down[23] = g.thumb_rx < -kStickThreshold;
+    // Hysteresis: a stick hovering around one threshold must not generate repeated
+    // release/press pairs (one push would move a menu two items).
+    auto stick = [&](int i, int value, bool negative) {
+        int v = negative ? -value : value;
+        bool was = (s.held_keys >> i) & 1;
+        down[i] = was ? v > kStickRelease : v > kStickThreshold;
+    };
+    stick(16, g.thumb_ly, false);
+    stick(17, g.thumb_ly, true);
+    stick(18, g.thumb_lx, false);
+    stick(19, g.thumb_lx, true);
+    stick(20, g.thumb_ry, false);
+    stick(21, g.thumb_ry, true);
+    stick(22, g.thumb_rx, false);
+    stick(23, g.thumb_rx, true);
     auto push = [&](int i, uint16_t flags) {
         if (s.keystrokes.size() >= 64) s.keystrokes.pop_front();
         s.keystrokes.push_back({vks[i], 0, flags, uint8_t(user), 0});
