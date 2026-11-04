@@ -1358,10 +1358,18 @@ struct VulkanRenderer::Impl {
     }
 
     // ---- textures ----------------------------------------------------------------------------
+    // The fetch constant's MIN_MIP_LEVEL is how the game streams a texture: levels sharper than it are
+    // not resident yet, so sampling must not go below it (FA_MIPCLAMP=0 disables). The image clamps
+    // minLod to its last decoded level, so a range past the decoded levels is safe.
+    static uint32_t mipClampMin(const TextureFetch& t) {
+        static const bool off = [] { const char* e = std::getenv("FA_MIPCLAMP"); return e && e[0] == '0'; }();
+        return (off || t.mipFilter == 2) ? 0u : uint32_t(t.mipMin & 15);
+    }
+
     VkSampler GetSampler(const TextureFetch& t) {
         uint64_t key = uint64_t(t.magFilter & 1) | (uint64_t(t.minFilter & 1) << 1) | (uint64_t(t.clamp[0]) << 2) |
                        (uint64_t(t.clamp[1]) << 5) | (uint64_t(t.clamp[2]) << 8) | (uint64_t(t.borderColor) << 11) |
-                       (uint64_t(t.mipFilter & 3) << 14);
+                       (uint64_t(t.mipFilter & 3) << 14) | (uint64_t(mipClampMin(t)) << 16);
         auto it = samplers.find(key);
         if (it != samplers.end()) return it->second;
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1374,6 +1382,7 @@ struct VulkanRenderer::Impl {
         si.addressModeV = AddressMode(t.clamp[1], mirrorClampEdge);
         si.addressModeW = AddressMode(t.clamp[2], mirrorClampEdge);
         si.borderColor = t.borderColor == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        si.minLod = float(mipClampMin(t));
         si.maxLod = t.mipFilter == 2 ? 0.0f : 16.0f;
         VkSampler s = VK_NULL_HANDLE;
         Check(vkCreateSampler(dev, &si, nullptr, &s), "vkCreateSampler");
@@ -1465,6 +1474,15 @@ struct VulkanRenderer::Impl {
         tex.validatedGen = generation;
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
+        {   // FA_TEXLOG=1: one line per upload, to see when the game's streaming changes each texture
+            static const bool texLog = [] { const char* e = std::getenv("FA_TEXLOG"); return e && e[0] == '1'; }();
+            static int texLogged = 0;
+            if (texLog && texLogged < 20000) {
+                texLogged++;
+                std::fprintf(stderr, "[texlog] frame %llu base %08x fmt %u %ux%u mipbase %08x mipmin %u mipmax %u %s\n", (unsigned long long)frame,
+                             t.base, t.format, t.width, t.height, t.mipBase, t.mipMin, t.mipMax, tex.ok ? "CHANGED" : "new");
+            }
+        }
 
         const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
@@ -2544,6 +2562,15 @@ struct VulkanRenderer::Impl {
         }
         Begin();
         generation++;
+        {   // Frames that take over 250 ms (e.g. the first-use texture burst) are always reported.
+            static uint64_t lastNs = 0, lastUploads = 0;
+            const uint64_t now = prof::NowNs();
+            if (lastNs && now - lastNs > 250000000ull)
+                std::fprintf(stderr, "[slowframe] frame %llu took %.0f ms, %llu texture uploads\n", (unsigned long long)frame,
+                             double(now - lastNs) / 1e6, (unsigned long long)(stats.textureUploads - lastUploads));
+            lastNs = now;
+            lastUploads = stats.textureUploads;
+        }
         if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
             std::fprintf(stderr, "[probe-frame] frame %llu final:", (unsigned long long)frame);
             for (size_t k = 0; k < probePts.size(); k++)
