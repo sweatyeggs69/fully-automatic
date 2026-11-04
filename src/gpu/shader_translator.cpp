@@ -192,6 +192,10 @@ private:
     int indent_ = 1;
     uint32_t prevVfetch_[3] = {0, 0, 0};
     bool haveVfetch_ = false;
+    // Vertex fetch extent analysis (see TranslatedShader::vfetchExtent).
+    bool r0Written_ = false;
+    uint32_t vfStride_[96] = {}, vfEnd_[96] = {};
+    uint32_t vfUnbounded_[3] = {0, 0, 0};
 };
 
 void Translator::WriteFetchResult(uint32_t dst, bool dstRel, uint32_t dstSwz, const std::string& value) {
@@ -206,6 +210,7 @@ void Translator::WriteFetchResult(uint32_t dst, bool dstRel, uint32_t dstSwz, co
         else src += s == 5 ? "1.0" : "0.0";
     }
     if (mask.empty()) return;
+    if (dst == 0 || dstRel) r0Written_ = true;
     Line("{");
     indent_++;
     Line("vec4 xe_f = " + value + ";");
@@ -241,7 +246,14 @@ void Translator::EmitVfetch(const uint32_t* w) {
     int offset = SB(w2, 8, 23);
     bool pred = B(w1, 31, 1), predCond = B(w2, 31, 1);
 
-    if (slot < 96) out_.vfetchUsed[slot / 32] |= 1u << (slot % 32);
+    if (slot < 96) {
+        out_.vfetchUsed[slot / 32] |= 1u << (slot % 32);
+        // Extent is only known when the index is the untouched vertex index in r0.x and the
+        // stride is explicit and the offset non-negative.
+        if (src != 0 || srcRel || srcComp != 0 || stride == 0 || offset < 0) vfUnbounded_[slot / 32] |= 1u << (slot % 32);
+        vfStride_[slot] = std::max(vfStride_[slot], stride);
+        vfEnd_[slot] = std::max<uint32_t>(vfEnd_[slot], uint32_t(std::max(offset, 0)) + 4);
+    }
     char dis[160];
     std::snprintf(dis, sizeof dis, "  vfetch%s r%u, r%u.%c, vf%u fmt=%u stride=%u off=%d %s%s", mini ? "_mini" : "",
                   dst, src, kComp[srcComp], slot, fmt, stride, offset, isSigned ? "signed " : "", isInt ? "int" : "norm");
@@ -579,8 +591,8 @@ void Translator::EmitAlu(const uint32_t* w) {
         else Line(lhs + "." + m + " = (" + vec4expr + ")." + m + ";");
     };
     if (!exp) {
-        if (vecMask) assign(TempRef(a.vdst(), a.vdstRel()), vecMask, "xe_v");
-        if (scaMask) assign(TempRef(a.sdst(), a.sdstRel()), scaMask, "vec4(xe_r)");
+        if (vecMask) { if (a.vdst() == 0 || a.vdstRel()) r0Written_ = true; assign(TempRef(a.vdst(), a.vdstRel()), vecMask, "xe_v"); }
+        if (scaMask) { if (a.sdst() == 0 || a.sdstRel()) r0Written_ = true; assign(TempRef(a.sdst(), a.sdstRel()), scaMask, "vec4(xe_r)"); }
     } else {
         uint32_t d = a.vdst();
         std::string lhs;
@@ -898,6 +910,12 @@ void Translator::Run() {
         g += "}\n";
     }
     out_.glsl = std::move(g);
+    for (uint32_t i = 0; i < 96; i++) {
+        if (!(out_.vfetchUsed[i / 32] & (1u << (i % 32)))) continue;
+        bool bounded = !r0Written_ && !(vfUnbounded_[i / 32] & (1u << (i % 32)));
+        out_.vfetchStride[i] = bounded ? vfStride_[i] : 0;  // 0 = extent unknown, upload the whole buffer
+        out_.vfetchEnd[i] = vfEnd_[i];
+    }
     out_.ok = true;
 }
 
