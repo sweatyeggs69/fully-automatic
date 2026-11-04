@@ -248,9 +248,9 @@ void Translator::EmitVfetch(const uint32_t* w) {
 
     if (slot < 96) {
         out_.vfetchUsed[slot / 32] |= 1u << (slot % 32);
-        // Extent is only known when the index is the untouched vertex index in r0.x and the
+        // Extent is only known when the index is the vertex index in r0.x (r0 not written before this fetch) and the
         // stride is explicit and the offset non-negative.
-        if (src != 0 || srcRel || srcComp != 0 || stride == 0 || offset < 0) vfUnbounded_[slot / 32] |= 1u << (slot % 32);
+        if (src != 0 || srcRel || srcComp != 0 || stride == 0 || offset < 0 || r0Written_) vfUnbounded_[slot / 32] |= 1u << (slot % 32);
         vfStride_[slot] = std::max(vfStride_[slot], stride);
         vfEnd_[slot] = std::max<uint32_t>(vfEnd_[slot], uint32_t(std::max(offset, 0)) + 4);
     }
@@ -912,7 +912,7 @@ void Translator::Run() {
     out_.glsl = std::move(g);
     for (uint32_t i = 0; i < 96; i++) {
         if (!(out_.vfetchUsed[i / 32] & (1u << (i % 32)))) continue;
-        bool bounded = !r0Written_ && !(vfUnbounded_[i / 32] & (1u << (i % 32)));
+        bool bounded = !(vfUnbounded_[i / 32] & (1u << (i % 32)));
         out_.vfetchStride[i] = bounded ? vfStride_[i] : 0;  // 0 = extent unknown, upload the whole buffer
         out_.vfetchEnd[i] = vfEnd_[i];
     }

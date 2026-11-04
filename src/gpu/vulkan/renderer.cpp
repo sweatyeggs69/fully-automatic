@@ -1395,6 +1395,16 @@ struct VulkanRenderer::Impl {
                 uint64_t need = uint64_t(maxIdx) * vs->info.vfetchStride[s] + vs->info.vfetchEnd[s];
                 words = uint32_t(std::min<uint64_t>(words, need));
             }
+            if (prof::g_enabled) {
+                static int logged = 0;
+                static uint64_t seen = 0;
+                if (logged < 60 && seen++ % 700 == 0) {
+                    logged++;
+                    std::fprintf(stderr, "[vbprof] vs %016llx slot %u: fetch words %u, copy %u, stride %u end %u, indices %zu max %d\n",
+                                 (unsigned long long)dc.vsHash, s, vf.sizeWords, words, vs->info.vfetchStride[s],
+                                 vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
+                }
+            }
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
             VkDeviceSize at;
