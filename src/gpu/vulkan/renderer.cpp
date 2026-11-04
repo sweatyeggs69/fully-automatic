@@ -1315,8 +1315,20 @@ struct VulkanRenderer::Impl {
         if (tex.ok && h == tex.contentHash) return tex.image.view;
         prof::Scope ps_(prof::kTexUpload);
 
+        const uint64_t upT0 = prof::g_enabled ? prof::NowNs() : 0;
         HostTexture ht;
         if (!DecodeTextureHost(t, src, ht)) return fallback.view;
+        if (prof::g_enabled) {
+            static uint64_t n = 0;
+            static uint64_t decNs[64] = {};
+            // Aggregate decode time per texture format and report every 400 uploads.
+            decNs[t.format & 63] += prof::NowNs() - upT0;
+            if (++n % 400 == 0) {
+                std::fprintf(stderr, "[texup] decode ms by format over 400 uploads:");
+                for (int f = 0; f < 64; f++) if (decNs[f]) { std::fprintf(stderr, " fmt%d=%.1f", f, double(decNs[f]) / 1e6); decNs[f] = 0; }
+                std::fprintf(stderr, " | last: fmt %u %ux%u float %d tiled %d\n", t.format, t.width, t.height, ht.isFloat ? 1 : 0, t.tiled ? 1 : 0);
+            }
+        }
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
                        tex.image.layers != ht.layers;
