@@ -1444,15 +1444,17 @@ struct VulkanRenderer::Impl {
                      regs[xe::RB_COLORCONTROL], regs[xe::RB_DEPTHCONTROL]);
         for (uint32_t i = 256; i < 260; i++) std::fprintf(stderr, " (%g %g %g %g)", c(i, 0), c(i, 1), c(i, 2), c(i, 3));
         std::fprintf(stderr, " | vs c255 (%g %g %g %g)\n", c(255, 0), c(255, 1), c(255, 2), c(255, 3));
-        // Non-zero vertex shader constants c0..c31 (colours and fades often live here).
-        std::fprintf(stderr, "[render]   vs consts:");
-        for (uint32_t i = 0; i < 32; i++) {
-            if (!regs[pm4::kAluConstBase + i * 4] && !regs[pm4::kAluConstBase + i * 4 + 1] &&
-                !regs[pm4::kAluConstBase + i * 4 + 2] && !regs[pm4::kAluConstBase + i * 4 + 3])
-                continue;
-            std::fprintf(stderr, " c%u(%g %g %g %g)", i, c(i, 0), c(i, 1), c(i, 2), c(i, 3));
+        // Non-zero constants c0..c31 of each stage (colours, fades, colour matrices live here).
+        for (uint32_t base : {0u, 256u}) {
+            std::fprintf(stderr, "[render]   %s consts:", base ? "ps" : "vs");
+            for (uint32_t i = base; i < base + 32; i++) {
+                if (!regs[pm4::kAluConstBase + i * 4] && !regs[pm4::kAluConstBase + i * 4 + 1] &&
+                    !regs[pm4::kAluConstBase + i * 4 + 2] && !regs[pm4::kAluConstBase + i * 4 + 3])
+                    continue;
+                std::fprintf(stderr, " c%u(%g %g %g %g)", i - base, c(i, 0), c(i, 1), c(i, 2), c(i, 3));
+            }
+            std::fprintf(stderr, "\n");
         }
-        std::fprintf(stderr, "\n");
         std::fprintf(stderr, "[render]   vport scale %g %g %g offset %g %g %g ndc scale %g %g offset %g %g flags %x %x %x\n",
                      sys.vportScale[0], sys.vportScale[1], sys.vportScale[2], sys.vportOffset[0], sys.vportOffset[1],
                      sys.vportOffset[2], sys.ndcScale[0], sys.ndcScale[1], sys.ndcOffset[0], sys.ndcOffset[1], sys.flags[0],
