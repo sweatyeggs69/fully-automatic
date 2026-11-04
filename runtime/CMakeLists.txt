@@ -21,7 +21,7 @@ set(THIRDPARTY_ROOT ${FA_XENONRECOMP}/thirdparty)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
 
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
-    src/memory.cpp src/kernel.cpp src/crash.cpp src/kernel/*.cpp
+    src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 # The GPU command processor lives in the top-level src/gpu.
 list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp)
@@ -49,6 +49,9 @@ add_test(NAME hle_import_test COMMAND hle_import_test)
 add_executable(nt_file_test tests/nt_file_test.cpp)
 target_link_libraries(nt_file_test fa_rt_fake)
 add_test(NAME nt_file_test COMMAND nt_file_test)
+add_executable(timebase_test tests/timebase_test.cpp)
+target_link_libraries(timebase_test fa_rt_fake)
+add_test(NAME timebase_test COMMAND timebase_test)
 
 # ---- the game, once XenonRecomp output exists --------------------------------------------------
 if(EXISTS ${FA_PPC_DIR}/ppc_config.h)

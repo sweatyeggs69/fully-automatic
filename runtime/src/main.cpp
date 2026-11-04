@@ -6,6 +6,7 @@
 #include "fa/rt/crash.hpp"
 #include "fa/rt/loader.hpp"
 #include "fa/rt/memory.hpp"
+#include "fa/rt/timebase.hpp"
 #include "fa/xdvdfs.hpp"
 
 #include <cstdio>
@@ -72,6 +73,8 @@ int main(int argc, char** argv) {
     LoadedImage img;
     if (!load_xex(xex, img)) return 1;
     g_kernel.set_tls_info(img.tls);
+    // mftb must tick at 50 MHz, not at the host TSC rate (FA_TIMEBASE=off to compare).
+    install_guest_timebase();
     std::fprintf(stderr, "entering 0x%08X (stack 0x%X)\n", img.entry, img.stack_size);
     uint32_t rc = g_kernel.run_main_thread(img.entry, img.stack_size);
     std::fprintf(stderr, "guest main returned 0x%08X\n", rc);
