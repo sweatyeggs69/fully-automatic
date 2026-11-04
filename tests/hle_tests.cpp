@@ -371,7 +371,7 @@ static void test_xma_hardware(const char* sample) {
     std::vector<int16_t> got;
     for (int iter = 0; iter < 200000; ++iter) {
         // Kick through the register page, as inline XDK code would.
-        uint32_t kick = __builtin_bswap32(1u);
+        uint32_t kick = 1u;  // little-endian register value, as the game's byte-reversed store leaves it
         std::memcpy(g.base + XmaDecoder::kRegisterBase + XmaDecoder::kRegKick, &kick, 4);
         xma.work_once();
         d.load(g.base + ctx);
