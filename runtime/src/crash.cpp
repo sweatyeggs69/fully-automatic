@@ -6,7 +6,9 @@
 #include "fa/rt/guest.hpp"
 #include "fa/rt/kernel.hpp"
 
+#include <dirent.h>
 #include <execinfo.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <ucontext.h>
@@ -111,7 +113,45 @@ static void handler(int sig, siginfo_t* info, void* uc) {
     _exit(128 + sig);
 }
 
+// ---- stack sampler (debug aid): FA_DUMP_AFTER=<seconds> ----------------------------------------
+// After the delay, every thread is sent SIGUSR2 three times (1 s apart) and prints where it is,
+// which shows what a stuck thread is executing.
+static void sample_handler(int) {
+    char buf[64];
+    int n = std::snprintf(buf, sizeof buf, "\n[sample] thread %ld\n", (long)::syscall(SYS_gettid));
+    ssize_t r = ::write(2, buf, n); (void)r;
+    void* frames[24];
+    int nf = backtrace(frames, 24);
+    backtrace_symbols_fd(frames + 1, nf - 1, 2);
+    dump_guest_context_short();
+}
+
+static void install_sampler() {
+    const char* e = std::getenv("FA_DUMP_AFTER");
+    if (!e) return;
+    int secs = std::atoi(e);
+    struct sigaction sa{};
+    sa.sa_handler = sample_handler;
+    sa.sa_flags = SA_ONSTACK | SA_RESTART;
+    sigaction(SIGUSR2, &sa, nullptr);
+    std::thread([secs] {
+        std::this_thread::sleep_for(std::chrono::seconds(secs));
+        for (int round = 0; round < 3; round++) {
+            if (DIR* d = opendir("/proc/self/task")) {
+                while (dirent* de = readdir(d)) {
+                    long tid = std::atol(de->d_name);
+                    if (tid > 0 && tid != ::syscall(SYS_gettid))
+                        ::syscall(SYS_tgkill, ::getpid(), tid, SIGUSR2);
+                }
+                closedir(d);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }).detach();
+}
+
 void install_crash_handler() {
+    install_sampler();
     static char altstack[1 << 16];
     stack_t ss{};
     ss.ss_sp = altstack;
