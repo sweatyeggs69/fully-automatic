@@ -497,6 +497,19 @@ struct VulkanRenderer::Impl {
     // A resolve of an 8888 target to guest memory also copies the pixels into an image of its own. A
     // texture fetch that reads exactly that surface samples the image instead of hashing, decoding and
     // uploading the guest bytes again (FA_RESOLVE_GPU=0 turns this off).
+    // Guest texture format classes a snapshot can stand in for: 8888, 2_10_10_10, 32_FLOAT, 16_16_FLOAT (all 4 bytes per texel).
+    static int SnapClass(uint32_t f) {
+        return (f == 6 || f == 14 || f == 50) ? 1 : (f == 7 || f == 54) ? 2 : f == 36 ? 3 : f == 31 ? 4 : 0;
+    }
+    // Host render target formats whose resolve to guest format `f` can be kept as a snapshot (ResolveRaw converts on writeback).
+    static bool SnapResolvable(VkFormat src, uint32_t f) {
+        switch (SnapClass(f)) {
+            case 1: case 2: return src == VK_FORMAT_R8G8B8A8_UNORM || src == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            case 3: return src == VK_FORMAT_R32_SFLOAT;
+            case 4: return src == VK_FORMAT_R16G16_SFLOAT;
+        }
+        return false;
+    }
     struct Snap {
         Image img;
         std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
@@ -663,10 +676,9 @@ struct VulkanRenderer::Impl {
         if (it == snaps.end()) return VK_NULL_HANDLE;
         if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, 0, 0, 0); return VK_NULL_HANDLE; }
         Snap& e = it->second;
-        const bool fmt8888 = e.img.format == VK_FORMAT_R8G8B8A8_UNORM && (t.format == 6 || t.format == 14 || t.format == 50);
-        const bool fmt1010 = e.img.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (t.format == 7 || t.format == 54);
+        const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
         auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
-        if (!t.tiled || t.dimension != 1 || !(fmt8888 || fmt1010)) return rej("tile/dim/fmt");
+        if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
         if (t.endian != e.endian || t.expAdjust != 0) return rej("endian/exp");
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
         if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
@@ -2323,9 +2335,8 @@ struct VulkanRenderer::Impl {
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
             } else {
                 // Snapshot-able 8888 surface from the top-left corner: keep it on the GPU, write guest memory later.
-                if (snapEnabled && !isDepth && d.expBias == 0 &&
-                    ((src->image.format == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50)) ||
-                     (src->image.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54))) &&
+                if (snapEnabled && !isDepth && d.expBias == 0 && SnapResolvable(src->image.format, d.format) &&
+                    (SnapClass(d.format) <= 2 || !d.swapRB) &&
                     d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
@@ -2434,8 +2445,10 @@ struct VulkanRenderer::Impl {
     bool ResolveRaw(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                     const uint8_t* rb, uint32_t destBytes) {
         if (isDepth || d.expBias != 0) return false;
-        const bool is8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50);
-        const bool is1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54);
+        const bool src8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM, src1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        const bool is8888 = (src8888 || src1010) && (d.format == 6 || d.format == 14 || d.format == 50);  // is8888/is1010: the guest format
+        const bool is1010 = (src8888 || src1010) && (d.format == 7 || d.format == 54);
+        const bool convert = (is8888 && src1010) || (is1010 && src8888);  // 10-bit <-> 8-bit conversion on the way out
         const bool isFloat = (srcFmt == VK_FORMAT_R16G16_SFLOAT && d.format == 31) ||
                              (srcFmt == VK_FORMAT_R16G16B16A16_SFLOAT && d.format == 32) ||
                              (srcFmt == VK_FORMAT_R32_SFLOAT && d.format == 36) ||
@@ -2468,6 +2481,15 @@ struct VulkanRenderer::Impl {
                 if (bpp == 4) {
                     uint32_t v;
                     std::memcpy(&v, row + x * 4, 4);
+                    if (convert) {
+                        if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
+                            v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
+                                (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
+                        } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
+                            v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
+                                (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
+                        }
+                    }
                     if (d.swapRB) {
                         if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
                         else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
