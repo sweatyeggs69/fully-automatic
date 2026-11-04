@@ -11,6 +11,7 @@
 #include <thread>
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -448,6 +449,12 @@ struct VulkanRenderer::Impl {
     // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
     const char* dumpDir = nullptr;
     bool dbgNoAtest = false, dbgNoBlend = false;
+    // FA_RENDER_PROBE=frame,x,y[,x,y...]: in that frame, after every draw, read back those screen pixels and log
+    // the draws that changed it, with their full trace ("who painted this pixel").
+    bool probeOn = false;
+    uint64_t probeFrame = 0;
+    std::vector<std::pair<int, int>> probePts;
+    std::map<uint64_t, std::array<float, 4>> probeLast;
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
     bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount)); }
 
@@ -456,6 +463,17 @@ struct VulkanRenderer::Impl {
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
         // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
+        if (const char* c = std::getenv("FA_RENDER_PROBE")) {
+            char* e = nullptr;
+            probeFrame = std::strtoull(c, &e, 10);
+            while (e && *e == ',') {
+                long x = std::strtol(e + 1, &e, 10);
+                if (!e || *e != ',') break;
+                long y = std::strtol(e + 1, &e, 10);
+                probePts.push_back({int(x), int(y)});
+            }
+            probeOn = !probePts.empty();
+        }
         if (const char* c = std::getenv("FA_DBG_RENDER")) {
             dbgNoAtest = std::strstr(c, "noatest") != nullptr;
             dbgNoBlend = std::strstr(c, "noblend") != nullptr;
@@ -1464,6 +1482,50 @@ struct VulkanRenderer::Impl {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
         }
+        if (probeOn && frame == probeFrame) {
+            RenderTarget* rt = nullptr;
+            for (int i = 0; i < 4 && !rt; i++) rt = curColor[i];
+            for (auto [px, py] : probePts) {
+                const int tx = px + int(wox), ty = py + int(woy);
+                if (!rt || tx < scissor.offset.x || ty < scissor.offset.y || tx >= scissor.offset.x + int(scissor.extent.width) ||
+                    ty >= scissor.offset.y + int(scissor.extent.height) || tx >= int(rt->image.w) || ty >= int(rt->image.h))
+                    continue;
+                float f[4];
+                ProbePixel(rt, tx, ty, f);
+                auto& last = probeLast[(uint64_t(uint32_t(ty)) << 32) | uint32_t(tx)];
+                if (std::memcmp(last.data(), f, sizeof f)) {
+                    std::memcpy(last.data(), f, sizeof f);
+                    std::fprintf(stderr, "[probe] frame %llu draw %llu pixel(%d,%d) tile-y %d -> %.3f %.3f %.3f %.3f | prim %u idx %zu vs %016llx ps %016llx blend %08x\n",
+                                 (unsigned long long)frame, (unsigned long long)stats.draws.load(), px, py, ty, f[0], f[1], f[2], f[3],
+                                 uint32_t(hd.prim), hd.indices.size(), (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash,
+                                 regs[xe::RB_BLENDCONTROL0]);
+                    TraceInputs(regs, vs, ps, sys);
+                }
+            }
+        }
+    }
+
+    void ProbePixel(RenderTarget* rt, int x, int y, float out[4]) {
+        uint32_t bpp = VkFormatBytes(rt->image.format);
+        EndRendering();
+        if (bpp > readback.size) {
+            SubmitAndWait();
+            Begin();
+            DestroyBuffer(readback);
+            CreateBuffer(readback, 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        }
+        Barrier();
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        bic.imageOffset = {x, y, 0};
+        bic.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(cmd, rt->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+        Barrier();
+        SubmitAndWait();
+        Begin();
+        ReadbackToFloat(rt->image.format, static_cast<const uint8_t*>(readback.map), out);
+        for (auto& c : curColor) c = nullptr;
+        curDepth = nullptr;
     }
 
     // Dump frames: the colour target right after a draw (scissor rectangle), as a PNG.
