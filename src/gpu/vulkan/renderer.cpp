@@ -1336,7 +1336,37 @@ struct VulkanRenderer::Impl {
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
+            if (DumpFrame()) TraceInputs(regs, vs, ps, sys);
         }
+    }
+
+    // Dump frames: what the draw reads (textures, vertex buffers, a few vertices).
+    void TraceInputs(const RegisterFile& regs, Shader* vs, Shader* ps, const XeSystemConstants& sys) {
+        uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
+        for (uint32_t s = 0; s < 32; s++) {
+            if (!(texUsed & (1u << s))) continue;
+            uint32_t d[6];
+            for (int k = 0; k < 6; k++) d[k] = regs[pm4::kFetchConstBase + s * 6 + k];
+            TextureFetch t = ParseTextureFetch(d);
+            std::fprintf(stderr,
+                         "[render]   tex %u: type %u fmt %u %ux%u depth %u dim %u base %08x pitch %u %s endian %u swz %03x "
+                         "clamp %u,%u filter %u/%u | %08x %08x %08x %08x %08x %08x\n",
+                         s, t.type, t.format, t.width, t.height, t.depth, t.dimension, t.base, t.pitch,
+                         t.tiled ? "tiled" : "linear", t.endian, t.swizzle, t.clamp[0], t.clamp[1], t.magFilter, t.minFilter,
+                         d[0], d[1], d[2], d[3], d[4], d[5]);
+        }
+        for (uint32_t s = 0; s < 96; s++) {
+            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32)))) continue;
+            xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
+            std::fprintf(stderr, "[render]   vf %u: type %u addr %08x words %u endian %u | first words:", s, vf.type, vf.address,
+                         vf.sizeWords, vf.endian);
+            for (uint32_t i = 0; i < std::min<uint32_t>(vf.sizeWords, 24); i++) std::fprintf(stderr, " %08x", mem.Read32(vf.address + i * 4));
+            std::fprintf(stderr, "\n");
+        }
+        std::fprintf(stderr, "[render]   vport scale %g %g %g offset %g %g %g ndc scale %g %g offset %g %g flags %x %x %x\n",
+                     sys.vportScale[0], sys.vportScale[1], sys.vportScale[2], sys.vportOffset[0], sys.vportOffset[1],
+                     sys.vportOffset[2], sys.ndcScale[0], sys.ndcScale[1], sys.ndcOffset[0], sys.ndcOffset[1], sys.flags[0],
+                     sys.flags[1], sys.flags[2]);
     }
 
     void RecoverConsts(const uint32_t* consts, VkDeviceSize& constsOff, VkDeviceSize& boolOff, const RegisterFile& regs,
