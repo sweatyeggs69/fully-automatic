@@ -234,6 +234,37 @@ static void test_downmix() {
     CHECK(std::fabs(out[1] - (-0.25f + 0.70710678f * 0.5f)) < 1e-5f);
 }
 
+// FA_AUDIO_DUMP path: submitted frames land in a valid float WAV and in the stats.
+static void test_audio_dump(const std::string& work) {
+    std::string path = work + "/dump_test.wav";
+    {
+        AudioSystem audio;
+        audio.init(GuestHooks{}, /*disable_output=*/true);
+        CHECK(audio.start_dump(path));
+        // One frame: FL = 0.5 on every sample, everything else silent (big-endian floats).
+        std::vector<uint8_t> be(6 * 256 * 4, 0);
+        for (int i = 0; i < 256; ++i) { be[4 * i] = 0x3F; }  // 0x3F000000 = 0.5f
+        std::vector<uint8_t> zero(be.size(), 0);
+        for (int k = 0; k < 200; ++k) audio.submit_frame_host(0, k == 199 ? zero.data() : be.data());
+        auto st = audio.take_stats();
+        CHECK(st.frames == 200);
+        CHECK(st.silent_frames == 1);
+        CHECK(std::fabs(st.peak - 0.5f) < 1e-6f);
+        audio.shutdown();
+    }
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), {});
+    CHECK(d.size() == 44 + 200 * 256 * 2 * 4);
+    if (d.size() < 52) return;
+    CHECK(!std::memcmp(d.data(), "RIFF", 4) && !std::memcmp(d.data() + 8, "WAVE", 4));
+    uint32_t data_len = d[40] | d[41] << 8 | d[42] << 16 | uint32_t(d[43]) << 24;
+    CHECK(data_len == 200 * 256 * 2 * 4);
+    float l, r;
+    std::memcpy(&l, &d[44], 4);
+    std::memcpy(&r, &d[48], 4);
+    CHECK(l == 0.5f && r == 0.0f);
+}
+
 // Simple bump allocator over a 4 GiB guest space.
 struct FakeGuest {
     uint8_t* base = nullptr;
@@ -378,6 +409,7 @@ int main(int argc, char** argv) {
     test_input();
     test_context_packing();
     test_downmix();
+    test_audio_dump(argv[2]);
     if (const char* s = std::getenv("FA_XMA_SAMPLE")) test_xma_hardware(s);
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
