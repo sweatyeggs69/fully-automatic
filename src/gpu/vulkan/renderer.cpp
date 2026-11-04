@@ -356,6 +356,7 @@ struct Texture {
     Image image;
     uint64_t contentHash = 0;
     uint64_t validatedGen = ~0ull;
+    uint64_t lastUseGen = 0;  // last frame that sampled it (cache eviction)
     uint32_t guestBase = 0, guestSize = 0;
     bool ok = false;
 };
@@ -1365,6 +1366,7 @@ struct VulkanRenderer::Impl {
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
         Texture& tex = textures[key];
+        tex.lastUseGen = generation;
         uint32_t size = HostTextureByteSize(t);
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
@@ -2446,6 +2448,46 @@ struct VulkanRenderer::Impl {
         curDepth = nullptr;
     }
 
+    // The texture cache is keyed by fetch constant and never shrank: every texture a level streamed
+    // in stayed on the GPU. On AMD that spills into system RAM and can freeze the machine, so keep
+    // the host-side total under a budget (FA_TEX_BUDGET_MB, default 1024) by dropping the least
+    // recently used textures that were not sampled this or the previous frame.
+    static uint64_t ImageBytes(const Image& im) {
+        uint64_t px = 0;
+        for (uint32_t m = 0; m < im.levels; m++) px += uint64_t(std::max(1u, im.w >> m)) * std::max(1u, im.h >> m);
+        return px * im.layers * (im.format == VK_FORMAT_R8G8B8A8_UNORM ? 4 : im.format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16);
+    }
+    void TrimTextures() {
+        static const uint64_t budget = [] {
+            const char* e = std::getenv("FA_TEX_BUDGET_MB");
+            return (e && *e ? std::strtoull(e, nullptr, 10) : 1024ull) << 20;
+        }();
+        uint64_t total = 0;
+        for (auto& [k, t] : textures) if (t.ok) total += ImageBytes(t.image);
+        if (total <= budget) return;
+        std::vector<std::pair<uint64_t, uint64_t>> order;  // (lastUseGen, key)
+        for (auto& [k, t] : textures)
+            if (t.lastUseGen + 2 <= generation) order.emplace_back(t.lastUseGen, k);
+        std::sort(order.begin(), order.end());
+        const uint64_t target = budget / 4 * 3;
+        size_t dropped = 0;
+        for (auto& [g, k] : order) {
+            if (total <= target) break;
+            auto it = textures.find(k);
+            if (it == textures.end()) continue;
+            if (it->second.ok) {
+                total -= ImageBytes(it->second.image);
+                garbageImages.push_back(it->second.image);
+            }
+            textures.erase(it);
+            dropped++;
+        }
+        static int logged = 0;
+        if (logged++ < 20)
+            std::fprintf(stderr, "[render] texture cache over budget: dropped %zu textures, %llu MB left\n", dropped,
+                         (unsigned long long)(total >> 20));
+    }
+
     void Swap() {
         FlushPending(prof::kFlushSwap);
         {
@@ -2454,6 +2496,7 @@ struct VulkanRenderer::Impl {
         }
         Begin();
         generation++;
+        TrimTextures();
         if (probeOn && frame >= probeFrame && frame <= probeFrameEnd) {
             std::fprintf(stderr, "[probe-frame] frame %llu final:", (unsigned long long)frame);
             for (size_t k = 0; k < probePts.size(); k++)
