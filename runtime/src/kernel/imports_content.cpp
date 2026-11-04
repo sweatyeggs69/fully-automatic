@@ -10,7 +10,9 @@
 #include "fa/hle/services.hpp"
 #include "fa/hle/vfs.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -308,12 +310,33 @@ FA_IMPORT(XamContentGetCreator) {
 }
 
 // (user_index, content_type, content_flags, min_free_bytes (u64), device_id*, overlapped*)
-// Auto-selects the single virtual device instead of showing UI.
+// Auto-selects the single virtual device instead of showing UI. Like the real call it returns
+// ERROR_IO_PENDING with the overlapped marked pending, and finishes it a moment later from a host
+// thread (FA_DEVICE_SELECT_DELAY_MS, default 200; 0 completes before returning).
 FA_IMPORT(XamShowDeviceSelectorUI) {
     uint32_t out = arg32(ctx, 4), ov = arg32(ctx, 5);
     if (!out) { ret32(ctx, kErrorInvalidParameter); return; }
-    st32(out, kDeviceId);
-    finish(ov, 0, ctx);
+    if (!ov) { st32(out, kDeviceId); ret32(ctx, 0); return; }
+    static const long delay_ms = [] {
+        const char* e = std::getenv("FA_DEVICE_SELECT_DELAY_MS");
+        return e ? std::atol(e) : 200L;
+    }();
+    if (delay_ms <= 0) {
+        st32(out, kDeviceId);
+        complete_overlapped(ov, 0);
+        ret32(ctx, kErrorIoPending);
+        return;
+    }
+    st32(ov + 0x00, kErrorIoPending);  // pending until the thread below finishes it
+    st32(ov + 0x04, 0);
+    st32(ov + 0x18, 0);
+    std::thread([out, ov] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        st32(out, kDeviceId);
+        complete_overlapped(ov, 0);
+        std::fprintf(stderr, "Content: device selector finished (device %u)\n", kDeviceId);
+    }).detach();
+    ret32(ctx, kErrorIoPending);
 }
 
 // ---- wide printf --------------------------------------------------------------------
