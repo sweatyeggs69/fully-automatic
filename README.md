@@ -46,7 +46,14 @@ Apply the patch before recompiling:
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-diag.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-overlap.patch
     git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-mulhd-fix.patch
+    git -C third_party/XenonRecomp apply ../../patches/xenonrecomp-keep-entries.patch
     cmake --build third_party/XenonRecomp/out --target XenonRecomp
+
+`xenonrecomp-keep-entries.patch` stops the jump table merge from deleting real function entries
+(called, in `.pdata`, or referenced as code pointers) that it swallows, adds functions that are only
+reached through pointers (vtables, callbacks), and allows `size = 0` in the `functions` list of
+`config/fullauto.toml`. XenonRecomp prints how many it added and kept. An indirect call that still
+finds no entry crashes in the runtime: add that address to `functions` and recompile.
 
 ## Check that the generated C++ compiles (slow, needs clang)
     cmake -S tools/recomp-build -B tools/recomp-build/out -G Ninja -DCMAKE_CXX_COMPILER=clang++

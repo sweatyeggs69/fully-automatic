@@ -37,6 +37,10 @@ PPC_EXTERN_FUNC(XMAGetOutputBufferWriteOffset);
 PPC_EXTERN_FUNC(XMASetLoopData);
 PPC_EXTERN_FUNC(XMAEnableContext);
 PPC_EXTERN_FUNC(XMADisableContext);
+PPC_EXTERN_FUNC(XMsgStartIORequest);
+PPC_EXTERN_FUNC(XMsgStartIORequestEx);
+PPC_EXTERN_FUNC(XamGetSystemVersion);
+PPC_EXTERN_FUNC(NtCreateEvent);
 
 static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
@@ -123,6 +127,26 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
     CHECK(K(ctx, XMAEnableContext, c) == 0);
     CHECK(K(ctx, XMADisableContext, c, 1) == 0);
     CHECK(K(ctx, XMAReleaseContext, c) == 0);
+
+    // ---- XMsg: synchronous music player query, then an overlapped one that signals an event.
+    CHECK(K(ctx, XamGetSystemVersion) == 0);
+    uint32_t args = s + 0x200, state = s + 0x220, ov = s + 0x240;
+    st32(args, 2);
+    st32(args + 4, state);
+    st32(state, 0xFFFFFFFF);
+    CHECK(K(ctx, XMsgStartIORequest, 0xFA, 0x00070009, 0, args, 8) == 0);  // XMPGetStatus
+    CHECK(ld32(state) == 0);
+    CHECK(K(ctx, NtCreateEvent, s + 0x260, 0, 0, 0) == 0);
+    uint32_t ev = ld32(s + 0x260);
+    for (int i = 0; i < 7; ++i) st32(ov + i * 4, 0);
+    st32(ov + 0x0C, ev);
+    CHECK(K(ctx, XMsgStartIORequestEx, 0xFB, 0x000B0006, ov, args, 8, 0) == 997);  // XUserSetContext
+    CHECK(ld32(ov) == 0);
+    {
+        auto e = g_kernel.get_handle(ev);
+        CHECK(e && static_cast<KEvent&>(*e).set);
+    }
+    CHECK(K(ctx, XMsgStartIORequest, 0x42, 1, 0, 0, 0) == 0x80070057);  // unknown app
     ctx.r3.u64 = g_fail;
 }
 

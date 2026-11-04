@@ -26,3 +26,10 @@ restvmx_64_address = 0x8257DA8C
 savevmx_64_address = 0x8257D7F4
 
 # TODO: setjmp_address / longjmp_address (only if the game uses them)
+
+# Function entries XenonAnalyse misses. size = 0 lets XenonRecomp find the size itself
+# (needs patches/xenonrecomp-keep-entries.patch). The patch also finds most of these on its
+# own from code pointers; list one here when the runtime reports an indirect call with no entry.
+functions = [
+    { address = 0x8227AE10, size = 0 },  # called through a pointer from sub_8227ACC0's caller
+]
