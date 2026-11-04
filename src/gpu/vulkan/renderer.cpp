@@ -48,6 +48,20 @@ const char* VkErr(VkResult r) {
 uint64_t HashBytes(const void* data, size_t n, uint64_t h = 0xCBF29CE484222325ull) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t i = 0;
+    if (n >= 64) {
+        // Four independent lanes so the multiplies overlap (texture checks hash megabytes per frame).
+        uint64_t l[4] = {h, h ^ 0x9E3779B97F4A7C15ull, h ^ 0xC2B2AE3D27D4EB4Full, h ^ 0x165667B19E3779F9ull};
+        for (; i + 32 <= n; i += 32) {
+            for (int k = 0; k < 4; k++) {
+                uint64_t v;
+                std::memcpy(&v, p + i + 8 * k, 8);
+                l[k] = (l[k] ^ v) * 0x100000001B3ull;
+                l[k] ^= l[k] >> 29;
+            }
+        }
+        h = l[0] ^ (l[1] * 0x9E3779B97F4A7C15ull) ^ (l[2] * 0xC2B2AE3D27D4EB4Full) ^ (l[3] * 0x165667B19E3779F9ull);
+        h ^= h >> 32;
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t v;
         std::memcpy(&v, p + i, 8);
@@ -339,7 +353,17 @@ struct VulkanRenderer::Impl {
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
     VkPipeline curPipeline = VK_NULL_HANDLE;
-    uint64_t generation = 1;  // bumped when guest memory may have changed (swap / resolve)
+    uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
+
+    // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
+    // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
+    void InvalidateTextures(uint32_t base, uint32_t size) {
+        const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (auto& [k, t] : textures) {
+            const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
+            if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+        }
+    }
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
@@ -940,6 +964,8 @@ struct VulkanRenderer::Impl {
         Texture& tex = textures[key];
         uint32_t size = HostTextureByteSize(t);
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
+        tex.guestBase = t.base;
+        tex.guestSize = size;
         const uint8_t* src = mem.HostPtr(t.base, size);
         if (!src) {
             tex.validatedGen = generation;
@@ -1592,9 +1618,15 @@ struct VulkanRenderer::Impl {
                 }
                 Begin();
                 prof::Scope pc_(prof::kResolveCpu);
+                const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
+                uint32_t destBytes = ResolveDestByteSize(d);
+                if (!DumpFrame() && ResolveRaw32(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
+                    InvalidateTextures(d.base, destBytes);
+                    goto clears;
+                }
+                {
                 // Destination offset: the resolve rectangle's position in EDRAM.
                 std::vector<float> px(size_t(w) * h * 4);
-                const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
                 for (size_t i = 0; i < size_t(w) * h; i++) {
                     if (isDepth) {
                         float z;
@@ -1608,7 +1640,6 @@ struct VulkanRenderer::Impl {
                         ReadbackToFloat(src->image.format, rb + i * bpp, &px[i * 4]);
                     }
                 }
-                uint32_t destBytes = ResolveDestByteSize(d);
                 uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
                 if (dst) {
                     EncodeResolve(d, uint32_t(x0), uint32_t(y0), w, h, px.data(), dst);
@@ -1623,7 +1654,7 @@ struct VulkanRenderer::Impl {
                     for (uint32_t i = 0; i + 4 <= destBytes; i += 4)
                         mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
                 }
-                generation++;
+                InvalidateTextures(d.base, destBytes);
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
                     std::fprintf(stderr,
@@ -1633,9 +1664,11 @@ struct VulkanRenderer::Impl {
                                  d.endian, d.swapRB ? " swapRB" : "", srcInfo & 0xFFF, srcFormat, surf,
                                  regs[xe::PA_SC_WINDOW_OFFSET], regs[xe::PA_SU_SC_MODE_CNTL], v[0], v[1], v[2], v[3], v[4], v[5]);
                 DumpResolve(px, w, h, d, srcInfo & 0xFFF, srcFormat, uint32_t(x0), uint32_t(y0));
+                }
             }
         }
 
+    clears:
         // Clears of the resolved rectangle.
         if (clearColor && !isDepth) ClearRect(src, regs, x0, y0, w, h, false);
         if (clearDepth) {
@@ -1643,6 +1676,46 @@ struct VulkanRenderer::Impl {
             RenderTarget* z = GetRt(dinfo & 0xFFF, (dinfo >> 16) & 1, pitch, msaa, true);
             if (z) ClearRect(z, regs, x0, y0, w, h, true);
         }
+    }
+
+    // Fast resolve: the render target already holds the destination's 32-bit texel layout
+    // (8888 -> 8888, 2_10_10_10 -> 2_10_10_10), so texels are copied as words, tiled and
+    // endian swapped without going through floats. Returns false when it does not apply.
+    bool ResolveRaw32(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
+                      const uint8_t* rb, uint32_t destBytes) {
+        if (isDepth || d.expBias != 0) return false;
+        const bool is8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM && (d.format == 6 || d.format == 14 || d.format == 50);
+        const bool is1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (d.format == 7 || d.format == 54);
+        if (!is8888 && !is1010) return false;
+        if (d.endian > 3) return false;
+        uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+        if (!dst) return false;
+        const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
+        const uint32_t endian = d.endian;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t ty = dy + y;
+            if (ty >= height) break;
+            const uint32_t* row = reinterpret_cast<const uint32_t*>(rb) + size_t(y) * w;
+            for (uint32_t x = 0; x < w; x++) {
+                const uint32_t tx = dx + x;
+                if (tx >= pitch) break;
+                uint32_t v = row[x];
+                if (d.swapRB) {
+                    if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                    else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+                }
+                switch (endian) {
+                    case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;  // 8in16
+                    case 2: v = __builtin_bswap32(v); break;                                    // 8in32
+                    case 3: v = (v << 16) | (v >> 16); break;                                   // 16in32
+                    default: break;
+                }
+                const uint32_t off = TiledBlockOffset(tx, ty, pitch, 4);
+                if (off + 4 > destBytes) continue;
+                std::memcpy(dst + off, &v, 4);
+            }
+        }
+        return true;
     }
 
     // FA_RENDER_DUMP=<dir>: PNGs of the first resolves (clamped to 0..1), for debugging.
