@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -263,6 +264,7 @@ private:
     std::condition_variable wake_cv_;
     bool wake_ = false;
     std::atomic<uint64_t> st_kicks_{0}, st_passes_{0};
+    bool trace_ctx_ = std::getenv("FA_XMA_DEBUG") != nullptr;  // log kicked contexts that decode nothing
     // Bumped by the per-context decode loop (Context is a nested class).
     static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_;
 };
