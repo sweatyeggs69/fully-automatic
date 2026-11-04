@@ -111,6 +111,8 @@ uint32_t dispatch(uint32_t app, uint32_t msg, uint32_t buf, uint32_t len) {
     return r;
 }
 
+}  // namespace
+
 // XOVERLAPPED {u32 result, length, context, event, completion_routine, completion_context,
 // extended_error}. Completion routines are not queued (the game has not been seen to use them).
 void complete_overlapped(uint32_t ov, uint32_t result) {
@@ -127,6 +129,8 @@ void complete_overlapped(uint32_t ov, uint32_t result) {
     }
     if (ld32(ov + 0x10)) std::fprintf(stderr, "XMsg: overlapped %08X has a completion routine (not called)\n", ov);
 }
+
+namespace {
 
 uint32_t start_io_request(uint32_t app, uint32_t msg, uint32_t ov, uint32_t buf, uint32_t len) {
     uint32_t r = dispatch(app, msg, buf, len);

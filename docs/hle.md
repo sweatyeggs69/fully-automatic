@@ -96,5 +96,5 @@ also runs the hardware-path test on a real stereo XMA file.
 ## Not done yet
 
 - XMA loop sub-frame precision (loops land on frame boundaries), multi-stream (more than 2 channel) XMA contexts.
-- Content/save APIs (`XamContentCreate` etc.) still need mapping onto `hdd:`.
+- `XamContentCreateEnumerator` (empty), `XamShowDeviceSelectorUI` (auto-picks device 1) and the wide printf pair `_vscwprintf` / `vswprintf` are in `runtime/src/kernel/imports_content.cpp`. Content packages (`XamContentCreate` etc.) still need mapping onto `hdd:`.
 - Keystroke queues (`XamInputGetKeystroke`) always report no input.

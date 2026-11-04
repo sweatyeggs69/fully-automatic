@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -41,6 +42,10 @@ PPC_EXTERN_FUNC(XMsgStartIORequest);
 PPC_EXTERN_FUNC(XMsgStartIORequestEx);
 PPC_EXTERN_FUNC(XamGetSystemVersion);
 PPC_EXTERN_FUNC(NtCreateEvent);
+PPC_EXTERN_FUNC(XamContentCreateEnumerator);
+PPC_EXTERN_FUNC(XamShowDeviceSelectorUI);
+PPC_EXTERN_FUNC(_vscwprintf);
+PPC_EXTERN_FUNC(vswprintf);
 
 static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
@@ -130,6 +135,38 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
 
     // ---- XMsg: synchronous music player query, then an overlapped one that signals an event.
     CHECK(K(ctx, XamGetSystemVersion) == 0);
+
+    // ---- content: enumerator reports a buffer size and handle; device selector picks device 1.
+    {
+        uint32_t cb = s + 0x300, h = s + 0x304;
+        CHECK(K(ctx, XamContentCreateEnumerator, 0, 0, 1, 0, 8, cb, h) == 0);
+        CHECK(ld32(cb) == 8 * 0x134 && ld32(h) != 0);
+        uint32_t dev = s + 0x308, ov = s + 0x310;
+        std::memset(host(ov), 0, 0x1C);
+        CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, ov) == 997);
+        CHECK(ld32(dev) == 1 && ld32(ov) == 0);
+        CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, 0) == 0);
+    }
+
+    // ---- wide printf: %d %s (wide) %hs (narrow) %x %5.2f %I64d, args in 8-byte slots.
+    {
+        uint32_t fmt = s + 0x340, ws = s + 0x3A0, ns = s + 0x3C0, va = s + 0x2C0, out = s + 0x200;
+        const char* f = "n=%d s=%s h=%hs x=%04X f=%5.2f q=%I64d%%";
+        uint32_t o = fmt; for (const char* c = f; *c; ++c, o += 2) st16(o, uint8_t(*c));
+        st16(o, 0);
+        st16(ws, 'W'); st16(ws + 2, 'i'); st16(ws + 4, 0);
+        std::memcpy(host(ns), "ok", 3);
+        double d = 3.14159; uint64_t db; std::memcpy(&db, &d, 8);
+        st64(va, uint64_t(int64_t(-42))); st64(va + 8, ws); st64(va + 16, ns);
+        st64(va + 24, 0xAB); st64(va + 32, db); st64(va + 40, 1ull << 40);
+        const char* want = "n=-42 s=Wi h=ok x=00AB f= 3.14 q=1099511627776%";
+        uint32_t n = K(ctx, _vscwprintf, fmt, va);
+        CHECK(n == std::strlen(want));
+        CHECK(K(ctx, vswprintf, out, fmt, va) == std::strlen(want));
+        bool same = true;
+        for (size_t i = 0; i <= std::strlen(want); ++i) same &= ld16(out + i * 2) == uint8_t(want[i]);
+        CHECK(same);
+    }
     uint32_t args = s + 0x200, state = s + 0x220, ov = s + 0x240;
     st32(args, 2);
     st32(args + 4, state);
