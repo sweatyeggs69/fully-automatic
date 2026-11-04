@@ -12,6 +12,7 @@
 // set_self_pump(true) and get_state() pumps itself, rate limited.
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -44,6 +45,16 @@ constexpr uint32_t kErrorDeviceNotConnected = 0x48F;
 constexpr uint32_t kErrorEmpty = 0x10D2;
 
 constexpr uint32_t kFlagGamepad = 0x01;
+
+// XINPUT_KEYSTROKE flags and VK_PAD_* virtual keys.
+constexpr uint16_t kKeyDown = 0x0001, kKeyUp = 0x0002, kKeyRepeat = 0x0004;
+constexpr uint16_t kVkPadA = 0x5800, kVkPadB = 0x5801, kVkPadX = 0x5802, kVkPadY = 0x5803;
+constexpr uint16_t kVkPadRShoulder = 0x5804, kVkPadLShoulder = 0x5805;
+constexpr uint16_t kVkPadLTrigger = 0x5806, kVkPadRTrigger = 0x5807;
+constexpr uint16_t kVkPadDpadUp = 0x5810, kVkPadDpadDown = 0x5811, kVkPadDpadLeft = 0x5812, kVkPadDpadRight = 0x5813;
+constexpr uint16_t kVkPadStart = 0x5814, kVkPadBack = 0x5815, kVkPadLThumbPress = 0x5816, kVkPadRThumbPress = 0x5817;
+constexpr uint16_t kVkPadLThumbUp = 0x5820, kVkPadLThumbDown = 0x5821, kVkPadLThumbRight = 0x5822, kVkPadLThumbLeft = 0x5823;
+constexpr uint16_t kVkPadRThumbUp = 0x5830, kVkPadRThumbDown = 0x5831, kVkPadRThumbRight = 0x5832, kVkPadRThumbLeft = 0x5833;
 constexpr uint32_t kUserAny = 0xFF;
 constexpr int kMaxUsers = 4;
 }  // namespace xinput
@@ -77,6 +88,14 @@ struct XInputCapabilities {     // guest XINPUT_CAPABILITIES, 20 bytes
     XInputVibration vibration;  // which motors exist
 };
 
+struct XInputKeystroke {        // guest XINPUT_KEYSTROKE, 8 bytes
+    uint16_t virtual_key = 0;
+    uint16_t unicode = 0;
+    uint16_t flags = 0;
+    uint8_t user_index = 0;
+    uint8_t hid_code = 0;
+};
+
 // What a keyboard key drives on the virtual pad of user 0.
 struct KeyBinding {
     enum class Kind { Button, LeftTrigger, RightTrigger, Axis } kind = Kind::Button;
@@ -105,6 +124,9 @@ public:
     uint32_t get_capabilities(uint32_t user, XInputCapabilities& out);
     uint32_t set_vibration(uint32_t user, const XInputVibration& v);
     bool connected(uint32_t user);
+    // Pops the next virtual key event (down / repeat / up) for a user (0xFF = any).
+    // Returns kErrorEmpty when there is none.
+    uint32_t get_keystroke(uint32_t user, XInputKeystroke& out);
 
     // Exposed for tests: parses an input.ini text into bindings
     // (SDL scancode -> binding). Unknown lines are reported in errors.
@@ -122,7 +144,13 @@ private:
         XInputState state;
         XInputVibration rumble;
         uint32_t rumble_refresh_ms = 0;
+        // Keystroke generation: virtual keys currently held, next repeat time, pending events.
+        uint32_t held_keys = 0;
+        uint32_t held_since_ms[24] = {};
+        std::deque<XInputKeystroke> keystrokes;
     };
+    void generate_keystrokes(int user, Slot& s, uint32_t now);
+    void maybe_self_pump();
     void open_pad(int device_index);
     void close_pad(int instance_id);
     void refresh();
