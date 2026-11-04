@@ -38,7 +38,14 @@ void vsync_thread() {
         next += std::chrono::microseconds(16667);
         std::this_thread::sleep_until(next);
         uint32_t cb = g_vd.callback.load();
-        if (cb) invoke_guest(cb, 0, g_vd.callback_ctx.load());  // source 0 = vsync
+        if (cb) {
+            static uint64_t n = 0;
+            if (n == 0 || n == 60 || n == 600)
+                std::fprintf(stderr, "[vd] vsync callback #%llu cb=%08x ctx=%08x\n", (unsigned long long)n,
+                             cb, g_vd.callback_ctx.load());
+            n++;
+            invoke_guest(cb, 0, g_vd.callback_ctx.load());  // source 0 = vsync
+        }
     }
 }
 }  // namespace
@@ -48,6 +55,8 @@ FA_IMPORT(VdInitializeEngines) { ret32(ctx, 0); }
 FA_IMPORT(VdSetGraphicsInterruptCallback) {
     g_vd.callback = arg32(ctx, 0);
     g_vd.callback_ctx = arg32(ctx, 1);
+    std::fprintf(stderr, "[vd] VdSetGraphicsInterruptCallback cb=%08x ctx=%08x\n", g_vd.callback.load(),
+                 g_vd.callback_ctx.load());
     if (g_vd.callback && !g_vsync_started.exchange(true)) std::thread(vsync_thread).detach();
 }
 
