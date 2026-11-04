@@ -432,6 +432,7 @@ struct VulkanRenderer::Impl {
     struct TexKey { uint32_t binding; VkSampler smp; VkImageView view; };
     VkDescriptorSet lastTexSet = VK_NULL_HANDLE;  // texture set of the previous draw in this batch
     std::vector<TexKey> lastTexKey;
+    std::unordered_map<uint64_t, VkDescriptorSet> texSetCache;  // every texture set built in this batch, by hash of its (binding, sampler, view) list
     HostDraw hostDraw;  // reused across draws so its index buffer keeps its capacity
     std::map<uint64_t, RenderTarget> rts;
     std::unordered_map<uint64_t, Texture> textures;
@@ -978,6 +979,7 @@ struct VulkanRenderer::Impl {
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
         lastTexSet = VK_NULL_HANDLE;
+        texSetCache.clear();
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
@@ -1791,6 +1793,24 @@ struct VulkanRenderer::Impl {
             bool sameSet = lastTexSet != VK_NULL_HANDLE && lastTexKey.size() == nw;
             for (uint32_t i = 0; i < nw && sameSet; i++)
                 sameSet = lastTexKey[i].binding == w[i].dstBinding && lastTexKey[i].smp == ii[i].sampler && lastTexKey[i].view == ii[i].imageView;
+            uint64_t setHash = 0;
+            if (!sameSet) {
+                setHash = 0xCBF29CE484222325ull ^ nw;
+                for (uint32_t i = 0; i < nw; i++) {
+                    setHash = (setHash ^ w[i].dstBinding) * 0x100000001B3ull;
+                    setHash = (setHash ^ uint64_t(reinterpret_cast<uintptr_t>(ii[i].sampler))) * 0x100000001B3ull;
+                    setHash = (setHash ^ uint64_t(reinterpret_cast<uintptr_t>(ii[i].imageView))) * 0x100000001B3ull;
+                    setHash ^= setHash >> 29;
+                }
+                auto cached = texSetCache.find(setHash);
+                if (cached != texSetCache.end()) {
+                    // Built earlier in this batch for the same samplers and views: reuse it.
+                    texSet = lastTexSet = cached->second;
+                    lastTexKey.resize(nw);
+                    for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
+                    sameSet = true;
+                }
+            }
             if (!sameSet) {
             prof::Scope pd_(prof::kDtDesc);
             if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
@@ -1810,6 +1830,7 @@ struct VulkanRenderer::Impl {
             }
             vkUpdateDescriptorSets(dev, nw, w, 0, nullptr);
             lastTexSet = texSet;
+            texSetCache[setHash] = texSet;
             lastTexKey.resize(nw);
             for (uint32_t i = 0; i < nw; i++) lastTexKey[i] = {w[i].dstBinding, ii[i].sampler, ii[i].imageView};
             } else {
