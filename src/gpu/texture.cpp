@@ -650,8 +650,11 @@ void EncodeResolve(const ResolveDest& d, uint32_t dx, uint32_t dy, uint32_t w, u
                 case 24: case 25: case 26: {
                     int n = d.format == 24 ? 1 : d.format == 25 ? 2 : 4;
                     for (int c = 0; c < n; c++) {
-                        int16_t s16 = int16_t(std::lround(std::clamp(v[c], -1.0f, 1.0f) * 32767.0f));
-                        std::memcpy(b + 2 * c, &s16, 2);
+                        // Non-negative values are stored unsigned normalised (1.0 -> 0xFFFF), the way a shadow map
+                        // fetched unsigned reads them back; negative ones as signed normalised.
+                        uint16_t h16 = v[c] >= 0.0f ? uint16_t(std::lround(std::min(v[c], 1.0f) * 65535.0f))
+                                                    : uint16_t(int16_t(std::lround(std::max(v[c], -1.0f) * 32767.0f)));
+                        std::memcpy(b + 2 * c, &h16, 2);
                     }
                     break;
                 }

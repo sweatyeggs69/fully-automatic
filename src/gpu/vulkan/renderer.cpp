@@ -177,9 +177,11 @@ uint16_t FloatToHalf(float f) {
 // The fixed-point 16_16 render targets (k_16_16, k_16_16_16_16) hold values in [-32, 32): the shader
 // output is stored as value / 32 in an int16. The host target keeps the real value in a float, so a
 // resolve into a 16-bit texture has to divide by 32 to put the same bits in guest memory.
-// FA_RT1616=0 turns this off (values are then stored as is, clamped to [-1, 1]).
+// Off by default: the shadow map the game resolves from a k_16_16 target is fetched as unsigned
+// normalised with no exponent adjust, and its fill writes 1.0 expecting 1.0 back. FA_RT1616=1
+// turns the divide by 32 on again.
 bool Rt1616Scaled() {
-    static const bool on = [] { const char* e = std::getenv("FA_RT1616"); return !(e && e[0] == '0'); }();
+    static const bool on = [] { const char* e = std::getenv("FA_RT1616"); return e && e[0] == '1'; }();
     return on;
 }
 
