@@ -39,7 +39,7 @@ labels = [
 ]
 
 # Missed jump tables found by scanning the generated code for unresolved bctr lookups
-# (lis/addi/rlwinm/lwzx/mtctr/bctr emitted as PPC_CALL_INDIRECT_FUNC). 0x8242DAA8 is the least certain: only 2 labels.
+# (lis/addi/rlwinm/lwzx/mtctr/bctr emitted as PPC_CALL_INDIRECT_FUNC). 0x8242DAA8 was first recorded with 2 labels and is now the full table.
 [[switch]]
 base = 0x8227ACBC
 r = 4
@@ -215,7 +215,27 @@ labels = [
 [[switch]]
 base = 0x8242DAA8
 r = 19
+# 21 entries at 0x8242DAAC..0x8242DAFC, read from the image with xexscan --check-switches (the table ends right before the code at 0x8242DB00)
 labels = [
+    0x8242DB00,
+    0x8242DB00,
+    0x8242D670,
+    0x8242DB00,
+    0x8242DB00,
+    0x8242DBE8,
+    0x8242DB00,
+    0x8242DB74,
+    0x8242DB00,
+    0x8242DB00,
+    0x8242D670,
+    0x8242D670,
+    0x8242DB00,
+    0x8242DB00,
+    0x8242D670,
+    0x8242D670,
+    0x8242D670,
+    0x8242D670,
+    0x8242DB00,
     0x8242DB00,
     0x8242DB00,
 ]
