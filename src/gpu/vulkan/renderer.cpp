@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/stat.h>
+
 #include "fa/gpu/gpu_profile.hpp"
 #include "fa/gpu/pm4.hpp"
 #include "fa/gpu/png.hpp"
@@ -424,6 +426,35 @@ struct VulkanRenderer::Impl {
     VkDescriptorSet set0 = VK_NULL_HANDLE;
     uint32_t texSetsUsed = 0;
     VkPipelineCache pipeCache = VK_NULL_HANDLE;
+    std::string pipeCachePath;
+    uint64_t pipeCacheDirtyAt = 0;  // steady-clock ms of the first pipeline built since the last save (0 = clean)
+    // FA_PIPELINE_CACHE=<file> (or "0" to disable), else $XDG_CACHE_HOME/fullauto/pipeline_cache.bin, else ~/.cache/...
+    static std::string PipelineCachePath() {
+        if (const char* e = std::getenv("FA_PIPELINE_CACHE")) return std::strcmp(e, "0") == 0 ? std::string() : std::string(e);
+        std::string dir;
+        if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) dir = x;
+        else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.cache";
+        else return {};
+        dir += "/fullauto";
+        std::string mk = dir;
+        for (size_t i = 1; i <= mk.size(); i++)
+            if (i == mk.size() || mk[i] == '/') ::mkdir(mk.substr(0, i).c_str(), 0755);
+        return dir + "/pipeline_cache.bin";
+    }
+    void SavePipelineCache() {
+        if (!pipeCache || pipeCachePath.empty() || !pipeCacheDirtyAt) return;
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev, pipeCache, &n, nullptr) != VK_SUCCESS || !n) return;
+        std::vector<uint8_t> data(n);
+        if (vkGetPipelineCacheData(dev, pipeCache, &n, data.data()) != VK_SUCCESS) return;
+        const std::string tmp = pipeCachePath + ".tmp";
+        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            bool ok = std::fwrite(data.data(), 1, n, f) == n;
+            ok = std::fclose(f) == 0 && ok;
+            if (ok) std::rename(tmp.c_str(), pipeCachePath.c_str()); else std::remove(tmp.c_str());
+        }
+        pipeCacheDirtyAt = 0;
+    }
 
     shaderc_compiler_t compiler = nullptr;
     std::unordered_map<uint64_t, Shader> shaders;
@@ -1183,8 +1214,27 @@ struct VulkanRenderer::Impl {
         dpci.pPoolSizes = &ps1;
         vkCreateDescriptorPool(dev, &dpci, nullptr, &texPool);
 
+        // The pipeline cache persists between runs (the driver rejects data from another GPU or driver version),
+        // so the shaders compiled for a race are not recompiled, and hitch, on every start.
+        pipeCachePath = PipelineCachePath();
+        std::vector<uint8_t> cacheData;
+        if (!pipeCachePath.empty()) {
+            if (FILE* f = std::fopen(pipeCachePath.c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                long n = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                if (n > 0 && n < (256l << 20)) {
+                    cacheData.resize(size_t(n));
+                    if (std::fread(cacheData.data(), 1, cacheData.size(), f) != cacheData.size()) cacheData.clear();
+                }
+                std::fclose(f);
+            }
+        }
         VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        pcci.initialDataSize = cacheData.size();
+        pcci.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
         vkCreatePipelineCache(dev, &pcci, nullptr, &pipeCache);
+        if (!cacheData.empty()) std::fprintf(stderr, "[render] pipeline cache: loaded %zu KB from %s\n", cacheData.size() / 1024, pipeCachePath.c_str());
 
         compiler = shaderc_compiler_initialize();
         if (!compiler) { err = "shaderc init failed"; return false; }
@@ -1241,6 +1291,7 @@ struct VulkanRenderer::Impl {
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
             DestroyBuffer(readback);
+            SavePipelineCache();
             if (pipeCache) vkDestroyPipelineCache(dev, pipeCache, nullptr);
             if (texPool) vkDestroyDescriptorPool(dev, texPool, nullptr);
             if (set0Pool) vkDestroyDescriptorPool(dev, set0Pool, nullptr);
@@ -1745,6 +1796,9 @@ struct VulkanRenderer::Impl {
             p = VK_NULL_HANDLE;
         } else {
             stats.pipelines++;
+            const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            if (!pipeCacheDirtyAt) pipeCacheDirtyAt = nowMs;
+            else if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();  // a run can end by a kill: save every 30 s
         }
         pipelines[k] = p;
         return p;
@@ -2673,6 +2727,10 @@ struct VulkanRenderer::Impl {
             SubmitAndWait();
         }
         Begin();
+        if (pipeCacheDirtyAt) {
+            const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();
+        }
         generation++;
         {   // Frames that take over 250 ms (e.g. the first-use texture burst) are always reported.
             static uint64_t lastNs = 0, lastUploads = 0;
