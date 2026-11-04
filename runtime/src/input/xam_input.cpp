@@ -1,5 +1,7 @@
 // xam input imports: XamInputGetState and friends, backed by fa::hle::Input
 // (SDL2 game controllers plus a keyboard for player 1).
+#include <cstdlib>
+#include <cstdio>
 #include "fa/hle/services.hpp"
 #include "fa/rt/import.hpp"
 
@@ -78,6 +80,9 @@ uint32_t get_keystroke(uint32_t user, uint32_t out) {
         st16(out + 4, k.flags);
         st8(out + 6, k.user_index);
         st8(out + 7, k.hid_code);
+        static const bool trace = std::getenv("FA_TRACE_INPUT") != nullptr;
+        if (trace)
+            std::fprintf(stderr, "[input] keystroke vk=%04X flags=%04X user=%u\n", k.virtual_key, k.flags, k.user_index);
     }
     return rc;
 }
