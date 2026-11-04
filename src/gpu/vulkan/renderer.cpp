@@ -447,6 +447,7 @@ struct VulkanRenderer::Impl {
     // FA_RENDER_DUMP=<dir>: every 30th frame (12 of them) gets all its draws logged and all its
     // resolves dumped, so the dumps line up with FrameBackend's front buffer dumps.
     const char* dumpDir = nullptr;
+    bool dbgNoAtest = false, dbgNoBlend = false;
     uint64_t dumpCount = 12;  // FA_RENDER_DUMP_COUNT: how many 30-frame steps get dumped
     bool DumpFrame() const { return dumpDir && (frame < 6 || (frame % 30 == 0 && frame / 30 < dumpCount)); }
 
@@ -454,6 +455,11 @@ struct VulkanRenderer::Impl {
         const char* d = std::getenv("FA_RENDER_DUMP");
         if (d && *d) dumpDir = d;
         if (const char* c = std::getenv("FA_RENDER_DUMP_COUNT")) dumpCount = std::strtoull(c, nullptr, 10);
+        // FA_DBG_RENDER=noatest,noblend: debugging switches that override the guest's alpha test / blending.
+        if (const char* c = std::getenv("FA_DBG_RENDER")) {
+            dbgNoAtest = std::strstr(c, "noatest") != nullptr;
+            dbgNoBlend = std::strstr(c, "noblend") != nullptr;
+        }
     }
 
     bool Fail(std::string& err, const char* what, VkResult r) {
@@ -1340,7 +1346,7 @@ struct VulkanRenderer::Impl {
         sys.ndcOffset[1] = (woy + half) * sys.ndcScale[1] - 1.0f;
         sys.ndcOffset[2] = 0.0f;
         const uint32_t colorCtl = regs[xe::RB_COLORCONTROL];
-        sys.flags[1] = ((colorCtl >> 3) & 1) ? (colorCtl & 7) : 7;
+        sys.flags[1] = ((colorCtl >> 3) & 1) && !dbgNoAtest ? (colorCtl & 7) : 7;
         const uint32_t prog = regs[xe::SQ_PROGRAM_CNTL];
         sys.flags[2] = ((prog >> 18) & 1) ? ((regs[xe::SQ_CONTEXT_MISC] >> 8) & 0xFF) : 0xFFFFFFFFu;
         sys.flags[3] = 16;
@@ -1393,7 +1399,7 @@ struct VulkanRenderer::Impl {
         for (int i = 0; i < 4; i++) key.colorFormats[i] = color[i] && ((colorMask >> (4 * i)) & 0xF) ? color[i]->image.format : VK_FORMAT_UNDEFINED;
         key.depthFormat = depth ? depthFormat : VK_FORMAT_UNDEFINED;
         static const uint32_t blendRegs[4] = {xe::RB_BLENDCONTROL0, xe::RB_BLENDCONTROL1, xe::RB_BLENDCONTROL2, xe::RB_BLENDCONTROL3};
-        for (int i = 0; i < 4; i++) key.blend[i] = key.colorFormats[i] ? regs[blendRegs[i]] & 0x1FFF1FFF : 0;
+        for (int i = 0; i < 4; i++) key.blend[i] = key.colorFormats[i] ? (dbgNoBlend ? 0x00010001u : regs[blendRegs[i]] & 0x1FFF1FFF) : 0;
         key.colorMask = colorMask;
         key.depthControl = depth ? depthCtl : 0;
         if (depth && !(depthCtl & 1)) key.depthControl &= 0xFF & ~0x80u;  // stencil off: ignore its fields
