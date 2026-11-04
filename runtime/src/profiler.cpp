@@ -34,6 +34,8 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" char __executable_start, etext;  // linker-provided bounds of our own code
+
 namespace fa::rt {
 
 bool g_profile = std::getenv("FA_PROFILE") != nullptr;
@@ -75,7 +77,6 @@ void prof_handler(int, siginfo_t*, void* uc) {
     s.tid = int32_t(::syscall(SYS_gettid));
     // Only unwind from our own code. A tick that lands in a foreign library (SDL, the GPU driver) can sit on
     // frames without unwind info, where backtrace() faults inside the handler: record just the pc there.
-    extern char __executable_start, etext;
     const void* rip = reinterpret_cast<void*>(static_cast<ucontext_t*>(uc)->uc_mcontext.gregs[REG_RIP]);
     s.pc[0] = const_cast<void*>(rip);
     int k = 1;
