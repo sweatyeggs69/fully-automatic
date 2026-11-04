@@ -320,6 +320,7 @@ struct XmaDecoder::Context {
     FrameDecoder dec;
     Carry carry;
     bool carry_crossed = false;
+    int trace_count = 0;
 
     void reset_stream() {
         carry.reset();
@@ -646,9 +647,23 @@ bool XmaDecoder::work_once() {
         uint8_t* g = hooks_.host(c.guest_ptr);
         XmaContextData d;
         d.load(g);
+        uint64_t frames_before = st_frames_.load(std::memory_order_relaxed);
+        XmaContextData before = d;
         c.decode(d, hooks_);
         d.store(g);
         st_passes_.fetch_add(1, std::memory_order_relaxed);
+        if (trace_ctx_ && st_frames_.load(std::memory_order_relaxed) == frames_before && c.trace_count++ < 12) {
+            // FA_XMA_DEBUG: a kicked context that decoded nothing; show why.
+            std::fprintf(stderr,
+                "[xma] ctx %d kicked, no frame: in0 valid=%u ptr=%08x pk=%u | in1 valid=%u ptr=%08x pk=%u | "
+                "cur=%u rd=%u | out valid=%u ptr=%08x blocks=%u wr=%u rd=%u | stereo=%u rate=%u loop=%u\n",
+                int((c.guest_ptr - array_ptr_) / kContextSize), before.input_buffer_0_valid, before.input_buffer_0_ptr,
+                before.input_buffer_0_packet_count, before.input_buffer_1_valid, before.input_buffer_1_ptr,
+                before.input_buffer_1_packet_count, before.current_buffer, before.input_buffer_read_offset,
+                before.output_buffer_valid, before.output_buffer_ptr, before.output_buffer_block_count,
+                before.output_buffer_write_offset, before.output_buffer_read_offset, before.is_stereo,
+                before.sample_rate, before.loop_count);
+        }
         did = true;
     }
     return did;
