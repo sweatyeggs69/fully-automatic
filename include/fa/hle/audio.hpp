@@ -243,6 +243,7 @@ public:
     struct Stats {
         uint64_t kicks = 0;          // XMAEnableContext calls and kick register bits
         uint64_t passes = 0;         // context decode passes
+        uint64_t loops = 0;          // worker thread iterations (0 growth = worker stuck)
         uint64_t frames = 0;         // XMA frames decoded
         uint64_t bad_frames = 0;     // invalid frame lengths skipped
         uint64_t decode_errors = 0;  // frames FFmpeg rejected
@@ -263,7 +264,7 @@ private:
     std::mutex wake_mu_;
     std::condition_variable wake_cv_;
     bool wake_ = false;
-    std::atomic<uint64_t> st_kicks_{0}, st_passes_{0};
+    std::atomic<uint64_t> st_kicks_{0}, st_passes_{0}, st_loops_{0};
     bool trace_ctx_ = std::getenv("FA_XMA_DEBUG") != nullptr;  // log kicked contexts that decode nothing
     // Bumped by the per-context decode loop (Context is a nested class).
     static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_;
