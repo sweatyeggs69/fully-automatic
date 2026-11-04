@@ -230,7 +230,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
 
         case pm4::kXeSwap:  // d[0] = 'SWAP', d[1] = front buffer, d[2] = width, d[3] = height
             if (n >= 4) {
-                backend_.Swap(d[1], d[2], d[3]);
+                backend_.Swap(d[1], d[2], d[3], regs_);
                 ++stats_.swaps;
             }
             break;

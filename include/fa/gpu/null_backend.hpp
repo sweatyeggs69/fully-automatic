@@ -14,7 +14,7 @@ public:
 
     void Draw(const DrawCall& d, const RegisterFile&) override { draws.push_back(d); }
     void Resolve(const RegisterFile&) override { ++resolves; }
-    void Swap(uint32_t addr, uint32_t w, uint32_t h) override { swaps.push_back({addr, w, h}); }
+    void Swap(uint32_t addr, uint32_t w, uint32_t h, const RegisterFile&) override { swaps.push_back({addr, w, h}); }
 };
 
 }  // namespace fa::gpu

@@ -35,6 +35,10 @@ Other layers add files under `src/gpu/`, `src/audio/`, `src/input/`, `src/vfs/`;
 - Calling into the guest from a host thread: `attach_guest_thread(name)` once, then `invoke_guest(func, arg)`.
 - The XMA/APU register page at 0x7FEA0000 is plain committed memory.
 
+## Game window
+The main thread owns the SDL2 window and the Vulkan presenter; the guest main thread runs on a
+separate host thread. See [docs/window.md](../docs/window.md) (`FA_HEADLESS=1` for no window).
+
 ## Known limits
 
 - One global lock for all waits (fine for now, split if profiling shows contention).
