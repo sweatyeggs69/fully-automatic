@@ -11,6 +11,7 @@
 #include <fstream>
 #include <thread>
 
+#include "fa/hle/services.hpp"
 #include "fa/rt/hle_hooks.hpp"
 #include "fa/rt/kernel.hpp"
 #include "fa/rt/loader.hpp"
@@ -44,6 +45,14 @@ PPC_EXTERN_FUNC(XamGetSystemVersion);
 PPC_EXTERN_FUNC(NtCreateEvent);
 PPC_EXTERN_FUNC(XamContentCreateEnumerator);
 PPC_EXTERN_FUNC(XamShowDeviceSelectorUI);
+PPC_EXTERN_FUNC(XamContentCreateDeviceEnumerator);
+PPC_EXTERN_FUNC(XamEnumerate);
+PPC_EXTERN_FUNC(XamContentGetDeviceData);
+PPC_EXTERN_FUNC(XamContentGetDeviceName);
+PPC_EXTERN_FUNC(XamContentGetDeviceState);
+PPC_EXTERN_FUNC(XamContentCreate);
+PPC_EXTERN_FUNC(XamContentClose);
+PPC_EXTERN_FUNC(XamContentDelete);
 PPC_EXTERN_FUNC(_vscwprintf);
 PPC_EXTERN_FUNC(vswprintf);
 
@@ -71,7 +80,7 @@ static void audio_callback(PPCContext& ctx, uint8_t*) {
 }
 
 static void guest_main(PPCContext& ctx, uint8_t*) {
-    uint32_t s = g_mem.malloc(0x400);
+    uint32_t s = g_mem.malloc(0x800);
     g_scratch = s;
 
     // ---- input: player 1 always exists (keyboard), player 2 does not.
@@ -146,6 +155,40 @@ static void guest_main(PPCContext& ctx, uint8_t*) {
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, ov) == 997);
         CHECK(ld32(dev) == 1 && ld32(ov) == 0);
         CHECK(K(ctx, XamShowDeviceSelectorUI, 0, 1, 0x200, 0, dev, 0) == 0);
+    }
+
+    // ---- device list, device info, and a save created, listed, reopened and deleted.
+    {
+        uint32_t cb = s + 0x300, h = s + 0x304, buf = s + 0x400, cnt = s + 0x30C;
+        CHECK(K(ctx, XamContentCreateDeviceEnumerator, 1, 0, 4, cb, h) == 0);
+        CHECK(ld32(cb) == 4 * 0x50);
+        CHECK(K(ctx, XamEnumerate, ld32(h), 0, buf, 0, cnt, 0) == 0);
+        CHECK(ld32(cnt) == 1 && ld32(buf) == 1 && ld32(buf + 4) == 1 && ld16(buf + 24) == 'H');
+        CHECK(K(ctx, XamEnumerate, ld32(h), 0, buf, 0, cnt, 0) == 18);
+        CHECK(K(ctx, XamContentGetDeviceData, 1, buf) == 0 && ld32(buf) == 1);
+        CHECK(K(ctx, XamContentGetDeviceData, 7, buf) == 0x48F);
+        CHECK(K(ctx, XamContentGetDeviceName, 1, buf, 32) == 0 && ld16(buf) == 'H' && ld16(buf + 20) == 0);
+        CHECK(K(ctx, XamContentGetDeviceState, 1, 0) == 0);
+
+        uint32_t data = s + 0x180, root = s + 0x2A0, disp = s + 0x2B0;
+        std::memset(host(data), 0, 0x134);
+        st32(data, 1); st32(data + 4, 1);
+        st16(data + 8, 'S'); st16(data + 10, 'v');
+        std::memcpy(host(data + 0x108), "slot0", 6);
+        std::memcpy(host(root), "save", 5);
+        CHECK(K(ctx, XamContentCreate, 0, root, data, 3, disp, 0, 0) == 2);  // OPEN_EXISTING, none yet
+        CHECK(K(ctx, XamContentCreate, 0, root, data, 1, disp, 0, 0) == 0 && ld32(disp) == 1);
+        CHECK(fa::hle::services().vfs.is_mounted("save:"));
+        CHECK(K(ctx, XamContentClose, root, 0) == 0);
+        CHECK(!fa::hle::services().vfs.is_mounted("save:"));
+        CHECK(K(ctx, XamContentCreate, 0, root, data, 1, disp, 0, 0) == 183);  // CREATE_NEW exists
+        CHECK(K(ctx, XamContentCreate, 0, root, data, 3, disp, 0, 0) == 0 && ld32(disp) == 2);
+        K(ctx, XamContentClose, root, 0);
+        CHECK(K(ctx, XamContentCreateEnumerator, 0, 0, 1, 0, 4, cb, h) == 0);
+        CHECK(K(ctx, XamEnumerate, ld32(h), 0, buf, 0, cnt, 0) == 0 && ld32(cnt) == 1);
+        CHECK(ld32(buf + 4) == 1 && ld16(buf + 8) == 'S' && std::memcmp(host(buf + 0x108), "slot0", 6) == 0);
+        CHECK(K(ctx, XamContentDelete, 0, data, 0) == 0);
+        CHECK(K(ctx, XamContentCreate, 0, root, data, 3, disp, 0, 0) == 2);
     }
 
     // ---- wide printf: %d %s (wide) %hs (narrow) %x %5.2f %I64d, args in 8-byte slots.
