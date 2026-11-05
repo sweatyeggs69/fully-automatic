@@ -1477,11 +1477,11 @@ struct VulkanRenderer::Impl {
     // Step one of letting the GPU read vertex data straight from guest memory instead of copying
     // it into the upload ring every draw: map the guest's physical memory a second time (an alias
     // the guest never sees, read/write) and try to import it as one Vulkan buffer. Only logs the
-    // outcome for now; nothing uses the buffer yet. FA_GUEST_IMPORT=0 skips it.
+    // outcome for now; nothing uses the buffer yet. Runs only with FA_GUEST_IMPORT=1.
     bool haveHostImport = false, haveMemFd = false, haveDmaBuf = false;
     void ProbeGuestImport() {
         const char* e = std::getenv("FA_GUEST_IMPORT");
-        if (e && e[0] == '0') return;
+        if (!e || e[0] != '1') return;
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &hp;
@@ -1831,7 +1831,9 @@ struct VulkanRenderer::Impl {
             w[i].pBufferInfo = &bufInfo[i];
         }
         vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
-        VkDescriptorPoolSize ps1 = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextureSets * 8};
+        // Every set of this layout takes all 64 bindings from the pool, used or not. Sizing it for 8 per set
+        // ran the pool dry after 512 sets, and each refill was a full SubmitAndWait (about 3 per race frame).
+        VkDescriptorPoolSize ps1 = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextureSets * 64};
         dpci.maxSets = kMaxTextureSets;
         dpci.poolSizeCount = 1;
         dpci.pPoolSizes = &ps1;
@@ -2663,12 +2665,13 @@ struct VulkanRenderer::Impl {
             }
             if (!sameSet) {
             prof::Scope pd_(prof::kDtDesc);
-            if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
+            if (texSetsUsed >= kMaxTextureSets) { prof::Add(prof::kDescFull, 1); SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
             ai.descriptorSetCount = 1;
             ai.pSetLayouts = &set1Layout;
             if (vkAllocateDescriptorSets(dev, &ai, &texSet) != VK_SUCCESS) {
+                prof::Add(prof::kDescFull, 1);
                 SubmitAndWait();
                 Begin();
                 vkAllocateDescriptorSets(dev, &ai, &texSet);
