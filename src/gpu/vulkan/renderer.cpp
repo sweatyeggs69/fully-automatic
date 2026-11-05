@@ -566,6 +566,9 @@ struct VulkanRenderer::Impl {
     uint64_t texEpoch = 1;
     struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; };
     SlotMemo slotMemo[32];
+    // Same idea across slots: a direct-mapped table of recent lookups (any slot) in this epoch, so draws that
+    // alternate between textures still skip GetTexture. FA_TEX_MEMO2=0 disables.
+    SlotMemo texMemo[2048];
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -2252,9 +2255,17 @@ struct VulkanRenderer::Impl {
                     static const bool noMemo = [] { const char* e = std::getenv("FA_TEX_MEMO"); return e && e[0] == '0'; }();
                     SlotMemo& m = slotMemo[s];
                     const uint32_t* fc = &regs.r[pm4::kFetchConstBase + s * 6];
+                    static const bool noMemo2 = [] { const char* e = std::getenv("FA_TEX_MEMO2"); return e && e[0] == '0'; }();
+                    uint32_t mh = (fc[0] * 0x9E3779B1u) ^ (fc[1] * 0x85EBCA77u) ^ (fc[2] * 0xC2B2AE3Du) ^ (fc[3] * 0x27D4EB2Fu) ^
+                                  (fc[4] * 0x165667B1u) ^ (fc[5] * 0xD3A2646Cu) ^ (cube ? 0x5bd1e995u : 0u);
+                    SlotMemo& g = texMemo[(mh ^ (mh >> 15)) & 2047u];
                     if (!noMemo && m.epoch == texEpoch && m.cube == cube && !std::memcmp(m.d, fc, sizeof m.d)) {
                         view = m.view;
                         smp = m.smp;
+                    } else if (!noMemo && !noMemo2 && g.epoch == texEpoch && g.cube == cube && !std::memcmp(g.d, fc, sizeof g.d)) {
+                        view = g.view;
+                        smp = g.smp;
+                        m = g;
                     } else {
                         prof::Scope pg_(prof::kDtGet);
                         view = GetTexture(regs, s, cube, smp);
@@ -2263,6 +2274,7 @@ struct VulkanRenderer::Impl {
                         std::memcpy(m.d, fc, sizeof m.d);
                         m.view = view;
                         m.smp = smp;
+                        g = m;
                     }
                 }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
