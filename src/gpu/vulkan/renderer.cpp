@@ -494,6 +494,7 @@ struct VulkanRenderer::Impl {
     shaderc_compiler_t compiler = nullptr;
     std::unordered_map<uint64_t, Shader> shaders;
     VkShaderModule rectGs = VK_NULL_HANDLE;
+    VkShaderModule nullPs = VK_NULL_HANDLE;  // diagnostic: empty fragment shader
     std::unordered_map<std::string, VkPipeline> pipelines;
     struct TexKey { uint32_t binding; VkSampler smp; VkImageView view; };
     VkDescriptorSet lastTexSet = VK_NULL_HANDLE;  // texture set of the previous draw in this batch
@@ -511,7 +512,7 @@ struct VulkanRenderer::Impl {
     RenderTarget* curColor[4] = {};
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
-    bool discardNow = false;
+    bool discardNow = false, nullPsNow = false;
     uint32_t curRaW = 0, curRaH = 0;  // render area of the running pass
     VkPipeline curPipeline = VK_NULL_HANDLE;
     // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
@@ -1469,6 +1470,15 @@ struct VulkanRenderer::Impl {
             }
         }
 
+        {
+            std::vector<uint32_t> spv;
+            std::string e;
+            if (CompileGlsl("#version 450\nvoid main() {}\n", shaderc_fragment_shader, "null.frag", spv, e)) nullPs = MakeModule(spv);
+            std::string sw;
+            for (const char* n : {"FA_SHADER_OPT", "FA_KEEP_PASS", "FA_SHRINK_AREA", "FA_RT_LAYOUT", "FA_RESOLVE_LAZY", "FA_TEX_QUICK", "FA_PROFILE", "FA_PIPELINE_CACHE"})
+                if (const char* v = std::getenv(n)) sw += std::string(" ") + n + "=" + v;
+            std::fprintf(stderr, "[render] switches:%s\n", sw.empty() ? " (none)" : sw.c_str());
+        }
         Begin();
         // Dummy textures for slots whose fetch constant is unusable.
         const VkImageUsageFlags texUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1493,6 +1503,7 @@ struct VulkanRenderer::Impl {
             vkDeviceWaitIdle(dev);
             for (auto& [k, s] : shaders) if (s.module) vkDestroyShaderModule(dev, s.module, nullptr);
             if (rectGs) vkDestroyShaderModule(dev, rectGs, nullptr);
+            if (nullPs) vkDestroyShaderModule(dev, nullPs, nullptr);
             for (auto& [k, p] : pipelines) vkDestroyPipeline(dev, p, nullptr);
             for (auto& [k, rt] : rts) DestroyImage(rt.image);
             for (auto& [k, t] : textures) DestroyImage(t.image);
@@ -1981,7 +1992,7 @@ struct VulkanRenderer::Impl {
         };
         stage(VK_SHADER_STAGE_VERTEX_BIT, vs->module);
         if (key.prim == uint32_t(HostPrim::Rects) && haveGs) stage(VK_SHADER_STAGE_GEOMETRY_BIT, rectGs);
-        stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps->module);
+        stage(VK_SHADER_STAGE_FRAGMENT_BIT, ((key.discard & 2) && nullPs) ? nullPs : ps->module);
 
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -1999,7 +2010,7 @@ struct VulkanRenderer::Impl {
         rs.lineWidth = 1.0f;
         // Diagnostic: while the file ~/.cache/fullauto/raster_discard exists (checked per frame, FA_PROFILE only)
         // only vertex/geometry work runs; the drop in 'gpu exec' shows how much GPU time is fragment work.
-        rs.rasterizerDiscardEnable = key.discard ? VK_TRUE : VK_FALSE;
+        rs.rasterizerDiscardEnable = (key.discard & 1) ? VK_TRUE : VK_FALSE;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -2368,7 +2379,7 @@ struct VulkanRenderer::Impl {
         key.cull = tri ? ((sc & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((sc & 2) ? VK_CULL_MODE_BACK_BIT : 0) : 0;
         key.frontFace = (sc & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         key.depthBias = depth && ((sc >> 11) & 3) ? 1 : 0;
-        key.discard = discardNow ? 1 : 0;
+        key.discard = (discardNow ? 1 : 0) | (nullPsNow ? 2 : 0);
         VkPipeline pipe = GetPipeline(key, vs, ps);
         if (!pipe) { stats.drawsSkipped++; return; }
 
@@ -3097,6 +3108,7 @@ struct VulkanRenderer::Impl {
             const char* h = std::getenv("HOME");
             struct stat st;
             discardNow = h && ::stat((std::string(h) + "/.cache/fullauto/raster_discard").c_str(), &st) == 0;
+            nullPsNow = h && ::stat((std::string(h) + "/.cache/fullauto/null_ps").c_str(), &st) == 0;
         }
         if (tsPool && frame % 300 == 0 && !passStats.empty()) {
             std::vector<std::pair<std::string, PassStat>> v(passStats.begin(), passStats.end());
