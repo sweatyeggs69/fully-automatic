@@ -2642,9 +2642,11 @@ struct VulkanRenderer::Impl {
     // List primitives (points, lines, triangles, rectangles) keep their indices as they are, so the
     // host list BuildHostDraw makes is the guest list plus the offset. Falls back for strips, fans
     // and quads, inline indices, unusual endian modes, a reset index present in the data, or an
-    // index that would wrap past 24 bits. FA_FAST_IDX=0 disables.
+    // index that would wrap past 24 bits. Opt-in with FA_FAST_IDX=1.
     bool TryFastIndices(const DrawCall& dc, const RegisterFile& regs, FastIdx& fi) {
-        static const bool off = [] { const char* e = std::getenv("FA_FAST_IDX"); return e && e[0] == '0'; }();
+        // Off by default: run 69 showed black triangles on light pole debris with it on (run 70 clean
+        // with it off), cause not found yet. It covered only ~700 indices per race frame anyway.
+        static const bool off = [] { const char* e = std::getenv("FA_FAST_IDX"); return !(e && e[0] == '1'); }();
         if (off || !dc.indexCount) return false;
         uint32_t per;
         HostPrim prim;
