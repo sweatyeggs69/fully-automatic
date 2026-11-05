@@ -24,6 +24,8 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
 #include <sys/stat.h>
 
 #include "fa/gpu/gpu_profile.hpp"
@@ -1476,7 +1478,7 @@ struct VulkanRenderer::Impl {
     // it into the upload ring every draw: map the guest's physical memory a second time (an alias
     // the guest never sees, read/write) and try to import it as one Vulkan buffer. Only logs the
     // outcome for now; nothing uses the buffer yet. FA_GUEST_IMPORT=0 skips it.
-    bool haveHostImport = false;
+    bool haveHostImport = false, haveMemFd = false, haveDmaBuf = false;
     void ProbeGuestImport() {
         const char* e = std::getenv("FA_GUEST_IMPORT");
         if (e && e[0] == '0') return;
@@ -1545,6 +1547,101 @@ struct VulkanRenderer::Impl {
         if (g == MAP_FAILED) { std::fprintf(stderr, "[import] alias mmap failed\n"); return; }
         tryImport("guest physical", g, size);
         munmap(g, size);
+        ProbeDmaBuf();
+    }
+
+    // The driver refuses shared (memfd) pages for host pointer import, so probe the reverse:
+    // let Vulkan allocate the memory, export it as a dma-buf and map that fd several times the
+    // way guest physical memory is mapped into its three views. Checks that writes through one
+    // mapping show in another, that mprotect works on it, and how fast the CPU reads it.
+    void ProbeDmaBuf() {
+        bool udma = access("/dev/udmabuf", R_OK | W_OK) == 0;
+        int lim = -1;
+        if (FILE* f = std::fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+            if (std::fscanf(f, "%d", &lim) != 1) lim = -1;
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[import] /dev/udmabuf usable %d, size limit %d MB; memory fd ext %d, dma-buf ext %d\n",
+                     int(udma), lim, int(haveMemFd), int(haveDmaBuf));
+        if (!haveMemFd || !haveDmaBuf) return;
+        auto getFd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
+        if (!getFd) return;
+        const VkDeviceSize size = 512ull << 20;
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.pNext = &eb;
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        VkBuffer b = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev, &bci, nullptr, &b) != VK_SUCCESS) { std::fprintf(stderr, "[import] dma-buf: buffer failed\n"); return; }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, b, &req);
+        for (int pass = 0; pass < 2; pass++) {
+            // Pass 0 wants host cached memory (what the CPU side would need), pass 1 any host visible.
+            VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                         (pass == 0 ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+            uint32_t type = ~0u;
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
+                if ((req.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want &&
+                    !(memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = i; break; }
+            if (type == ~0u) { std::fprintf(stderr, "[import] dma-buf pass %d: no memory type\n", pass); continue; }
+            VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+            ex.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+            ded.buffer = b;
+            ex.pNext = &ded;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &ex;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = type;
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            VkResult r = vkAllocateMemory(dev, &mai, nullptr, &m);
+            if (r != VK_SUCCESS) { std::fprintf(stderr, "[import] dma-buf pass %d: allocate %d\n", pass, int(r)); continue; }
+            VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+            gi.memory = m;
+            gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            int fd = -1;
+            r = getFd(dev, &gi, &fd);
+            std::string res;
+            char buf[256];
+            if (r != VK_SUCCESS || fd < 0) {
+                res = "export failed " + std::to_string(int(r));
+            } else {
+                uint8_t* v1 = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                uint8_t* v2 = (uint8_t*)mmap(nullptr, size - 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x1000);
+                if (v1 == MAP_FAILED || v2 == MAP_FAILED) {
+                    res = std::string("mmap failed: ") + std::strerror(errno);
+                } else {
+                    v1[0x2345] = 0x5a;
+                    v2[0x10000] = 0xa5;  // = v1[0x11000]
+                    bool alias = v2[0x1345] == 0x5a && v1[0x11000] == 0xa5;
+                    bool prot = mprotect(v1 + (64u << 20), 1u << 20, PROT_NONE) == 0 &&
+                                mprotect(v1 + (64u << 20), 1u << 20, PROT_READ | PROT_WRITE) == 0;
+                    // CPU write then read bandwidth over 256 MB (first touch faults pages in).
+                    auto t0 = std::chrono::steady_clock::now();
+                    std::memset(v1, 1, 256u << 20);
+                    auto t1 = std::chrono::steady_clock::now();
+                    uint64_t sum = 0;
+                    for (size_t i = 0; i < (256u << 20); i += 8) sum += *(const uint64_t*)(v1 + i);
+                    auto t2 = std::chrono::steady_clock::now();
+                    std::memset(v1, 1, 256u << 20);
+                    auto t3 = std::chrono::steady_clock::now();
+                    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                    std::snprintf(buf, sizeof buf, "alias %d, mprotect %d, 256 MB first write %.1f ms, read %.1f ms, rewrite %.1f ms (sum %llu)",
+                                  int(alias), int(prot), ms(t0, t1), ms(t1, t2), ms(t2, t3), (unsigned long long)(sum & 1));
+                    res = buf;
+                }
+                if (v1 != MAP_FAILED) munmap(v1, size);
+                if (v2 != MAP_FAILED) munmap(v2, size - 0x1000);
+                close(fd);
+            }
+            std::fprintf(stderr, "[import] dma-buf pass %d: memory type %u (flags %x): %s\n", pass, type,
+                         memProps.memoryTypes[type].propertyFlags, res.c_str());
+            vkFreeMemory(dev, m, nullptr);
+            if (pass == 0) break;
+        }
+        vkDestroyBuffer(dev, b, nullptr);
     }
 
     // ---- init ------------------------------------------------------------------------------
@@ -1629,7 +1726,11 @@ struct VulkanRenderer::Impl {
             vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, ep.data());
             for (auto& e : ep)
                 if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) haveHostImport = true;
+                else if (!std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) haveMemFd = true;
+                else if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) haveDmaBuf = true;
             if (haveHostImport) devExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            if (haveMemFd) devExts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            if (haveMemFd && haveDmaBuf) devExts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
         }
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &use;
