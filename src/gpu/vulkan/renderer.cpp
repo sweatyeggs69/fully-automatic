@@ -510,6 +510,7 @@ struct VulkanRenderer::Impl {
     RenderTarget* curColor[4] = {};
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
+    uint32_t curRaW = 0, curRaH = 0;  // render area of the running pass
     VkPipeline curPipeline = VK_NULL_HANDLE;
     // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
     // and every time a texture fetch binds it (with whether the cached copy was reused).
@@ -1652,6 +1653,8 @@ struct VulkanRenderer::Impl {
         }
         vkCmdBeginRendering(cmd, &ri);
         renderingActive = true;
+        curRaW = area.extent.width;
+        curRaH = area.extent.height;
         curPipeline = VK_NULL_HANDLE;
     }
 
@@ -2323,15 +2326,28 @@ struct VulkanRenderer::Impl {
         if (!pipe) { stats.drawsSkipped++; return; }
 
         // Rendering pass for this target set.
+        // The render area is only as tall as the first scissor needs (the EDRAM-sized targets are 2048 rows
+        // high but the scene is 720), so each pass loads and stores far fewer pixels. A later draw that needs
+        // more starts a new pass with the full area. FA_SHRINK_AREA=0 disables.
+        static const bool noShrink = [] { const char* e = std::getenv("FA_SHRINK_AREA"); return e && e[0] == '0'; }();
+        const VkRect2D scissor = Scissor(regs, areaW, areaH);
         bool same = renderingActive && curDepth == depth;
         for (int i = 0; i < 4 && same; i++) same = curColor[i] == attach[i];
+        bool fullArea = noShrink;
+        if (same && (scissor.offset.x + scissor.extent.width > curRaW || scissor.offset.y + scissor.extent.height > curRaH)) {
+            same = false;
+            fullArea = true;
+            EndRendering("area");
+        }
         if (!same) {
             EndRendering("drawtargets");
             for (int i = 0; i < 4; i++) curColor[i] = attach[i];
             curDepth = depth;
             curW = areaW;
             curH = areaH;
-            BeginRendering(curColor, curDepth, VkRect2D{{0, 0}, {areaW, areaH}});
+            uint32_t raH = areaH;
+            if (!fullArea) raH = std::min(areaH, std::max<uint32_t>(64u, (scissor.offset.y + scissor.extent.height + 63u) & ~63u));
+            BeginRendering(curColor, curDepth, VkRect2D{{0, 0}, {areaW, raH}});
         }
         if (curPipeline != pipe) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -2342,7 +2358,6 @@ struct VulkanRenderer::Impl {
         if (texSet) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 1, 1, &texSet, 0, nullptr);
         VkViewport vp{0.0f, 0.0f, float(areaW), float(areaH), 0.0f, 1.0f};
         vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D scissor = Scissor(regs, areaW, areaH);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         float bc[4] = {xe::AsFloat(regs[xe::RB_BLEND_RED]), xe::AsFloat(regs[xe::RB_BLEND_GREEN]),
                        xe::AsFloat(regs[xe::RB_BLEND_BLUE]), xe::AsFloat(regs[xe::RB_BLEND_ALPHA])};
