@@ -892,7 +892,10 @@ struct VulkanRenderer::Impl {
         const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
         auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
         if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
-        if (t.endian != e.endian || t.expAdjust != 0) return rej("endian/exp");
+        if (t.endian != e.endian || t.expAdjust != 0) {
+            SnapLog("fetch", "endian/exp", t.base & 0x1FFFFFFFu, t.format, t.endian, e.endian, uint32_t(int32_t(t.expAdjust)), 0, 0);
+            return VK_NULL_HANDLE;
+        }
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
         if (t.height > e.filled) return rej("incomplete");
         if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
@@ -3331,7 +3334,10 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
 }
 
 void VulkanRenderer::Sync() {
-    if (p_->ready && !p_->broken) p_->FlushPending();
+    // FA_SYNC_FLUSH=0: fences and interrupts from the command stream no longer force the pending resolves into
+    // guest memory (one GPU wait each); texture fetches, overlapping resolves and the swap still do.
+    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return !(e && e[0] == '0'); }();
+    if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
 }
 
