@@ -1665,13 +1665,19 @@ struct VulkanRenderer::Impl {
     // Streaming vertex memory (the game's per-frame vertex ring, run 73: one shader's fetches at
     // ever-advancing addresses) is rewritten by the game before our GPU runs the draw, because fences
     // are signalled when the commands are recorded, not when the GPU finishes. Those regions keep
-    // the copy at record time. A 1 MB region counts as streaming once more than FA_VB_STREAM (24)
+    // the copy at record time. With FA_VB_STREAM=N, a 1 MB region counts as streaming once more than N
     // fetch bases in one frame advance by small steps past the previous one; it stays so for 600
     // frames after the last frame that qualified.
+    // Every rewritten range FA_VB_CHECK found (runs 73, 74: menus and race, three shaders) was fetch
+    // constant 95, the slot the game streams its per-frame vertex data through, so that slot keeps
+    // the copy at record time and everything else is read directly. FA_VB_COPY_SLOT=-1 reads it
+    // directly too, another number picks another slot.
+    static inline const int vbCopySlot = [] { const char* e = std::getenv("FA_VB_COPY_SLOT"); return e ? std::atoi(e) : 95; }();
     struct StreamRegion { uint64_t frame = ~0ull; uint32_t lastBase = 0; uint32_t advances = 0; uint64_t until = 0; };
     std::unordered_map<uint32_t, StreamRegion> streamRegions;
     bool StreamingRegion(uint32_t pa) {
-        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 24u; }();
+        // Off by default: the 1 MB heuristic flagged most vertex memory (run 75) and missed 0x02800000.
+        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 0u; }();
         if (!limit) return false;
         StreamRegion& r = streamRegions[pa >> 20];
         if (r.frame != frame) { r.frame = frame; r.advances = 0; }
@@ -3017,7 +3023,9 @@ struct VulkanRenderer::Impl {
             // whole fetch range is used and the draw's largest index is not needed.
             auto tryDirect = [&](uint32_t n) {
                 const uint32_t pa = GuestPhys(vf.address);
-                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) || !mem.HostPtr(vf.address, n * 4)) return false;
+                if (int(s) == vbCopySlot || uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) ||
+                    !mem.HostPtr(vf.address, n * 4))
+                    return false;
                 sys.vf[s][0] = pa / 4;
                 sys.vf[s][1] = vf.endian;
                 sys.vf[s][2] = n;
