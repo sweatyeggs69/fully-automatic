@@ -2194,6 +2194,40 @@ struct VulkanRenderer::Impl {
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
             if (DumpDraw()) TraceInputs(regs, vs, ps, sys);
         }
+        {   // FA_PSCONST=<hex ps hash>[,<hex ps hash>...]: PS constants c0..c7 of those shaders, at most once per second each
+            static const std::vector<uint64_t> hashes = [] {
+                std::vector<uint64_t> v;
+                if (const char* e = std::getenv("FA_PSCONST"))
+                    for (const char* p = e; *p;) {
+                        char* end = nullptr;
+                        uint64_t h = std::strtoull(p, &end, 16);
+                        if (end == p) break;
+                        // hashes are logged as 16 hex digits; accept a prefix (e.g. a743cc16) too
+                        const int digits = int(end - p);
+                        v.push_back(digits >= 16 ? h : (h << (4 * (16 - digits))));
+                        v.push_back(digits >= 16 ? 0ull : ((1ull << (4 * (16 - digits))) - 1));
+                        p = *end == ',' ? end + 1 : end;
+                    }
+                return v;
+            }();
+            if (!hashes.empty()) {
+                static std::map<uint64_t, std::pair<std::chrono::steady_clock::time_point, uint32_t>> last;
+                for (size_t i = 0; i + 1 < hashes.size(); i += 2) {
+                    if ((dc.psHash & ~hashes[i + 1]) != hashes[i]) continue;
+                    auto& l = last[dc.psHash];
+                    l.second++;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - l.first < std::chrono::seconds(1)) break;
+                    l.first = now;
+                    auto cf = [&](uint32_t i2, int k) { return xe::AsFloat(regs[pm4::kAluConstBase + (256 + i2) * 4 + k]); };
+                    std::fprintf(stderr, "[psconst] frame %llu ps %016llx vs %016llx idx %zu draws %u:", (unsigned long long)frame,
+                                 (unsigned long long)dc.psHash, (unsigned long long)dc.vsHash, hd.indices.size(), l.second);
+                    for (uint32_t k = 0; k < 8; k++) std::fprintf(stderr, " c%u(%g %g %g %g)", k, cf(k, 0), cf(k, 1), cf(k, 2), cf(k, 3));
+                    std::fprintf(stderr, "\n");
+                    break;
+                }
+            }
+        }
         if (DumpDraw()) {
             for (int i = 0; i < 4; i++)
                 if (curColor[i]) { DumpTarget(curColor[i], scissor, "draw"); break; }
