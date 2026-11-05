@@ -3590,11 +3590,11 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
 }
 
 void VulkanRenderer::Sync() {
-    // Fences and interrupts from the command stream no longer force the pending resolves into guest memory (one
-    // GPU wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still do. Runs 36 and
-    // 57 showed no visual difference. FA_SYNC_FLUSH=1 restores the flush at every sync point. (Skipping the swap
-    // flush as well corrupted the scene in run 42: keep that one.)
-    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return e && e[0] == '1'; }();
+    // FA_SYNC_FLUSH=0: fences and interrupts from the command stream no longer force the pending resolves into
+    // guest memory (one GPU wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still
+    // do. Faster (run 57), but cars flickered in the pause menu with it (run 58, not in run 59 with it on), so it
+    // stays opt-in. Skipping the swap flush as well corrupted the scene in run 42.
+    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return !(e && e[0] == '0'); }();
     if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
 }
