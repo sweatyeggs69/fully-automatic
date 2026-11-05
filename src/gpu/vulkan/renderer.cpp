@@ -1413,9 +1413,44 @@ struct VulkanRenderer::Impl {
         Barrier();
         MarkTs(curPassLabel);
     }
+    // FA_VB_CHECK=1: for direct vertex reads, hash the fetched range (first 16 KB) when the draw is
+    // recorded and again at submit and after the GPU finished. A change means the GPU read different
+    // vertex data than a copy at record time would have given (the game rewrote the buffer early).
+    static inline const bool vbCheck = [] { const char* e = std::getenv("FA_VB_CHECK"); return e && e[0] == '1'; }();
+    struct VbCheck { uint32_t addr, words; uint64_t vs; uint32_t slot; uint64_t h; };
+    std::vector<VbCheck> vbChecks;
+    uint64_t HashGuest(uint32_t addr, uint32_t words) const {
+        const uint8_t* p = mem.HostPtr(addr, words * 4);
+        if (!p) return 0;
+        uint64_t h = 0x9E3779B97F4A7C15ull ^ words;
+        for (uint32_t k = 0; k + 1 < words; k += 2) {
+            uint64_t v;
+            std::memcpy(&v, p + size_t(k) * 4, 8);
+            h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+            h ^= h >> 29;
+        }
+        return h;
+    }
+    void VbCheckPass(const char* when, prof::Stat draws, prof::Stat kb) {
+        static int logged = 0;
+        for (auto& c : vbChecks) {
+            uint64_t h = HashGuest(c.addr, c.words);
+            if (h == c.h) continue;
+            prof::Add(draws, 1);
+            prof::Add(kb, c.words / 256);
+            c.h = h;  // count each change once
+            if (logged < 40) {
+                logged++;
+                std::fprintf(stderr, "[vbcheck] %s: vs %016llx slot %u, %08x, %u words changed since record\n", when,
+                             (unsigned long long)c.vs, c.slot, c.addr, c.words);
+            }
+        }
+    }
+
     // Submits everything recorded so far and waits for it. All per-batch resources are reset.
     void SubmitAndWait() {
         if (!recording) return;
+        if (vbCheck) VbCheckPass("submit", prof::kVbChgSubmit, prof::kVbChgSubmitKB);
         EndRendering("submit");
         MarkTs("other");
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
@@ -1426,6 +1461,11 @@ struct VulkanRenderer::Impl {
         Check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
         Check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         vkResetFences(dev, 1, &fence);
+        if (vbCheck) {
+            VbCheckPass("gpu done", prof::kVbChgGpu, prof::kVbChgGpuKB);
+            prof::Add(prof::kVbChecked, vbChecks.size());
+            vbChecks.clear();
+        }
         if (tsPool) {
             std::vector<uint64_t> ts(tsCount);
             if (tsCount >= 2 && vkGetQueryPoolResults(dev, tsPool, 0, tsCount, tsCount * sizeof(uint64_t), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -2961,6 +3001,10 @@ struct VulkanRenderer::Impl {
                 sys.vf[s][2] = n;
                 sys.vf[s][3] = 1;
                 prof::Add(prof::kVbDirectKB, uint64_t(n) / 256);
+                if (vbCheck) {
+                    const uint32_t hw = std::min<uint32_t>(n, 4096);
+                    vbChecks.push_back({vf.address, hw, dc.vsHash, s, HashGuest(vf.address, hw)});
+                }
                 return true;
             };
             if (guestBuf && tryDirect(words)) continue;
