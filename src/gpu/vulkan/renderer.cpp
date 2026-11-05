@@ -1553,7 +1553,7 @@ struct VulkanRenderer::Impl {
     }
 
     // ---- direct vertex reads ---------------------------------------------------------------
-    // FA_VB_DIRECT=1: wrap guest physical memory (the memfd) in a udmabuf and import it as one
+    // On unless FA_VB_DIRECT=0: wrap guest physical memory (the memfd) in a udmabuf and import it as one
     // storage buffer, so vertex fetches read guest memory on the GPU instead of being copied into
     // the ring for every draw. udmabuf pins the pages, so the runtime stops punching holes on free.
     VkBuffer guestBuf = VK_NULL_HANDLE;
@@ -1561,7 +1561,7 @@ struct VulkanRenderer::Impl {
     uint32_t guestSize = 0;
     void SetupDirectVb() {
         const char* e = std::getenv("FA_VB_DIRECT");
-        if (!e || e[0] != '1') return;
+        if (e && e[0] == '0') return;
         auto fail = [](const char* why, int code) { std::fprintf(stderr, "[vbdirect] off: %s (%d)\n", why, code); };
         int memfd = mem.PhysicalFd();
         uint32_t size = mem.PhysicalSize();
@@ -1897,7 +1897,7 @@ struct VulkanRenderer::Impl {
         dsai.descriptorSetCount = 1;
         dsai.pSetLayouts = &set0Layout;
         vkAllocateDescriptorSets(dev, &dsai, &set0);
-        // Binding 4 is guest physical memory for direct vertex reads (FA_VB_DIRECT=1), else the ring as a stand-in.
+        // Binding 4 is guest physical memory for direct vertex reads (see SetupDirectVb), else the ring as a stand-in.
         VkDescriptorBufferInfo bufInfo[5] = {{ring.buf, 0, 8192}, {ring.buf, 0, 160}, {ring.buf, 0, sizeof(XeSystemConstants)},
                                              {ring.buf, 0, VK_WHOLE_SIZE}, {guestBuf ? guestBuf : ring.buf, 0, VK_WHOLE_SIZE}};
         VkWriteDescriptorSet w[5] = {};
@@ -2632,6 +2632,70 @@ struct VulkanRenderer::Impl {
     }
 
     // ---- draws -------------------------------------------------------------------------------
+    struct FastIdx {
+        int mode = 0;           // 0 = host index list (BuildHostDraw), 1 = guest u16, 2 = guest u32, 3 = auto
+        HostPrim prim = HostPrim::Triangles;
+        uint32_t count = 0;     // indices drawn
+        uint32_t offset = 0;    // VGT_INDX_OFFSET, applied as the vertex offset
+        uint32_t maxIdx = 0;    // largest final index (offset applied)
+        const uint8_t* src = nullptr;
+    };
+    // List primitives (points, lines, triangles, rectangles) keep their indices as they are, so the
+    // host list BuildHostDraw makes is the guest list plus the offset. Falls back for strips, fans
+    // and quads, inline indices, unusual endian modes, a reset index present in the data, or an
+    // index that would wrap past 24 bits. FA_FAST_IDX=0 disables.
+    bool TryFastIndices(const DrawCall& dc, const RegisterFile& regs, FastIdx& fi) {
+        static const bool off = [] { const char* e = std::getenv("FA_FAST_IDX"); return e && e[0] == '0'; }();
+        if (off || !dc.indexCount) return false;
+        uint32_t per;
+        HostPrim prim;
+        switch (dc.primType) {
+            case xe::kPrimPointList: per = 1; prim = HostPrim::Points; break;
+            case xe::kPrimLineList: per = 2; prim = HostPrim::Lines; break;
+            case xe::kPrimTriangleList:
+            case xe::kPrimTriangleWithWFlags: per = 3; prim = HostPrim::Triangles; break;
+            case xe::kPrimRectangleList: per = 3; prim = HostPrim::Rects; break;
+            default: return false;
+        }
+        const uint32_t offset = regs[xe::VGT_INDX_OFFSET] & 0xFFFFFF;
+        const uint32_t n = dc.indexCount / per * per;
+        if (!n) return false;
+        if (!dc.indexed) {
+            if (uint64_t(offset) + n > 0xFFFFFF) return false;
+            fi = {3, prim, n, offset, offset + n - 1, nullptr};
+            return true;
+        }
+        if (!dc.inlineIndices.empty() || !dc.indexGuestAddr) return false;
+        if (dc.index32 ? dc.indexEndian != kEndian8in32 : dc.indexEndian != kEndian8in16) return false;
+        const uint32_t bytes = dc.indexCount * (dc.index32 ? 4 : 2);
+        const uint8_t* p = mem.HostPtr(dc.indexGuestAddr, (bytes + 3) & ~3u);
+        if (!p) return false;
+        const bool resetEnabled = (regs[xe::PA_SU_SC_MODE_CNTL] >> 21) & 1;
+        const uint32_t resetMask = dc.index32 ? 0xFFFFFF : 0xFFFF;
+        const uint32_t reset = resetEnabled ? (regs[xe::VGT_MULTI_PRIM_IB_RESET_INDX] & resetMask) : ~0u;
+        uint32_t mx = 0;
+        if (dc.index32) {
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v;
+                std::memcpy(&v, p + size_t(i) * 4, 4);
+                v = __builtin_bswap32(v);
+                if ((v & resetMask) == reset || v > 0xFFFFFF) return false;
+                mx = std::max(mx, v);
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                uint16_t v;
+                std::memcpy(&v, p + size_t(i) * 2, 2);
+                v = __builtin_bswap16(v);
+                if (v == reset) return false;
+                mx = std::max<uint32_t>(mx, v);
+            }
+        }
+        if (uint64_t(mx) + offset > 0xFFFFFF) return false;
+        fi = {dc.index32 ? 2 : 1, prim, n, offset, mx + offset, p};
+        return true;
+    }
+
     void Draw(const DrawCall& dc, const RegisterFile& regs) {
         prof::Scope ps_(prof::kDraw);
         uint32_t mode = regs[xe::RB_MODECONTROL] & 7;
@@ -2642,9 +2706,22 @@ struct VulkanRenderer::Impl {
         if (!vs->ok || !ps->ok) { stats.drawsSkipped++; return; }
         std::optional<prof::Scope> sec;
         sec.emplace(prof::kDrawBuild);
-        if (!BuildHostDraw(dc, regs, mem, hostDraw)) { stats.drawsSkipped++; return; }
+        // List primitives whose indices need no rewriting skip the host index list: the guest indices
+        // are byte swapped straight into the ring (fi.mode 1/2), or not uploaded at all for
+        // auto indices (mode 3). The index offset becomes the draw's vertex offset.
+        FastIdx fi;
         HostDraw& hd = hostDraw;
-        prof::Add(prof::kIdxCount, hd.indices.size());
+        if (TryFastIndices(dc, regs, fi)) {
+            hd.indices.clear();
+            hd.prim = fi.prim;
+            hd.supported = true;
+        } else if (!BuildHostDraw(dc, regs, mem, hostDraw)) {
+            stats.drawsSkipped++;
+            return;
+        }
+        const uint32_t nIdx = fi.mode ? fi.count : uint32_t(hd.indices.size());
+        prof::Add(prof::kIdxCount, nIdx);
+        if (fi.mode) prof::Add(prof::kIdxFast, nIdx);
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 
@@ -2858,12 +2935,26 @@ struct VulkanRenderer::Impl {
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             uint32_t words = std::min<uint32_t>(vf.sizeWords, 4u << 20);
             if (vf.type != 3 || !words) continue;
+            // Direct read: the shader fetches from guest memory (binding 4); nothing is copied, so the
+            // whole fetch range is used and the draw's largest index is not needed.
+            auto tryDirect = [&](uint32_t n) {
+                const uint32_t pa = GuestPhys(vf.address);
+                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || !mem.HostPtr(vf.address, n * 4)) return false;
+                sys.vf[s][0] = pa / 4;
+                sys.vf[s][1] = vf.endian;
+                sys.vf[s][2] = n;
+                sys.vf[s][3] = 1;
+                prof::Add(prof::kVbDirectKB, uint64_t(n) / 256);
+                return true;
+            };
+            if (guestBuf && tryDirect(words)) continue;
             // Games often give the fetch constant a whole pool as its size; only the part the draw's
             // indices can reach needs copying (when the shader indexes straight from the vertex index).
             if (vs->info.vfetchStride[s]) {
                 if (maxIdx == ~0u) {
                     maxIdx = 0;
-                    for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
+                    if (fi.mode) maxIdx = fi.maxIdx;
+                    else for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
                 }
                 uint64_t need = uint64_t(maxIdx) * vs->info.vfetchStride[s] + vs->info.vfetchEnd[s];
                 words = uint32_t(std::min<uint64_t>(words, need));
@@ -2875,7 +2966,7 @@ struct VulkanRenderer::Impl {
                     logged++;
                     std::fprintf(stderr, "[vbprof] vs %016llx slot %u: fetch words %u, copy %u, stride %u end %u, indices %zu max %d\n",
                                  (unsigned long long)dc.vsHash, s, vf.sizeWords, words, vs->info.vfetchStride[s],
-                                 vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
+                                 vs->info.vfetchEnd[s], size_t(nIdx), maxIdx == ~0u ? -1 : int(maxIdx));
                 }
             }
             if (prof::g_enabled && !vs->info.vfetchStride[s] && vs->info.vfetchUsed[s / 32]) {
@@ -2883,20 +2974,9 @@ struct VulkanRenderer::Impl {
                 static std::set<uint64_t> seenUnb;
                 if (seenUnb.size() < 60 && seenUnb.insert(dc.vsHash ^ (uint64_t(s) << 56)).second)
                     std::fprintf(stderr, "[vbunb] vs %016llx slot %u: why 0x%x fetch words %u, indices %zu\n",
-                                 (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, hd.indices.size());
+                                 (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, size_t(nIdx));
             }
-            if (guestBuf) {
-                // Direct read: the shader fetches from guest memory (binding 4); nothing is copied.
-                const uint32_t pa = GuestPhys(vf.address);
-                if (uint64_t(pa) + uint64_t(words) * 4 <= guestSize && mem.HostPtr(vf.address, words * 4)) {
-                    sys.vf[s][0] = pa / 4;
-                    sys.vf[s][1] = vf.endian;
-                    sys.vf[s][2] = words;
-                    sys.vf[s][3] = 1;
-                    prof::Add(prof::kVbDirectKB, uint64_t(words) / 256);
-                    continue;
-                }
-            }
+            if (guestBuf && tryDirect(words)) continue;
             if (!vs->info.vfetchStride[s]) {
                 const uint64_t endKey = uint64_t(vf.address) + uint64_t(words) * 4;
                 auto uit = unbCache.find(endKey);
@@ -2961,16 +3041,25 @@ struct VulkanRenderer::Impl {
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
-        VkDeviceSize idxOff = RingAlloc(hd.indices.size() * 4, 16, flushed);
+        const VkDeviceSize idxBytes = fi.mode == 3 ? 0 : fi.mode == 1 ? VkDeviceSize(nIdx) * 2 : VkDeviceSize(nIdx) * 4;
+        VkDeviceSize idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         if (flushed) {
             // Batch restarted: everything above has to be uploaded again into the new batch.
             RecoverConsts(consts, constsOff, boolOff, regs, uboAlign);
             ReuploadVbs(sys, vs, regs);
             sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
             std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
-            idxOff = RingAlloc(hd.indices.size() * 4, 16, flushed);
+            idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         }
-        std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
+        if (fi.mode == 1) {
+            uint16_t* d = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(ring.map) + idxOff);
+            for (uint32_t i = 0; i < nIdx; i++) { uint16_t v; std::memcpy(&v, fi.src + size_t(i) * 2, 2); d[i] = __builtin_bswap16(v); }
+        } else if (fi.mode == 2) {
+            uint32_t* d = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(ring.map) + idxOff);
+            for (uint32_t i = 0; i < nIdx; i++) { uint32_t v; std::memcpy(&v, fi.src + size_t(i) * 4, 4); d[i] = __builtin_bswap32(v); }
+        } else if (!fi.mode) {
+            std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
+        }
 
         sub.reset();
         // Pipeline.
@@ -3047,8 +3136,12 @@ struct VulkanRenderer::Impl {
         vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, (srmBf >> 16) & 0xFF);
         vkCmdSetDepthBias(cmd, xe::AsFloat(regs[xe::PA_SU_POLY_OFFSET_FRONT_OFFSET]), 0.0f,
                           xe::AsFloat(regs[xe::PA_SU_POLY_OFFSET_FRONT_SCALE]));
-        vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
+        if (fi.mode == 3) {
+            vkCmdDraw(cmd, nIdx, 1, fi.offset, 0);
+        } else {
+            vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, fi.mode == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, nIdx, 1, 0, int32_t(fi.offset), 0);
+        }
         if (tsPool && DrawTsOn()) {
             char lb[40];
             std::snprintf(lb, sizeof lb, "D ps %016llx", (unsigned long long)dc.psHash);
@@ -3062,7 +3155,7 @@ struct VulkanRenderer::Impl {
             std::fprintf(stderr,
                          "[render] frame %llu draw %llu (#%llu in frame): prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), size_t(nIdx),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
@@ -3095,7 +3188,7 @@ struct VulkanRenderer::Impl {
                     l.first = now;
                     auto cf = [&](uint32_t i2, int k) { return xe::AsFloat(regs[pm4::kAluConstBase + (256 + i2) * 4 + k]); };
                     std::fprintf(stderr, "[psconst] frame %llu ps %016llx vs %016llx idx %zu draws %u:", (unsigned long long)frame,
-                                 (unsigned long long)dc.psHash, (unsigned long long)dc.vsHash, hd.indices.size(), l.second);
+                                 (unsigned long long)dc.psHash, (unsigned long long)dc.vsHash, size_t(nIdx), l.second);
                     for (uint32_t k = 0; k < 8; k++) std::fprintf(stderr, " c%u(%g %g %g %g)", k, cf(k, 0), cf(k, 1), cf(k, 2), cf(k, 3));
                     std::fprintf(stderr, "\n");
                     break;
@@ -3130,7 +3223,7 @@ struct VulkanRenderer::Impl {
                     probeLast[k] = f;
                     std::fprintf(stderr, "[probe] frame %llu draw %llu pixel(%d,%d) -> %.3f %.3f %.3f %.3f | prim %u idx %zu vs %016llx ps %016llx blend %08x\n",
                                  (unsigned long long)frame, (unsigned long long)stats.draws.load(), probePts[k].first, probePts[k].second,
-                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), hd.indices.size(), (unsigned long long)dc.vsHash,
+                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), size_t(nIdx), (unsigned long long)dc.vsHash,
                                  (unsigned long long)dc.psHash, regs[xe::RB_BLENDCONTROL0]);
                     if (probeTraced.insert({dc.vsHash, dc.psHash}).second) TraceInputs(regs, vs, ps, sys);
                 }
