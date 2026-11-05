@@ -714,7 +714,7 @@ struct VulkanRenderer::Impl {
             offs.push_back(total);
             total += (VkDeviceSize(snaps[k].w) * snaps[k].h * 4 + 15) & ~VkDeviceSize(15);
         }
-        EndRendering();
+        EndRendering("flushpending");
         if (pendingGenBytes + total > readback.size) {
             // The generic resolves already recorded live in the current buffer: run them before replacing it.
             {
@@ -853,11 +853,11 @@ struct VulkanRenderer::Impl {
                     e.crops.erase((t.width << 16) | t.height);
                     return VK_NULL_HANDLE;
                 }
-                EndRendering();
+                EndRendering("snapview");
                 ImageToGeneral(c.img.img, VK_IMAGE_ASPECT_COLOR_BIT, 1);
             }
             if (c.version != e.version) {
-                EndRendering();
+                EndRendering("snapview");
                 Barrier();
                 VkImageCopy ic{};
                 ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1158,8 +1158,10 @@ struct VulkanRenderer::Impl {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
     }
-    void EndRendering() {
+    std::map<std::string, uint32_t> endReasons;
+    void EndRendering(const char* why = "other") {
         if (!renderingActive) return;
+        if (tsPool) endReasons[curPassLabel + " <- " + why]++;
         vkCmdEndRendering(cmd);
         renderingActive = false;
         curPipeline = VK_NULL_HANDLE;
@@ -1169,7 +1171,7 @@ struct VulkanRenderer::Impl {
     // Submits everything recorded so far and waits for it. All per-batch resources are reset.
     void SubmitAndWait() {
         if (!recording) return;
-        EndRendering();
+        EndRendering("submit");
         MarkTs("other");
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         recording = false;
@@ -1599,7 +1601,7 @@ struct VulkanRenderer::Impl {
             rts.erase(key);
             return nullptr;
         }
-        EndRendering();
+        EndRendering("getrt");
         ImageToGeneral(rt.image.img, aspect, 1);
         VkImageSubresourceRange rr{aspect, 0, 1, 0, 1};
         if (depth) {
@@ -1846,7 +1848,7 @@ struct VulkanRenderer::Impl {
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
                        tex.image.layers != ht.layers || tex.image.levels != ht.levels;
-        EndRendering();
+        EndRendering("gettexture");
         if (needNew) {
             if (tex.ok) garbageImages.push_back(tex.image);
             tex.image = Image{};
@@ -2324,7 +2326,7 @@ struct VulkanRenderer::Impl {
         bool same = renderingActive && curDepth == depth;
         for (int i = 0; i < 4 && same; i++) same = curColor[i] == attach[i];
         if (!same) {
-            EndRendering();
+            EndRendering("drawtargets");
             for (int i = 0; i < 4; i++) curColor[i] = attach[i];
             curDepth = depth;
             curW = areaW;
@@ -2413,7 +2415,7 @@ struct VulkanRenderer::Impl {
         const uint32_t bpp = VkFormatBytes(rt->image.format);
         const VkDeviceSize stride = 32;
         const VkDeviceSize need = stride * pts.size();
-        EndRendering();
+        EndRendering("probe");
         if (need > readback.size) {
             SubmitAndWait();
             Begin();
@@ -2448,7 +2450,7 @@ struct VulkanRenderer::Impl {
         FlushPending();  // the readback buffer holds pending resolves
         uint32_t bpp = VkFormatBytes(rt->image.format);
         VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
-        EndRendering();
+        EndRendering("dump");
         if (bytes > readback.size) {
             SubmitAndWait();
             Begin();
@@ -2690,7 +2692,7 @@ struct VulkanRenderer::Impl {
         w = std::min(w, src->image.w - std::min<uint32_t>(src->image.w, uint32_t(x0)));
         h = std::min(h, src->image.h - std::min<uint32_t>(src->image.h, uint32_t(y0)));
         if (!w || !h) return;
-        EndRendering();
+        EndRendering("resolve");
 
         // Copy EDRAM -> guest memory.
         if (copyCmd == 0 || copyCmd == 1) {
@@ -2737,7 +2739,7 @@ struct VulkanRenderer::Impl {
                         DestroyBuffer(readback);
                         CreateBuffer(readback, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
                     }
-                    EndRendering();
+                    EndRendering("resolve2");
                     VkBufferImageCopy bic{};
                     bic.bufferOffset = pendingGenBytes;
                     bic.imageSubresource = {VkImageAspectFlags(isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
@@ -2951,7 +2953,7 @@ struct VulkanRenderer::Impl {
 
     void ClearRect(RenderTarget* rt, const RegisterFile& regs, int32_t x, int32_t y, uint32_t w, uint32_t h, bool depth) {
         stats.clears++;
-        EndRendering();
+        EndRendering("clear");
         RenderTarget* color[4] = {};
         if (!depth) color[0] = rt;
         w = std::min(w, rt->image.w - std::min<uint32_t>(rt->image.w, uint32_t(x)));
@@ -2972,7 +2974,7 @@ struct VulkanRenderer::Impl {
         }
         VkClearRect cr{{{x, y}, {w, h}}, 0, 1};
         vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
-        EndRendering();
+        EndRendering("clearend");
         for (auto& c : curColor) c = nullptr;
         curDepth = nullptr;
     }
@@ -3039,6 +3041,15 @@ struct VulkanRenderer::Impl {
                 line += b;
             }
             std::fprintf(stderr, "%s\n", line.c_str());
+            std::vector<std::pair<std::string, uint32_t>> er(endReasons.begin(), endReasons.end());
+            std::sort(er.begin(), er.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string l2 = "[gpupass] pass ends per frame:";
+            for (size_t i = 0; i < er.size() && i < 10; i++) {
+                std::snprintf(b, sizeof b, " | %s %.1f", er[i].first.c_str(), er[i].second / 300.0);
+                l2 += b;
+            }
+            std::fprintf(stderr, "%s\n", l2.c_str());
+            endReasons.clear();
             passStats.clear();
         }
         TrimTextures();
