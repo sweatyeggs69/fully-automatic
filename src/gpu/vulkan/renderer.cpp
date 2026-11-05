@@ -2538,6 +2538,7 @@ struct VulkanRenderer::Impl {
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = key.prim == uint32_t(HostPrim::Points) ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                     : key.prim == uint32_t(HostPrim::Lines) ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                    : key.prim == uint32_t(HostPrim::TriStrip) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
                     : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vps.viewportCount = 1;
@@ -2656,11 +2657,14 @@ struct VulkanRenderer::Impl {
             case xe::kPrimTriangleList:
             case xe::kPrimTriangleWithWFlags: per = 3; prim = HostPrim::Triangles; break;
             case xe::kPrimRectangleList: per = 3; prim = HostPrim::Rects; break;
+            // Strips are drawn as native strips: same triangles and winding as the list BuildHostDraw
+            // makes (odd triangles have their first two vertices swapped either way).
+            case xe::kPrimTriangleStrip: per = 1; prim = HostPrim::TriStrip; break;
             default: return false;
         }
         const uint32_t offset = regs[xe::VGT_INDX_OFFSET] & 0xFFFFFF;
         const uint32_t n = dc.indexCount / per * per;
-        if (!n) return false;
+        if (!n || (prim == HostPrim::TriStrip && n < 3)) return false;
         if (!dc.indexed) {
             if (uint64_t(offset) + n > 0xFFFFFF) return false;
             fi = {3, prim, n, offset, offset + n - 1, nullptr};
@@ -3093,7 +3097,7 @@ struct VulkanRenderer::Impl {
         key.colorMask = colorMask;
         key.depthControl = depth ? depthCtl : 0;
         if (depth && !(depthCtl & 1)) key.depthControl &= 0xFF & ~0x80u;  // stencil off: ignore its fields
-        bool tri = hd.prim == HostPrim::Triangles;
+        bool tri = hd.prim == HostPrim::Triangles || hd.prim == HostPrim::TriStrip;
         key.cull = tri ? ((sc & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((sc & 2) ? VK_CULL_MODE_BACK_BIT : 0) : 0;
         key.frontFace = (sc & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         key.depthBias = depth && ((sc >> 11) & 3) ? 1 : 0;
