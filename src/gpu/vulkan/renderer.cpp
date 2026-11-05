@@ -3345,7 +3345,10 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
 }
 
 void VulkanRenderer::Sync() {
-    if (p_->ready && !p_->broken) p_->FlushPending();
+    // FA_SYNC_FLUSH=0: fences and interrupts from the command stream no longer force the pending resolves into
+    // guest memory (one GPU wait each); texture fetches, overlapping resolves and the swap still do.
+    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return !(e && e[0] == '0'); }();
+    if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
 }
 
