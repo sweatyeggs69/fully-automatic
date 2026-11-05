@@ -836,7 +836,13 @@ struct VulkanRenderer::Impl {
             e.pending = false;
             if (!e.valid) continue;  // overwritten since: nothing to write
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
-            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes)) {
+            prof::Add(prof::kWbSnapKB, destBytes / 1024);
+            bool raw;
+            {
+                prof::Scope pr_(prof::kRcRaw);
+                raw = ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes);
+            }
+            if (raw) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes, 766);  // other textures over this memory are stale now
                 e.valid = keep;
@@ -858,6 +864,8 @@ struct VulkanRenderer::Impl {
     // Converts the generic resolves recorded since the last flush into guest memory (their pixels are in readback).
     void FinishGenerics() {
         if (pendingGen.empty()) return;
+        prof::Scope pg_(prof::kRcGen);
+        for (const PendingGeneric& j : pendingGen) prof::Add(prof::kWbGenKB, j.destBytes / 1024);
         std::vector<PendingGeneric> jobs;
         jobs.swap(pendingGen);
         pendingGenBytes = 0;
@@ -3590,11 +3598,11 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
 }
 
 void VulkanRenderer::Sync() {
-    // FA_SYNC_FLUSH=0: fences and interrupts from the command stream no longer force the pending resolves into
-    // guest memory (one GPU wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still
-    // do. Faster (run 57), but cars flickered in the pause menu with it (run 58, not in run 59 with it on), so it
-    // stays opt-in. Skipping the swap flush as well corrupted the scene in run 42.
-    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return !(e && e[0] == '0'); }();
+    // Fences and interrupts from the command stream do not force the pending resolves into guest memory (one GPU
+    // wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still do. The pause menu car
+    // flicker seen without them (run 58) came with the CPU-decoded cube map; with cube snapshots (#111) run 62 showed
+    // none. FA_SYNC_FLUSH=1 restores the flush at every sync point. Skipping the swap flush corrupted the scene (run 42).
+    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return e && e[0] == '1'; }();
     if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
 }
