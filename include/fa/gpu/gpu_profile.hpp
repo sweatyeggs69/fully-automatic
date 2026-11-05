@@ -32,12 +32,15 @@ enum Section : int {
     kDtGet,        // inside d.tex: GetTexture calls in total (includes tex check and tex upload)
     kDtSnap,       // inside d.tex: SnapView lookups
     kDtDesc,       // inside d.tex: descriptor set allocation and update
+    kUpConst,      // inside d.upload: shader constants and system constants
+    kUpVb,         // inside d.upload: vertex buffer lookups and copies
+    kUpIdx,        // inside d.upload: system block and index copy (includes ring flush recovery)
     kCount
 };
 
 inline const char* const kNames[kCount] = {"busy",         "draw",        "tex check",  "tex upload",
                                            "shader",       "pipeline",    "resolve",    "resolve wait",
-                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc"};
+                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc", "up.const", "up.vb", "up.idx"};
 
 inline const bool g_enabled = std::getenv("FA_PROFILE") != nullptr;
 inline std::atomic<uint64_t> g_ns[kCount];

@@ -2318,6 +2318,8 @@ struct VulkanRenderer::Impl {
 
         // Uniforms and vertex data.
         sec.emplace(prof::kDrawUpload);
+        std::optional<prof::Scope> sub;
+        sub.emplace(prof::kUpConst);
         const VkDeviceSize uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
         bool flushed;
         VkDeviceSize constsOff;
@@ -2390,6 +2392,7 @@ struct VulkanRenderer::Impl {
         sys.misc[1] = float((regs[xe::PA_SU_POINT_SIZE] >> 16) & 0xFFFF) / 8.0f;
         if (sys.misc[1] <= 0.0f) sys.misc[1] = 1.0f;
 
+        sub.emplace(prof::kUpVb);
         // Vertex buffers used by the vertex shader.
         uint32_t maxIdx = ~0u;  // largest vertex index of this draw, computed on first use
         for (uint32_t s = 0; s < 96; s++) {
@@ -2464,6 +2467,7 @@ struct VulkanRenderer::Impl {
             sys.vf[s][1] = vf.endian;
             sys.vf[s][2] = words;
         }
+        sub.emplace(prof::kUpIdx);
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
@@ -2478,6 +2482,7 @@ struct VulkanRenderer::Impl {
         }
         std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
 
+        sub.reset();
         // Pipeline.
         sec.emplace(prof::kDrawRecord);
         PipelineKey key{};
