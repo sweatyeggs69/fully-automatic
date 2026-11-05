@@ -65,7 +65,9 @@ struct XeSystemConstants {
                            // w: number of interpolators the PS reads
     float misc[4];         // x: alpha ref, y: point size (pixels), z: pixel centre offset, w: 0
     uint32_t vf[96][4];    // vertex fetch slot: x = word offset in XeVertexWords, y = endian, z = size words
+    float texXf[32][4];    // texture slot conversion: x = mode (0 none, 1 scale + clamp, 2 float bits as unorm32),
+                           // y = scale, z = clamp low, w = mask of result components to convert
 };
-static_assert(sizeof(XeSystemConstants) == 96 + 96 * 16, "std140 layout");
+static_assert(sizeof(XeSystemConstants) == 96 + 96 * 16 + 32 * 16, "std140 layout");
 
 }  // namespace fa::gpu

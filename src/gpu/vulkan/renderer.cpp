@@ -564,7 +564,7 @@ struct VulkanRenderer::Impl {
     // a texture or snapshot invalidation). Draws repeating the previous lookup of a slot within one epoch reuse it.
     uint64_t upCreateNs = 0, upStageNs = 0, upRecNs = 0, upBytes = 0, upNew = 0;  // FA_PROFILE: upload phases
     uint64_t texEpoch = 1;
-    struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; };
+    struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; float xf[4] = {0, 0, 0, 0}; };
     SlotMemo slotMemo[32];
     // Same idea across slots: a direct-mapped table of recent lookups (any slot) in this epoch, so draws that
     // alternate between textures still skip GetTexture. FA_TEX_MEMO2=0 disables.
@@ -574,6 +574,7 @@ struct VulkanRenderer::Impl {
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+        prof::Scope pi_(prof::kInval);
         texEpoch++;
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
@@ -590,7 +591,7 @@ struct VulkanRenderer::Impl {
     // uploading the guest bytes again (FA_RESOLVE_GPU=0 turns this off).
     // Guest texture format classes a snapshot can stand in for: 8888, 2_10_10_10, 32_FLOAT, 16_16_FLOAT (all 4 bytes per texel).
     static int SnapClass(uint32_t f) {
-        return (f == 6 || f == 14 || f == 50) ? 1 : (f == 7 || f == 54) ? 2 : f == 36 ? 3 : f == 31 ? 4 : 0;
+        return (f == 6 || f == 14 || f == 50) ? 1 : (f == 7 || f == 54) ? 2 : f == 36 ? 3 : f == 31 ? 4 : f == 25 ? 5 : 0;
     }
     // Host render target formats whose resolve to guest format `f` can be kept as a snapshot (ResolveRaw converts on writeback).
     static bool SnapResolvable(VkFormat src, uint32_t f) {
@@ -598,6 +599,7 @@ struct VulkanRenderer::Impl {
             case 1: case 2: return src == VK_FORMAT_R8G8B8A8_UNORM || src == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             case 3: return src == VK_FORMAT_R32_SFLOAT;
             case 4: return src == VK_FORMAT_R16G16_SFLOAT;
+            case 5: return src == VK_FORMAT_R16G16_SFLOAT && snapXf;  // 16_16 normalised: sampled with a scale and clamp
         }
         return false;
     }
@@ -620,11 +622,17 @@ struct VulkanRenderer::Impl {
         bool swapRB = false;
         bool pending = false;       // guest memory not written yet (see FlushPending)
         ResolveDest dest{};         // how to write it when it is
+        uint32_t srcRt = 0;         // xe render target format it was resolved from (for the generic writeback)
         uint32_t samples[64] = {};  // dwords of the guest surface when it was resolved
     };
     std::unordered_map<uint32_t, Snap> snaps;  // by destination base (masked to 512 MB)
     std::vector<VkImageView> garbageViews;
     const bool snapEnabled = [] { const char* e = std::getenv("FA_RESOLVE_GPU"); return !(e && e[0] == '0'); }();
+    // Snapshots that need a conversion in the shader (FA_SNAP_XF=0 disables): 16_16 normalised resolves (with an
+    // exponent bias) sampled as scale + clamp, and 32_FLOAT snapshots fetched as k_32 (float bits as unorm32).
+    static inline const bool snapXf = [] { const char* e = std::getenv("FA_SNAP_XF"); return !(e && e[0] == '0'); }();
+    float curXf[4] = {0, 0, 0, 0};  // set by SnapView for the lookup in progress: mode, scale, clamp low, component mask
+    uint32_t curResolveSrcRt = 0;   // xe render target format of the resolve being stored as a snapshot
 
     static bool SnapSample(const uint8_t* p, uint32_t size, uint32_t out[64]) {
         const uint32_t words = size / 4;
@@ -772,6 +780,7 @@ struct VulkanRenderer::Impl {
         e.h = H;
         e.filled = h;
         e.dest = d;
+        e.srcRt = curResolveSrcRt;
         std::memcpy(e.samples, samples, sizeof samples);
         e.version++;
         e.valid = true;
@@ -830,6 +839,13 @@ struct VulkanRenderer::Impl {
             if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes)) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes, 766);  // other textures over this memory are stale now
+                e.valid = keep;
+                if (const uint8_t* gp = mem.HostPtr(e.dest.base, destBytes)) SnapSample(gp, destBytes, e.samples);
+            } else if (SnapClass(e.dest.format) == 5) {
+                // No raw copy for this one (16-bit normalised, maybe with an exponent bias): convert like a generic resolve.
+                const bool keep = e.valid;
+                PendingGeneric j{e.dest, e.img.format, false, e.srcRt, 0, 0, e.w, e.filled, destBytes, VkFormatBytes(e.img.format), 0};
+                FinishGeneric(j, rb + snapBase + offs[i]);
                 e.valid = keep;
                 if (const uint8_t* gp = mem.HostPtr(e.dest.base, destBytes)) SnapSample(gp, destBytes, e.samples);
             } else {
@@ -900,7 +916,9 @@ struct VulkanRenderer::Impl {
         if (it == snaps.end()) return VK_NULL_HANDLE;
         if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, it->second.invBase, it->second.invSize, it->second.invSite); return VK_NULL_HANDLE; }
         Snap& e = it->second;
-        const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
+        // k_32 fetched over a 32_FLOAT snapshot: the shader turns the float bits into unorm32 (as the CPU decode would).
+        const bool bitsAsUnorm = snapXf && t.format == 33 && SnapClass(e.dest.format) == 3;
+        const bool fmtOk = bitsAsUnorm || (SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format));
         auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
         if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
         if (t.endian != e.endian || t.expAdjust != 0) {
@@ -912,6 +930,23 @@ struct VulkanRenderer::Impl {
         if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
         for (int c = 0; c < 4; c++) if (t.sign[c]) return rej("sign");
         if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return rej("pitch");
+        float xf[4] = {0, 0, 0, 0};
+        if (bitsAsUnorm || SnapClass(e.dest.format) == 5) {
+            // Components that read a stored channel get the conversion; constant 0 / 1 and missing channels do not.
+            const uint32_t chans = bitsAsUnorm ? 1 : 2;
+            uint32_t mask = 0;
+            for (int c = 0; c < 4; c++) if (((t.swizzle >> (3 * c)) & 7) < chans) mask |= 1u << c;
+            if (bitsAsUnorm) {
+                xf[0] = 2.0f;
+            } else {
+                float k = std::ldexp(1.0f, e.dest.expBias);
+                if (Rt1616Scaled() && e.srcRt == xe::kRt16_16) k *= 1.0f / 32.0f;
+                xf[0] = 1.0f;
+                xf[1] = k;
+            }
+            xf[2] = 0.0f;
+            xf[3] = float(mask);
+        }
         const uint8_t* src = mem.HostPtr(t.base, e.size);
         if (!src) return VK_NULL_HANDLE;
         // Sampling 64 dwords spread over the surface costs a cache miss each: once per frame and snapshot version
@@ -951,6 +986,7 @@ struct VulkanRenderer::Impl {
             image = c.img.img;
             views = &c.views;
         }
+        std::memcpy(curXf, xf, sizeof xf);
         auto v = views->find(t.swizzle);
         if (v != views->end()) return v->second;
         VkComponentMapping cm;
@@ -968,7 +1004,7 @@ struct VulkanRenderer::Impl {
         vi.components = cm;
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageView view = VK_NULL_HANDLE;
-        if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) { std::memset(curXf, 0, sizeof curXf); return VK_NULL_HANDLE; }
         (*views)[t.swizzle] = view;
         return view;
     }
@@ -1830,6 +1866,7 @@ struct VulkanRenderer::Impl {
 
     // Returns the image view for texture fetch slot `slot` (uploading it if its bytes changed).
     VkImageView GetTexture(const RegisterFile& regs, uint32_t slot, bool cube, VkSampler& sampler) {
+        std::memset(curXf, 0, sizeof curXf);
         uint32_t d[6];
         for (int k = 0; k < 6; k++) d[k] = regs[pm4::kFetchConstBase + slot * 6 + k];
         TextureFetch t = ParseTextureFetch(d);
@@ -1874,6 +1911,7 @@ struct VulkanRenderer::Impl {
                                  sv ? "SNAPSHOT" : "miss", sit->second.w, sit->second.h, sit->second.dest.format, int(sit->second.valid));
             }
             if (sv) return sv;
+            std::memset(curXf, 0, sizeof curXf);
         }
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
@@ -1888,11 +1926,18 @@ struct VulkanRenderer::Impl {
                 const uint64_t lo = t.base & 0x1FFFFFFFu, hi = lo + size;
                 for (const PendingGeneric& g : pendingGen) {
                     const uint64_t glo = g.d.base & 0x1FFFFFFFu;
-                    if (glo < hi && lo < glo + g.destBytes)
+                    if (glo < hi && lo < glo + g.destBytes) {
+                        prof::Add(prof::kFtGen, 1);
+                        if (ResTrace()) std::fprintf(stderr, "[restrace] f%llu flushtex by generic %08x (fetch %08x fmt %u)\n", (unsigned long long)frame, uint32_t(glo), uint32_t(lo), t.format);
                         SnapLog("flushtex", "g", uint32_t(lo), t.format, t.width, uint32_t(glo), g.d.format, uint32_t(g.fmt), uint32_t(int32_t(g.d.expBias)));
+                    }
                 }
                 for (uint32_t k : pendingKeys) {
                     const Snap& e = snaps[k];
+                    if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) {
+                        prof::Add(prof::kFtSnap, 1);
+                        if (ResTrace()) std::fprintf(stderr, "[restrace] f%llu flushtex by snapshot %08x (fetch %08x fmt %u)\n", (unsigned long long)frame, e.base, uint32_t(lo), t.format);
+                    }
                     if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size)
                         SnapLog("flushtex", "s", uint32_t(lo), t.format, t.width, e.base, e.dest.format, uint32_t(e.img.format), uint32_t(int32_t(t.expAdjust)));
                 }
@@ -2259,6 +2304,7 @@ struct VulkanRenderer::Impl {
         // Textures (uploads happen outside rendering, so before BeginRendering).
         sec.emplace(prof::kDrawTex);
         uint32_t texUsed = vs->info.texUsed | ps->info.texUsed;
+        float texXf[32][4] = {};  // per slot sampling conversion for snapshots (see SnapView), copied into XeSystem
         VkDescriptorSet texSet = VK_NULL_HANDLE;
         if (texUsed) {
             // Views first: an upload can flush the batch, which resets the descriptor pool.
@@ -2293,8 +2339,10 @@ struct VulkanRenderer::Impl {
                         std::memcpy(m.d, fc, sizeof m.d);
                         m.view = view;
                         m.smp = smp;
+                        std::memcpy(m.xf, curXf, sizeof m.xf);
                         g = m;
                     }
+                    std::memcpy(texXf[s], m.xf, sizeof m.xf);
                 }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2386,6 +2434,7 @@ struct VulkanRenderer::Impl {
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
+        std::memcpy(sys.texXf, texXf, sizeof texXf);
         const uint32_t vte = regs[xe::PA_CL_VTE_CNTL];
         const float vs_[3] = {xe::AsFloat(regs[xe::PA_CL_VPORT_XSCALE]), xe::AsFloat(regs[xe::PA_CL_VPORT_YSCALE]),
                               xe::AsFloat(regs[xe::PA_CL_VPORT_ZSCALE])};
@@ -3017,12 +3066,18 @@ struct VulkanRenderer::Impl {
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
             } else {
                 // Snapshot-able 8888 surface from the top-left corner: keep it on the GPU, write guest memory later.
-                if (snapEnabled && !isDepth && d.expBias == 0 && SnapResolvable(src->image.format, d.format) &&
+                if (snapEnabled && !isDepth && (d.expBias == 0 || SnapClass(d.format) == 5) && SnapResolvable(src->image.format, d.format) &&
                     (SnapClass(d.format) <= 2 || !d.swapRB) &&
                     d.endian <= 3 && x0 == 0 && y0 == 0 && !DumpFrame()) {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
-                    if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) {
+                    curResolveSrcRt = srcFormat;
+                    bool stored;
+                    {
+                        prof::Scope pss_(prof::kRsSnap);
+                        stored = mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h);
+                    }
+                    if (stored) {
                         if (!lazyWriteback) FlushPending();  // eager: write guest memory right away
                         goto clears;
                     }

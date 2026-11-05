@@ -412,7 +412,7 @@ void Translator::EmitTfetch(const uint32_t* w) {
             std::snprintf(b, sizeof b, "xe_tc += vec2(%g, %g) / xe_ts;", offX * 0.5, offY * 0.5);
             Line(b);
         }
-        Line("vec4 xe_tr = textureLod(" + sampler + ", xe_tc, 0.0);");
+        Line("vec4 xe_tr = xe_texxf(textureLod(" + sampler + ", xe_tc, 0.0), xe_s.texxf[" + Num(int(slot)) + "]);");
     }
     WriteFetchResult(dst, dstRel, dstSwz, "xe_tr");
     indent_--;
@@ -647,7 +647,7 @@ layout(std140, set = 0, binding = 0) uniform XeConsts { vec4 c[512]; } xe_c;
 layout(std140, set = 0, binding = 1) uniform XeBoolLoop { uvec4 b[2]; uvec4 l[8]; } xe_bl;
 layout(std140, set = 0, binding = 2) uniform XeSystem {
   vec4 ndc_scale; vec4 ndc_offset; vec4 vport_scale; vec4 vport_offset;
-  uvec4 flags; vec4 misc; uvec4 vf[96];
+  uvec4 flags; vec4 misc; uvec4 vf[96]; vec4 texxf[32];
 } xe_s;
 layout(std430, set = 0, binding = 3) readonly buffer XeVertexWords { uint w[]; } xe_vb;
 
@@ -658,6 +658,13 @@ int a0 = 0;
 int aL = 0;
 
 float xe_mul(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
+// Snapshot sampling conversion for a texture slot (see XeSystemConstants::texXf).
+vec4 xe_texxf(vec4 v, vec4 f) {
+  if (f.x == 0.0) return v;
+  vec4 c = f.x == 2.0 ? vec4(floatBitsToUint(v)) * (1.0 / 4294967295.0) : clamp(v * f.y, vec4(f.z), vec4(1.0));
+  uint m = uint(f.w);
+  return vec4((m & 1u) != 0u ? c.x : v.x, (m & 2u) != 0u ? c.y : v.y, (m & 4u) != 0u ? c.z : v.z, (m & 8u) != 0u ? c.w : v.w);
+}
 vec4 xe_mul4(vec4 a, vec4 b) {
   bvec4 z = bvec4(uvec4(equal(a, vec4(0.0))) | uvec4(equal(b, vec4(0.0))));
   return mix(a * b, vec4(0.0), z);
