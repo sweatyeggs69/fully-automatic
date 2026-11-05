@@ -1120,7 +1120,6 @@ struct VulkanRenderer::Impl {
     // (from the lowest start seen so far) serves all of them.
     struct UnbCopy { uint32_t start; VkDeviceSize at; };
     std::unordered_map<uint64_t, UnbCopy> unbCache;
-    std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     uint32_t lastVsN = 0, lastPsN = 0;
     int drawsTraced = 0;
@@ -2858,12 +2857,14 @@ struct VulkanRenderer::Impl {
         VkDeviceSize constsOff;
         const uint32_t* consts = &regs.r[pm4::kAluConstBase];
         // Only the float constants the two shaders can read are compared and copied (vs c0.., ps c256..).
-        // lastConsts holds what the ring copy has for the ranges lastVsN / lastPsN (vec4 counts).
+        // The ring copy at lastConstsOff is valid for the ranges lastVsN / lastPsN (vec4 counts).
         static const bool fullConsts = [] { const char* e = std::getenv("FA_CONST_RANGE"); return e && e[0] == '0'; }();  // 0: always all 512
         const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
-        if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && vsN <= lastVsN && psN <= lastPsN &&
-            !std::memcmp(lastConsts.data(), consts, vsN * 16) &&
-            !std::memcmp(lastConsts.data() + 1024, consts + 1024, psN * 16)) {
+        // Compared against the ring copy itself (host cached), so no second copy is kept.
+        const uint8_t* lastRing = lastConstsOff != ~0ull ? static_cast<const uint8_t*>(ring.map) + lastConstsOff : nullptr;
+        if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
+            !std::memcmp(lastRing, consts, vsN * 16) &&
+            !std::memcmp(lastRing + 4096, consts + 1024, psN * 16)) {
             constsOff = lastConstsOff;
         } else {
             prof::Add(prof::kConstUploads, 1);
@@ -2871,15 +2872,12 @@ struct VulkanRenderer::Impl {
             uint8_t* cdst = static_cast<uint8_t*>(ring.map) + constsOff;
             std::memcpy(cdst, consts, vsN * 16);
             std::memcpy(cdst + 4096, consts + 1024, psN * 16);
-            lastConsts.resize(2048);
-            std::memcpy(lastConsts.data(), consts, vsN * 16);
-            std::memcpy(lastConsts.data() + 1024, consts + 1024, psN * 16);
             lastVsN = vsN;
             lastPsN = psN;
             lastConstsOff = constsOff;
         }
         VkDeviceSize boolOff = RingAlloc(160, uboAlign, flushed);
-        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastConsts.assign(consts, consts + 2048); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
+        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
@@ -3425,7 +3423,6 @@ struct VulkanRenderer::Impl {
         bool f;
         constsOff = RingAlloc(8192, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
-        lastConsts.assign(consts, consts + 2048);
         lastVsN = lastPsN = 256;
         lastConstsOff = constsOff;
         boolOff = RingAlloc(160, uboAlign, f);
