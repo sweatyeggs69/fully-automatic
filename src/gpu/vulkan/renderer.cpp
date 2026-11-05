@@ -893,7 +893,10 @@ struct VulkanRenderer::Impl {
         const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
         auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
         if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
-        if (t.endian != e.endian || t.expAdjust != -e.dest.expBias) return rej("endian/exp");
+        if (t.endian != e.endian || t.expAdjust != -e.dest.expBias) {
+            SnapLog("fetch", "endian/exp", t.base & 0x1FFFFFFFu, t.format, t.endian, e.endian, uint32_t(int32_t(t.expAdjust)), uint32_t(int32_t(e.dest.expBias)), t.sign[0] | (t.sign[1] << 4));
+            return VK_NULL_HANDLE;
+        }
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
         if (t.height > e.filled) return rej("incomplete");
         if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
