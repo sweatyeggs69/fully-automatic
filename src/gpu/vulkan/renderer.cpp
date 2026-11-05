@@ -2349,7 +2349,8 @@ struct VulkanRenderer::Impl {
         const uint32_t* consts = &regs.r[pm4::kAluConstBase];
         // Only the float constants the two shaders can read are compared and copied (vs c0.., ps c256..).
         // lastConsts holds what the ring copy has for the ranges lastVsN / lastPsN (vec4 counts).
-        const uint32_t vsN = std::min<uint32_t>(vs->info.constMax, 256), psN = std::min<uint32_t>(ps->info.constMax, 256);
+        static const bool fullConsts = [] { const char* e = std::getenv("FA_CONST_RANGE"); return e && e[0] == '0'; }();  // 0: always all 512
+        const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
         if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && vsN <= lastVsN && psN <= lastPsN &&
             !std::memcmp(lastConsts.data(), consts, vsN * 16) &&
             !std::memcmp(lastConsts.data() + 1024, consts + 1024, psN * 16)) {
