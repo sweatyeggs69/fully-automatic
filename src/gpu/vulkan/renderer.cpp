@@ -408,6 +408,7 @@ struct PipelineKey {
     uint32_t colorMask = 0;
     uint32_t depthControl = 0;  // masked to the used bits
     uint32_t cull = 0, frontFace = 0, depthBias = 0;
+    uint32_t discard = 0;  // diagnostic (FA_PROFILE): rasterizer discard
 };
 #pragma pack(pop)
 
@@ -510,6 +511,7 @@ struct VulkanRenderer::Impl {
     RenderTarget* curColor[4] = {};
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
+    bool discardNow = false;
     uint32_t curRaW = 0, curRaH = 0;  // render area of the running pass
     VkPipeline curPipeline = VK_NULL_HANDLE;
     // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
@@ -1954,10 +1956,9 @@ struct VulkanRenderer::Impl {
         rs.frontFace = VkFrontFace(key.frontFace);
         rs.depthBiasEnable = key.depthBias;
         rs.lineWidth = 1.0f;
-        // Diagnostic: FA_RASTER_DISCARD=1 runs vertex/geometry work only (output is wrong); the drop in
-        // 'gpu exec' shows how much of the GPU time is fragment work.
-        static const bool rasterDiscard = [] { const char* e = std::getenv("FA_RASTER_DISCARD"); return e && e[0] == '1'; }();
-        rs.rasterizerDiscardEnable = rasterDiscard ? VK_TRUE : VK_FALSE;
+        // Diagnostic: while the file ~/.cache/fullauto/raster_discard exists (checked per frame, FA_PROFILE only)
+        // only vertex/geometry work runs; the drop in 'gpu exec' shows how much GPU time is fragment work.
+        rs.rasterizerDiscardEnable = key.discard ? VK_TRUE : VK_FALSE;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -2326,6 +2327,7 @@ struct VulkanRenderer::Impl {
         key.cull = tri ? ((sc & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((sc & 2) ? VK_CULL_MODE_BACK_BIT : 0) : 0;
         key.frontFace = (sc & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         key.depthBias = depth && ((sc >> 11) & 3) ? 1 : 0;
+        key.discard = discardNow ? 1 : 0;
         VkPipeline pipe = GetPipeline(key, vs, ps);
         if (!pipe) { stats.drawsSkipped++; return; }
 
@@ -3050,6 +3052,11 @@ struct VulkanRenderer::Impl {
             if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();
         }
         generation++;
+        if (prof::g_enabled) {
+            const char* h = std::getenv("HOME");
+            struct stat st;
+            discardNow = h && ::stat((std::string(h) + "/.cache/fullauto/raster_discard").c_str(), &st) == 0;
+        }
         if (tsPool && frame % 300 == 0 && !passStats.empty()) {
             std::vector<std::pair<std::string, PassStat>> v(passStats.begin(), passStats.end());
             std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
