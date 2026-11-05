@@ -588,7 +588,7 @@ struct VulkanRenderer::Impl {
             case 1: case 2: return src == VK_FORMAT_R8G8B8A8_UNORM || src == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             case 3: return src == VK_FORMAT_R32_SFLOAT;
             case 4: return src == VK_FORMAT_R16G16_SFLOAT;
-            case 5: { static const bool off = [] { const char* e = std::getenv("FA_SNAP_1616"); return e && e[0] == '0'; }(); return !off && src == VK_FORMAT_R16G16_SNORM; }  // 16_16 (unsigned in memory, fetched back with the opposite exponent)
+            case 5: { static const bool off = [] { const char* e = std::getenv("FA_SNAP_1616"); return e && e[0] == '0'; }(); return !off && src == VK_FORMAT_R16G16_SFLOAT; }  // 16_16 unorm in memory from a float target, fetched back with the opposite exponent
         }
         return false;
     }
@@ -3039,8 +3039,8 @@ struct VulkanRenderer::Impl {
     bool ResolveRaw(const ResolveDest& d, VkFormat srcFmt, bool isDepth, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h,
                     const uint8_t* rb, uint32_t destBytes) {
         if (isDepth || (d.expBias != 0 && d.format != 25)) return false;
-        // 16_16 from a signed-normalised target: unsigned 16-bit texels of max(v, 0) * 2^expBias (what EncodeResolve writes).
-        const bool is1616 = srcFmt == VK_FORMAT_R16G16_SNORM && d.format == 25 && d.expBias <= 0 && d.expBias >= -15;
+        // 16_16 from a 16-bit float target: unsigned normalised 16-bit texels of clamp(v * 2^expBias, 0, 1) (what EncodeResolve writes).
+        const bool is1616 = srcFmt == VK_FORMAT_R16G16_SFLOAT && d.format == 25 && d.expBias <= 0 && d.expBias >= -15;
         if (d.format == 25 && !is1616) return false;
         const bool src8888 = srcFmt == VK_FORMAT_R8G8B8A8_UNORM, src1010 = srcFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         const bool is8888 = (src8888 || src1010) && (d.format == 6 || d.format == 14 || d.format == 50);  // is8888/is1010: the guest format
@@ -3082,8 +3082,9 @@ struct VulkanRenderer::Impl {
                     if (is1616) {
                         uint32_t o = 0;
                         for (int c = 0; c < 2; c++) {
-                            const int16_t sv = int16_t(v >> (16 * c));
-                            const float f = std::max<float>(sv, 0.0f) * std::ldexp(1.0f, d.expBias) * (65535.0f / 32767.0f);
+                            float x = HalfToFloat(uint16_t(v >> (16 * c)));
+                            if (!(x > 0.0f)) x = 0.0f;  // negatives and NaN
+                            const float f = x * std::ldexp(1.0f, d.expBias) * 65535.0f;
                             o |= uint32_t(std::min(f + 0.5f, 65535.0f)) << (16 * c);
                         }
                         v = o;
