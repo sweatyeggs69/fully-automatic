@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 #include "fa/gpu/gpu_profile.hpp"
@@ -1470,6 +1471,82 @@ struct VulkanRenderer::Impl {
         return at;
     }
 
+    // ---- direct guest memory probe ---------------------------------------------------------
+    // Step one of letting the GPU read vertex data straight from guest memory instead of copying
+    // it into the upload ring every draw: map the guest's physical memory a second time (an alias
+    // the guest never sees, read/write) and try to import it as one Vulkan buffer. Only logs the
+    // outcome for now; nothing uses the buffer yet. FA_GUEST_IMPORT=0 skips it.
+    bool haveHostImport = false;
+    void ProbeGuestImport() {
+        const char* e = std::getenv("FA_GUEST_IMPORT");
+        if (e && e[0] == '0') return;
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &hp;
+        vkGetPhysicalDeviceProperties2(phys, &p2);
+        std::fprintf(stderr, "[import] device %s, host import ext %d, align %llu, max storage range %u\n",
+                     props.deviceName, int(haveHostImport), (unsigned long long)hp.minImportedHostPointerAlignment,
+                     props.limits.maxStorageBufferRange);
+        if (!haveHostImport) return;
+        auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+        if (!getProps) { std::fprintf(stderr, "[import] no vkGetMemoryHostPointerPropertiesEXT\n"); return; }
+        auto tryImport = [&](const char* what, void* ptr, VkDeviceSize size) {
+            auto t0 = std::chrono::steady_clock::now();
+            VkMemoryHostPointerPropertiesEXT mp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            VkResult r = getProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &mp);
+            if (r != VK_SUCCESS || !mp.memoryTypeBits) {
+                std::fprintf(stderr, "[import] %s: host pointer properties failed (%d, types %x)\n", what, int(r), mp.memoryTypeBits);
+                return false;
+            }
+            VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.pNext = &eb;
+            bci.size = size;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VkBuffer b = VK_NULL_HANDLE;
+            r = vkCreateBuffer(dev, &bci, nullptr, &b);
+            if (r != VK_SUCCESS) { std::fprintf(stderr, "[import] %s: vkCreateBuffer %d\n", what, int(r)); return false; }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(dev, b, &req);
+            uint32_t bits = req.memoryTypeBits & mp.memoryTypeBits, type = 0;
+            while (bits && !(bits & 1u)) { bits >>= 1; type++; }
+            if (!bits) {
+                std::fprintf(stderr, "[import] %s: no memory type (buffer %x, host %x)\n", what, req.memoryTypeBits, mp.memoryTypeBits);
+                vkDestroyBuffer(dev, b, nullptr);
+                return false;
+            }
+            VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+            imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            imp.pHostPointer = ptr;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &imp;
+            mai.allocationSize = size;
+            mai.memoryTypeIndex = type;
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            r = vkAllocateMemory(dev, &mai, nullptr, &m);
+            if (r == VK_SUCCESS) r = vkBindBufferMemory(dev, b, m, 0);
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[import] %s: %llu MB, memory type %u (flags %x): %s (%d) in %.1f ms\n", what,
+                         (unsigned long long)(size >> 20), type, memProps.memoryTypes[type].propertyFlags,
+                         r == VK_SUCCESS ? "OK" : "FAILED", int(r), ms);
+            if (m) vkFreeMemory(dev, m, nullptr);
+            vkDestroyBuffer(dev, b, nullptr);
+            return r == VK_SUCCESS;
+        };
+        // Control: plain anonymous memory, which every driver should accept.
+        size_t anon = 16u << 20;
+        void* a = mmap(nullptr, anon, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (a != MAP_FAILED) { tryImport("anonymous", a, anon); munmap(a, anon); }
+        int fd = mem.PhysicalFd();
+        uint32_t size = mem.PhysicalSize();
+        if (fd < 0 || !size) { std::fprintf(stderr, "[import] guest physical memory fd not available\n"); return; }
+        void* g = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (g == MAP_FAILED) { std::fprintf(stderr, "[import] alias mmap failed\n"); return; }
+        tryImport("guest physical", g, size);
+        munmap(g, size);
+    }
+
     // ---- init ------------------------------------------------------------------------------
     bool Init(const Options& o, std::string& err) {
         opt = o;
@@ -1544,13 +1621,26 @@ struct VulkanRenderer::Impl {
         qci.queueFamilyIndex = qfam;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
+        std::vector<const char*> devExts;
+        {
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> ep(ne);
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, ep.data());
+            for (auto& e : ep)
+                if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) haveHostImport = true;
+            if (haveHostImport) devExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        }
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &use;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = uint32_t(devExts.size());
+        dci.ppEnabledExtensionNames = devExts.data();
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (r != VK_SUCCESS) return Fail(err, "vkCreateDevice", r);
         vkGetDeviceQueue(dev, qfam, 0, &queue);
+        ProbeGuestImport();
 
         // Depth format: D32S8 where available (AMD has no D24S8), else D24S8.
         VkFormatProperties fp;

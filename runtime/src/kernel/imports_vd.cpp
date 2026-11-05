@@ -111,6 +111,8 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
     uint8_t* HostPtrWrite(uint32_t a, uint32_t size) override {
         return const_cast<uint8_t*>(HostPtr(a, size));  // resolves write textures / the front buffer
     }
+    int PhysicalFd() const override { return g_mem.phys_fd(); }
+    uint32_t PhysicalSize() const override { return kPhysicalSize; }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;

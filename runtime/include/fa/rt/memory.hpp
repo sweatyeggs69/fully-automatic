@@ -49,6 +49,8 @@ public:
         uint32_t page = addr >> 12;
         return (committed_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
     }
+    // memfd holding physical memory (physical address p at offset p).
+    int phys_fd() const { return phys_fd_; }
     // Start and size of the allocation containing addr, false if none.
     bool find_allocation(uint32_t addr, uint32_t& start, uint32_t& size);
 
