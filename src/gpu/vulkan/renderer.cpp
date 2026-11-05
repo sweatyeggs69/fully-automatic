@@ -149,6 +149,22 @@ uint64_t HashBytes(const void* data, size_t n, uint64_t h = 0xCBF29CE484222325ul
     return h;
 }
 
+// Hash of ~256 dwords spread evenly over the buffer (a cheap change detector for big static textures).
+uint64_t SampleHash(const uint8_t* p, size_t n) {
+    const size_t words = n / 4;
+    uint64_t h = 0xCBF29CE484222325ull ^ n;
+    if (words < 256) return HashBytes(p, n, h);
+    const size_t step = words / 256;
+    for (size_t i = 0; i < 256; i++) {
+        uint32_t v;
+        std::memcpy(&v, p + i * step * 4, 4);
+        h = (h ^ v) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    // The first and last 64 bytes always count (headers and tail blocks change first when a texture is rewritten).
+    return HashBytes(p, 64, h) ^ (HashBytes(p + n - 64, 64, h) * 0x9E3779B97F4A7C15ull);
+}
+
 float HalfToFloat(uint16_t h) {
     uint32_t sign = uint32_t(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023, bits;
     if (e == 0) {
@@ -375,6 +391,9 @@ struct Texture {
     uint64_t contentHash = 0;
     uint64_t validatedGen = ~0ull;
     uint64_t lastUseGen = 0;  // last frame that sampled it (cache eviction)
+    uint64_t sampleHash = 0;  // hash of ~256 spread dwords, for the cheap re-check of stable textures
+    uint64_t lastFullGen = 0;  // frame of the last full hash
+    uint32_t stable = 0;       // consecutive checked frames with unchanged content
     uint32_t guestBase = 0, guestSize = 0;
     bool ok = false;
 };
@@ -1612,18 +1631,41 @@ struct VulkanRenderer::Impl {
             tex.validatedGen = generation;
             return tex.ok ? tex.image.view : fell("guest memory not mapped");
         }
+        // Big textures that have not changed for a while are re-checked with a sampled hash of ~256 dwords
+        // (base and mip chain) and only fully hashed every 16 frames or when the sample differs: hashing megabytes
+        // of static car and track textures every frame was the main cost of texture lookups.
+        static const bool quickCheck = [] { const char* e = std::getenv("FA_TEX_QUICK"); return !(e && e[0] == '0'); }();
+        const uint32_t mipBytes = HostMipByteSize(t);
+        // Mip levels 1.. live at the mip address. They are optional: when that memory is not
+        // readable the texture is uploaded with its base level only.
+        const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
+        auto sampled = [&]() {
+            uint64_t sh = SampleHash(src, size);
+            if (mipSrc) sh = sh * 0x9E3779B97F4A7C15ull + SampleHash(mipSrc, mipBytes) + 1;
+            return sh;
+        };
+        uint64_t sh = 0;
+        if (quickCheck && tex.ok && size + mipBytes >= 65536) {
+            prof::Scope ps_(prof::kTexCheck);
+            sh = sampled();
+            if (tex.stable >= 8 && generation - tex.lastFullGen < 16 && sh == tex.sampleHash) {
+                tex.validatedGen = generation;
+                tex.stable++;
+                return tex.image.view;
+            }
+        }
         uint64_t h;
         {
             prof::Scope ps_(prof::kTexCheck);
             h = HashBytes(src, size);
+            if (mipSrc) h = h * 0x9E3779B97F4A7C15ull + HashBytes(mipSrc, mipBytes) + 1;
+            if (!sh && quickCheck && size + mipBytes >= 65536) sh = sampled();
         }
-        // Mip levels 1.. live at the mip address. They are optional: when that memory is not
-        // readable the texture is uploaded with its base level only.
-        const uint32_t mipBytes = HostMipByteSize(t);
-        const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
-        if (mipSrc) h = h * 0x9E3779B97F4A7C15ull + HashBytes(mipSrc, mipBytes) + 1;
         tex.validatedGen = generation;
-        if (tex.ok && h == tex.contentHash) return tex.image.view;
+        tex.lastFullGen = generation;
+        tex.sampleHash = sh;
+        if (tex.ok && h == tex.contentHash) { tex.stable++; return tex.image.view; }
+        tex.stable = 0;
         prof::Scope ps_(prof::kTexUpload);
         {   // FA_TEXLOG=1: one line per upload, to see when the game's streaming changes each texture
             static const bool texLog = [] { const char* e = std::getenv("FA_TEXLOG"); return e && e[0] == '1'; }();
