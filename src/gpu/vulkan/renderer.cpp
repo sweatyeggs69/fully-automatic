@@ -518,7 +518,7 @@ struct VulkanRenderer::Impl {
     RenderTarget* curColor[4] = {};
     RenderTarget* curDepth = nullptr;
     uint32_t curW = 0, curH = 0;
-    bool discardNow = false, nullPsNow = false;
+    bool discardNow = false, nullPsNow = false, tinyTexNow = false;
     uint32_t curRaW = 0, curRaH = 0;  // render area of the running pass
     VkPipeline curPipeline = VK_NULL_HANDLE;
     // FA_WATCH_ADDR=<hex physical address>: log the guest bytes at that surface after every resolve into it
@@ -1757,6 +1757,7 @@ struct VulkanRenderer::Impl {
         for (int k = 0; k < 6; k++) d[k] = regs[pm4::kFetchConstBase + slot * 6 + k];
         TextureFetch t = ParseTextureFetch(d);
         sampler = GetSampler(t);
+        if (tinyTexNow && !cube) return dummy2D.view;  // diagnostic: every 2D fetch hits a 1x1 texture
         Image& fallback = cube ? dummyCube : dummy2D;
         // Every fall back to the black dummy texture is logged once per (reason, format, size),
         // since a black building or shadow means a texture that never made it to the GPU.
@@ -3120,6 +3121,7 @@ struct VulkanRenderer::Impl {
             struct stat st;
             discardNow = h && ::stat((std::string(h) + "/.cache/fullauto/raster_discard").c_str(), &st) == 0;
             nullPsNow = h && ::stat((std::string(h) + "/.cache/fullauto/null_ps").c_str(), &st) == 0;
+            tinyTexNow = h && ::stat((std::string(h) + "/.cache/fullauto/tiny_tex").c_str(), &st) == 0;
         }
         if (tsPool && frame % 300 == 0 && !passStats.empty()) {
             std::vector<std::pair<std::string, PassStat>> v;
