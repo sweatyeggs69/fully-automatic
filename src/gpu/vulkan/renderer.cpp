@@ -566,6 +566,9 @@ struct VulkanRenderer::Impl {
     uint64_t texEpoch = 1;
     struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; };
     SlotMemo slotMemo[32];
+    // Same idea across slots: a direct-mapped table of recent lookups (any slot) in this epoch, so draws that
+    // alternate between textures still skip GetTexture. FA_TEX_MEMO2=0 disables.
+    SlotMemo texMemo[2048];
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -975,6 +978,8 @@ struct VulkanRenderer::Impl {
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
+    const bool vbHashOn = [] { const char* e = std::getenv("FA_VBHASH"); return e && e[0] == '1'; }();
+    std::unordered_map<uint64_t, uint64_t> vbHashSeen;  // FA_VBHASH: last content hash per (pool address, size), kept across batches
     struct VbExt { VkDeviceSize at; uint32_t words; };
     std::unordered_map<uint32_t, VbExt> vbExt;  // largest copy per guest address in this batch: smaller draws of the same pool reuse it
     // Fetches whose extent cannot be bounded copy from their address to the end of the fetch constant's range.
@@ -1878,7 +1883,25 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
-        if (HasPending() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
+        if (HasPending() && PendingOverlaps(t.base, size)) {
+            {   // FA_SNAPLOG: which fetch forced the writeback, and of what (g = generic resolve, s = snapshot)
+                const uint64_t lo = t.base & 0x1FFFFFFFu, hi = lo + size;
+                for (const PendingGeneric& g : pendingGen) {
+                    const uint64_t glo = g.d.base & 0x1FFFFFFFu;
+                    if (glo < hi && lo < glo + g.destBytes)
+                        SnapLog("flushtex", "g", uint32_t(lo), t.format, t.width, uint32_t(glo), g.d.format, uint32_t(g.fmt), uint32_t(int32_t(g.d.expBias)));
+                }
+                for (uint32_t k : pendingKeys) {
+                    const Snap& e = snaps[k];
+                    if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size)
+                        SnapLog("flushtex", "s", uint32_t(lo), t.format, t.width, e.base, e.dest.format, uint32_t(e.img.format), uint32_t(int32_t(t.expAdjust)));
+                }
+            }
+            prof::Scope pf_(prof::kDtFlush);
+            FlushPending(prof::kFlushTex);
+        }
+        std::optional<prof::Scope> pp_;
+        pp_.emplace(prof::kDtPtr);
         const uint8_t* src = mem.HostPtr(t.base, size);
         std::vector<uint8_t> padded;
         if (!src) {
@@ -1914,6 +1937,7 @@ struct VulkanRenderer::Impl {
         // Mip levels 1.. live at the mip address. They are optional: when that memory is not
         // readable the texture is uploaded with its base level only.
         const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
+        pp_.reset();
         auto sampled = [&]() {
             uint64_t sh = SampleHash(src, size);
             if (mipSrc) sh = sh * 0x9E3779B97F4A7C15ull + SampleHash(mipSrc, mipBytes) + 1;
@@ -2250,9 +2274,17 @@ struct VulkanRenderer::Impl {
                     static const bool noMemo = [] { const char* e = std::getenv("FA_TEX_MEMO"); return e && e[0] == '0'; }();
                     SlotMemo& m = slotMemo[s];
                     const uint32_t* fc = &regs.r[pm4::kFetchConstBase + s * 6];
+                    static const bool noMemo2 = [] { const char* e = std::getenv("FA_TEX_MEMO2"); return e && e[0] == '0'; }();
+                    uint32_t mh = (fc[0] * 0x9E3779B1u) ^ (fc[1] * 0x85EBCA77u) ^ (fc[2] * 0xC2B2AE3Du) ^ (fc[3] * 0x27D4EB2Fu) ^
+                                  (fc[4] * 0x165667B1u) ^ (fc[5] * 0xD3A2646Cu) ^ (cube ? 0x5bd1e995u : 0u);
+                    SlotMemo& g = texMemo[(mh ^ (mh >> 15)) & 2047u];
                     if (!noMemo && m.epoch == texEpoch && m.cube == cube && !std::memcmp(m.d, fc, sizeof m.d)) {
                         view = m.view;
                         smp = m.smp;
+                    } else if (!noMemo && !noMemo2 && g.epoch == texEpoch && g.cube == cube && !std::memcmp(g.d, fc, sizeof g.d)) {
+                        view = g.view;
+                        smp = g.smp;
+                        m = g;
                     } else {
                         prof::Scope pg_(prof::kDtGet);
                         view = GetTexture(regs, s, cube, smp);
@@ -2261,6 +2293,7 @@ struct VulkanRenderer::Impl {
                         std::memcpy(m.d, fc, sizeof m.d);
                         m.view = view;
                         m.smp = smp;
+                        g = m;
                     }
                 }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
@@ -2329,7 +2362,8 @@ struct VulkanRenderer::Impl {
         const uint32_t* consts = &regs.r[pm4::kAluConstBase];
         // Only the float constants the two shaders can read are compared and copied (vs c0.., ps c256..).
         // lastConsts holds what the ring copy has for the ranges lastVsN / lastPsN (vec4 counts).
-        const uint32_t vsN = std::min<uint32_t>(vs->info.constMax, 256), psN = std::min<uint32_t>(ps->info.constMax, 256);
+        static const bool fullConsts = [] { const char* e = std::getenv("FA_CONST_RANGE"); return e && e[0] == '0'; }();  // 0: always all 512
+        const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
         if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && vsN <= lastVsN && psN <= lastPsN &&
             !std::memcmp(lastConsts.data(), consts, vsN * 16) &&
             !std::memcmp(lastConsts.data() + 1024, consts + 1024, psN * 16)) {
@@ -2444,6 +2478,21 @@ struct VulkanRenderer::Impl {
                     std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
                     prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                     prof::Add(prof::kVbUnbounded, uint64_t(words) * 4);
+                    if (vbHashOn) {
+                        // Measurement (FA_VBHASH=1): would a copy kept from an earlier batch still be valid?
+                        uint64_t h = 0x9E3779B97F4A7C15ull ^ words;
+                        const size_t n8 = size_t(words) / 2;
+                        for (size_t k = 0; k < n8; k++) {
+                            uint64_t v;
+                            std::memcpy(&v, src + k * 8, 8);
+                            h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+                            h ^= h >> 29;
+                        }
+                        uint64_t& last = vbHashSeen[(uint64_t(vf.address) << 32) ^ words];
+                        prof::Add(prof::kVbUnbCnt, 1);
+                        if (last == h) { prof::Add(prof::kVbSame, uint64_t(words) * 4); prof::Add(prof::kVbSameCnt, 1); }
+                        last = h;
+                    }
                     unbCache[endKey] = {vf.address, at};
                 }
                 sys.vf[s][0] = uint32_t(at / 4);

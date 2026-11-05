@@ -35,20 +35,22 @@ enum Section : int {
     kUpConst,      // inside d.upload: shader constants and system constants
     kUpVb,         // inside d.upload: vertex buffer lookups and copies
     kUpIdx,        // inside d.upload: system block and index copy (includes ring flush recovery)
+    kDtFlush,      // inside dt.get: writing pending resolves back before a texture read (flush tex)
+    kDtPtr,        // inside dt.get: guest memory lookup of the texture and its mips
     kCount
 };
 
 inline const char* const kNames[kCount] = {"busy",         "draw",        "tex check",  "tex upload",
                                            "shader",       "pipeline",    "resolve",    "resolve wait",
-                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc", "up.const", "up.vb", "up.idx"};
+                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc", "up.const", "up.vb", "up.idx", "dt.flush", "dt.ptr"};
 
 inline const bool g_enabled = std::getenv("FA_PROFILE") != nullptr;
 inline std::atomic<uint64_t> g_ns[kCount];
 inline std::atomic<uint64_t> g_count[kCount];
 
 // Plain counters (bytes, items) printed per frame after the timed sections.
-enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kStatCount };
-inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us"};
+enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kVbSame, kVbSameCnt, kVbUnbCnt, kStatCount };
+inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us", "vb KB unchanged", "unb pools unchanged", "unb pool copies"};
 inline std::atomic<uint64_t> g_stat[kStatCount];
 inline void Add(Stat s, uint64_t n) {
     if (g_enabled) g_stat[s].fetch_add(n, std::memory_order_relaxed);
@@ -98,7 +100,7 @@ inline void OnSwap() {
     }
     for (int i = 0; i < kStatCount && len > 0 && len < int(sizeof line); i++) {
         double v = double(g_stat[i].exchange(0, std::memory_order_relaxed)) / double(swaps);
-        if (i == kVbBytes || i == kVbUnbounded) v /= 1024.0;
+        if (i == kVbBytes || i == kVbUnbounded || i == kVbSame) v /= 1024.0;
         len += std::snprintf(line + len, sizeof line - len, " | %s %.1f", kStatNames[i], v);
     }
     std::fprintf(stderr, "%s\n", line);
