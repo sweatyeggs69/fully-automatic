@@ -1432,15 +1432,14 @@ struct VulkanRenderer::Impl {
         return h;
     }
     void VbCheckPass(const char* when, prof::Stat draws, prof::Stat kb) {
-        static int logged = 0;
+        static int logged = 0, loggedLate = 0;
         for (auto& c : vbChecks) {
             uint64_t h = HashGuest(c.addr, c.words);
             if (h == c.h) continue;
             prof::Add(draws, 1);
             prof::Add(kb, c.words / 256);
             c.h = h;  // count each change once
-            if (logged < 40) {
-                logged++;
+            if (frame < 600 ? logged++ < 20 : loggedLate++ < 40) {
                 std::fprintf(stderr, "[vbcheck] %s: vs %016llx slot %u, %08x, %u words changed since record\n", when,
                              (unsigned long long)c.vs, c.slot, c.addr, c.words);
             }
@@ -1662,6 +1661,29 @@ struct VulkanRenderer::Impl {
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "[vbdirect] on: %u MB guest memory imported (memory type %u, flags %x) in %.1f ms\n", size >> 20, type,
                      memProps.memoryTypes[type].propertyFlags, ms);
+    }
+    // Streaming vertex memory (the game's per-frame vertex ring, run 73: one shader's fetches at
+    // ever-advancing addresses) is rewritten by the game before our GPU runs the draw, because fences
+    // are signalled when the commands are recorded, not when the GPU finishes. Those regions keep
+    // the copy at record time. A 1 MB region counts as streaming once more than FA_VB_STREAM (24)
+    // fetch bases in one frame advance by small steps past the previous one; it stays so for 600
+    // frames after the last frame that qualified.
+    struct StreamRegion { uint64_t frame = ~0ull; uint32_t lastBase = 0; uint32_t advances = 0; uint64_t until = 0; };
+    std::unordered_map<uint32_t, StreamRegion> streamRegions;
+    bool StreamingRegion(uint32_t pa) {
+        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 24u; }();
+        if (!limit) return false;
+        StreamRegion& r = streamRegions[pa >> 20];
+        if (r.frame != frame) { r.frame = frame; r.advances = 0; }
+        if (pa > r.lastBase && pa - r.lastBase <= 0x40000 && ++r.advances == limit) {
+            if (frame >= r.until) {
+                static int logged = 0;
+                if (logged++ < 20) std::fprintf(stderr, "[vbstream] region %08x streams (frame %llu): copied, not read directly\n", pa & ~0xFFFFFu, (unsigned long long)frame);
+            }
+            r.until = frame + 600;
+        }
+        if (pa != r.lastBase) r.lastBase = pa;
+        return frame < r.until;
     }
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
     static uint32_t GuestPhys(uint32_t a) { return a < 0x20000000u ? a : (a & 0x1FFFFFFFu); }
@@ -2995,7 +3017,7 @@ struct VulkanRenderer::Impl {
             // whole fetch range is used and the draw's largest index is not needed.
             auto tryDirect = [&](uint32_t n) {
                 const uint32_t pa = GuestPhys(vf.address);
-                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || !mem.HostPtr(vf.address, n * 4)) return false;
+                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) || !mem.HostPtr(vf.address, n * 4)) return false;
                 sys.vf[s][0] = pa / 4;
                 sys.vf[s][1] = vf.endian;
                 sys.vf[s][2] = n;
