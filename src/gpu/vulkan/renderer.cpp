@@ -1954,6 +1954,10 @@ struct VulkanRenderer::Impl {
         rs.frontFace = VkFrontFace(key.frontFace);
         rs.depthBiasEnable = key.depthBias;
         rs.lineWidth = 1.0f;
+        // Diagnostic: FA_RASTER_DISCARD=1 runs vertex/geometry work only (output is wrong); the drop in
+        // 'gpu exec' shows how much of the GPU time is fragment work.
+        static const bool rasterDiscard = [] { const char* e = std::getenv("FA_RASTER_DISCARD"); return e && e[0] == '1'; }();
+        rs.rasterizerDiscardEnable = rasterDiscard ? VK_TRUE : VK_FALSE;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
