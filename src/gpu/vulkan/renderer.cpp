@@ -560,11 +560,18 @@ struct VulkanRenderer::Impl {
         static const bool on = [] { const char* e = std::getenv("FA_RESTRACE"); return e && e[0] == '1'; }();
         return on && frame % 300 == 7;
     }
+    // Bumped by anything that can change what a texture fetch resolves to (new frame, a resolve or snapshot write,
+    // a texture or snapshot invalidation). Draws repeating the previous lookup of a slot within one epoch reuse it.
+    uint64_t upCreateNs = 0, upStageNs = 0, upRecNs = 0, upBytes = 0, upNew = 0;  // FA_PROFILE: upload phases
+    uint64_t texEpoch = 1;
+    struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; };
+    SlotMemo slotMemo[32];
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+        texEpoch++;
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
             if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
@@ -623,6 +630,7 @@ struct VulkanRenderer::Impl {
         return true;
     }
     void ReleaseSnapImage(Snap& e) {
+        texEpoch++;
         for (auto& [k, v] : e.views) garbageViews.push_back(v);
         e.views.clear();
         for (auto& [k, c] : e.crops) {
@@ -1974,9 +1982,13 @@ struct VulkanRenderer::Impl {
             if (++n % 400 == 0) {
                 std::fprintf(stderr, "[texup] decode ms by format over 400 uploads:");
                 for (int f = 0; f < 64; f++) if (decNs[f]) { std::fprintf(stderr, " fmt%d=%.1f", f, double(decNs[f]) / 1e6); decNs[f] = 0; }
-                std::fprintf(stderr, " | last: fmt %u %ux%u float %d tiled %d\n", t.format, t.width, t.height, ht.isFloat ? 1 : 0, t.tiled ? 1 : 0);
+                std::fprintf(stderr, " | other phases ms: create %.1f stage %.1f record %.1f, MB staged %.1f, new images %llu | last: fmt %u %ux%u float %d tiled %d\n",
+                             double(upCreateNs) / 1e6, double(upStageNs) / 1e6, double(upRecNs) / 1e6, double(upBytes) / 1048576.0,
+                             (unsigned long long)upNew, t.format, t.width, t.height, ht.isFloat ? 1 : 0, t.tiled ? 1 : 0);
+                upCreateNs = upStageNs = upRecNs = upBytes = upNew = 0;
             }
         }
+        const uint64_t upT1 = prof::g_enabled ? prof::NowNs() : 0;
         VkFormat fmt = ht.isFloat ? floatTexFormat : VK_FORMAT_R8G8B8A8_UNORM;
         bool needNew = !tex.ok || tex.image.w != ht.width || tex.image.h != ht.height || tex.image.format != fmt ||
                        tex.image.layers != ht.layers || tex.image.levels != ht.levels;
@@ -1998,6 +2010,8 @@ struct VulkanRenderer::Impl {
                 return fallback.view;
             ImageToGeneral(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, ht.layers, ht.levels);
         }
+        const uint64_t upT2 = prof::g_enabled ? prof::NowNs() : 0;
+        if (needNew) upNew++;
         // Stage the texels (RGBA32F -> RGBA16F when that is the host format).
         size_t texels = ht.data.size() / (ht.isFloat ? 16 : 4);  // all layers and levels
         size_t bytes = texels * (fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16);
@@ -2015,6 +2029,7 @@ struct VulkanRenderer::Impl {
         } else {
             std::memcpy(dst, ht.data.data(), bytes);
         }
+        const uint64_t upT3 = prof::g_enabled ? prof::NowNs() : 0;
         Barrier();
         {
             const VkDeviceSize texelBytes = fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16;
@@ -2041,6 +2056,13 @@ struct VulkanRenderer::Impl {
             vkCmdCopyBufferToImage(cmd, ring.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, nr, regions);
         }
         Barrier();
+        if (prof::g_enabled) {
+            const uint64_t upT4 = prof::NowNs();
+            upCreateNs += upT2 - upT1;
+            upStageNs += upT3 - upT2;
+            upRecNs += upT4 - upT3;
+            upBytes += bytes;
+        }
         tex.contentHash = h;
         tex.guestBase = t.base;
         tex.guestSize = size;
@@ -2221,8 +2243,21 @@ struct VulkanRenderer::Impl {
                 VkSampler smp;
                 VkImageView view;
                 {
-                    prof::Scope pg_(prof::kDtGet);
-                    view = GetTexture(regs, s, cube, smp);
+                    static const bool noMemo = [] { const char* e = std::getenv("FA_TEX_MEMO"); return e && e[0] == '0'; }();
+                    SlotMemo& m = slotMemo[s];
+                    const uint32_t* fc = &regs.r[pm4::kFetchConstBase + s * 6];
+                    if (!noMemo && m.epoch == texEpoch && m.cube == cube && !std::memcmp(m.d, fc, sizeof m.d)) {
+                        view = m.view;
+                        smp = m.smp;
+                    } else {
+                        prof::Scope pg_(prof::kDtGet);
+                        view = GetTexture(regs, s, cube, smp);
+                        m.epoch = texEpoch;
+                        m.cube = cube;
+                        std::memcpy(m.d, fc, sizeof m.d);
+                        m.view = view;
+                        m.smp = smp;
+                    }
                 }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -3223,6 +3258,7 @@ struct VulkanRenderer::Impl {
             if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();
         }
         generation++;
+        texEpoch++;
         if (prof::g_enabled) {
             const char* h = std::getenv("HOME");
             struct stat st;
