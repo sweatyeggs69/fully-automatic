@@ -434,7 +434,18 @@ struct VulkanRenderer::Impl {
     VkFormat floatTexFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     VkCommandPool cmdPool = VK_NULL_HANDLE;
-    VkQueryPool tsPool = VK_NULL_HANDLE;  // two timestamps per batch: GPU execution time (FA_PROFILE)
+    VkQueryPool tsPool = VK_NULL_HANDLE;  // timestamps per batch: GPU execution time and per-pass attribution (FA_PROFILE)
+    static constexpr uint32_t kTsMax = 1024;
+    uint32_t tsCount = 0;
+    std::vector<std::string> tsLabels;  // label of the interval that ends at timestamp i (i >= 1)
+    struct PassStat { double us = 0; uint32_t n = 0; };
+    std::map<std::string, PassStat> passStats;
+    std::string curPassLabel;
+    void MarkTs(const std::string& label) {
+        if (!tsPool || tsCount >= kTsMax) return;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsCount++);
+        tsLabels.push_back(label);
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool recording = false;
@@ -1120,8 +1131,10 @@ struct VulkanRenderer::Impl {
         Check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
         recording = true;
         if (tsPool) {
-            vkCmdResetQueryPool(cmd, tsPool, 0, 2);
+            vkCmdResetQueryPool(cmd, tsPool, 0, kTsMax);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool, 0);
+            tsCount = 1;
+            tsLabels.assign(1, std::string());
         }
         VkDescriptorSet s = set0;
         (void)s;
@@ -1151,12 +1164,13 @@ struct VulkanRenderer::Impl {
         renderingActive = false;
         curPipeline = VK_NULL_HANDLE;
         Barrier();
+        MarkTs(curPassLabel);
     }
     // Submits everything recorded so far and waits for it. All per-batch resources are reset.
     void SubmitAndWait() {
         if (!recording) return;
         EndRendering();
-        if (tsPool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, 1);
+        MarkTs("other");
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         recording = false;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1166,9 +1180,18 @@ struct VulkanRenderer::Impl {
         Check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         vkResetFences(dev, 1, &fence);
         if (tsPool) {
-            uint64_t ts[2] = {};
-            if (vkGetQueryPoolResults(dev, tsPool, 0, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0])
-                prof::Add(prof::kGpuUs, uint64_t(double(ts[1] - ts[0]) * double(props.limits.timestampPeriod) / 1000.0));
+            std::vector<uint64_t> ts(tsCount);
+            if (tsCount >= 2 && vkGetQueryPoolResults(dev, tsPool, 0, tsCount, tsCount * sizeof(uint64_t), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const double per = double(props.limits.timestampPeriod) / 1000.0;
+                if (ts[tsCount - 1] >= ts[0]) prof::Add(prof::kGpuUs, uint64_t(double(ts[tsCount - 1] - ts[0]) * per));
+                for (uint32_t i = 1; i < tsCount; i++) {
+                    if (ts[i] < ts[i - 1]) continue;
+                    PassStat& st = passStats[tsLabels[i]];
+                    st.us += double(ts[i] - ts[i - 1]) * per;
+                    st.n++;
+                }
+            }
+            tsCount = 0;
         }
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
@@ -1306,7 +1329,7 @@ struct VulkanRenderer::Impl {
         if (prof::g_enabled && props.limits.timestampComputeAndGraphics) {
             VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = 2;
+            qci.queryCount = kTsMax;
             if (vkCreateQueryPool(dev, &qci, nullptr, &tsPool) != VK_SUCCESS) tsPool = VK_NULL_HANDLE;
         }
 
@@ -1616,6 +1639,14 @@ struct VulkanRenderer::Impl {
         if (depth) {
             ri.pDepthAttachment = &da;
             ri.pStencilAttachment = &da;
+        }
+        if (tsPool) {
+            MarkTs("other");  // everything since the last pass: copies, uploads, resolves, barriers
+            char lb[96];
+            const RenderTarget* rt0 = color[0] ? color[0] : (color[1] ? color[1] : depth);
+            std::snprintf(lb, sizeof lb, "pass %ux%u f%u c%d d%d", rt0 ? rt0->image.w : 0, rt0 ? rt0->image.h : 0,
+                          rt0 ? rt0->xeFormat : 0, int(color[0] != nullptr) + int(color[1] != nullptr) + int(color[2] != nullptr) + int(color[3] != nullptr), depth ? 1 : 0);
+            curPassLabel = lb;
         }
         vkCmdBeginRendering(cmd, &ri);
         renderingActive = true;
@@ -2992,6 +3023,18 @@ struct VulkanRenderer::Impl {
             if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();
         }
         generation++;
+        if (tsPool && frame % 300 == 0 && !passStats.empty()) {
+            std::vector<std::pair<std::string, PassStat>> v(passStats.begin(), passStats.end());
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+            std::string line = "[gpupass] ms/frame (count/frame):";
+            char b[160];
+            for (size_t i = 0; i < v.size() && i < 8; i++) {
+                std::snprintf(b, sizeof b, " | %s %.2f (%.1f)", v[i].first.c_str(), v[i].second.us / 300000.0, v[i].second.n / 300.0);
+                line += b;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+            passStats.clear();
+        }
         TrimTextures();
         {   // Frames that take over 250 ms (e.g. the first-use texture burst) are always reported.
             static uint64_t lastNs = 0, lastUploads = 0;
