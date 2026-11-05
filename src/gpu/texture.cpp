@@ -438,6 +438,21 @@ bool DecodeTextureHost(const TextureFetch& t, const uint8_t* src, HostTexture& o
                 if (off + fi.bytesPerBlock > l.size) continue;
                 const uint8_t* b = sw.data() + off;
                 if (!out.isFloat && DecodeBytesFast(f, b, dstLayer, bx, by, fi, t.width, t.height)) continue;
+                if (out.isFloat && (f == 24 || f == 25 || f == 26)) {
+                    // 16-bit normalized texel to float32 directly (skips the generic block scratch).
+                    const uint32_t x = bx, y = by;
+                    if (x >= t.width || y >= t.height) continue;
+                    const int n = f == 24 ? 1 : f == 25 ? 2 : 4;
+                    float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    for (int c = 0; c < n; c++) {
+                        uint16_t h;
+                        std::memcpy(&h, b + 2 * c, 2);
+                        v[c] = t.sign[c] == 1 ? std::max(float(int16_t(h)) / 32767.0f, -1.0f) : h / 65535.0f;
+                    }
+                    for (int c = 0; c < 4; c++) v[c] *= expScale;
+                    std::memcpy(dstLayer + (size_t(y) * t.width + x) * texelBytes, v, 16);
+                    continue;
+                }
                 float px[16][4];
                 for (auto& p : px) { p[0] = p[1] = p[2] = 0.0f; p[3] = 1.0f; }
                 auto bitsN = [&](uint32_t v, int sh, int n) { return float((v >> sh) & ((1u << n) - 1)) / float((1u << n) - 1); };
