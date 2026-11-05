@@ -434,6 +434,7 @@ struct VulkanRenderer::Impl {
     VkFormat floatTexFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkQueryPool tsPool = VK_NULL_HANDLE;  // two timestamps per batch: GPU execution time (FA_PROFILE)
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool recording = false;
@@ -1118,6 +1119,10 @@ struct VulkanRenderer::Impl {
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
         recording = true;
+        if (tsPool) {
+            vkCmdResetQueryPool(cmd, tsPool, 0, 2);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool, 0);
+        }
         VkDescriptorSet s = set0;
         (void)s;
     }
@@ -1151,6 +1156,7 @@ struct VulkanRenderer::Impl {
     void SubmitAndWait() {
         if (!recording) return;
         EndRendering();
+        if (tsPool) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, 1);
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         recording = false;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1159,6 +1165,11 @@ struct VulkanRenderer::Impl {
         Check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
         Check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         vkResetFences(dev, 1, &fence);
+        if (tsPool) {
+            uint64_t ts[2] = {};
+            if (vkGetQueryPoolResults(dev, tsPool, 0, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0])
+                prof::Add(prof::kGpuUs, uint64_t(double(ts[1] - ts[0]) * double(props.limits.timestampPeriod) / 1000.0));
+        }
         vkResetCommandPool(dev, cmdPool, 0);
         vkResetDescriptorPool(dev, texPool, 0);
         texSetsUsed = 0;
@@ -1292,6 +1303,12 @@ struct VulkanRenderer::Impl {
         vkAllocateCommandBuffers(dev, &cai, &cmd);
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         vkCreateFence(dev, &fci, nullptr, &fence);
+        if (prof::g_enabled && props.limits.timestampComputeAndGraphics) {
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = 2;
+            if (vkCreateQueryPool(dev, &qci, nullptr, &tsPool) != VK_SUCCESS) tsPool = VK_NULL_HANDLE;
+        }
 
         if (!CreateBuffer(ring, kRingSize,
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -1446,6 +1463,7 @@ struct VulkanRenderer::Impl {
             if (pipeLayout) vkDestroyPipelineLayout(dev, pipeLayout, nullptr);
             if (set0Layout) vkDestroyDescriptorSetLayout(dev, set0Layout, nullptr);
             if (set1Layout) vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
+            if (tsPool) vkDestroyQueryPool(dev, tsPool, nullptr);
             if (fence) vkDestroyFence(dev, fence, nullptr);
             if (cmdPool) vkDestroyCommandPool(dev, cmdPool, nullptr);
             for (auto& pb : poolBlocks) vkFreeMemory(dev, pb.mem, nullptr);
