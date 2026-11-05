@@ -594,8 +594,25 @@ struct VulkanRenderer::Impl {
     const bool lazyWriteback = [] { const char* e = std::getenv("FA_RESOLVE_LAZY"); return !(e && e[0] == '0'); }();
     std::vector<uint32_t> pendingKeys;
     uint64_t pendingBytes = 0;
+    // Resolves that cannot be kept as snapshots (other formats, exp bias, ...) copy their pixels into the readback
+    // buffer right away and are converted into guest memory at the next flush, so they share one GPU wait
+    // (FA_RESOLVE_LAZY=0 goes back to a wait per resolve).
+    struct PendingGeneric {
+        ResolveDest d;
+        VkFormat fmt;
+        bool isDepth;
+        uint32_t srcFormat, x0, y0, w, h, destBytes, bpp;
+        VkDeviceSize off;
+    };
+    std::vector<PendingGeneric> pendingGen;
+    VkDeviceSize pendingGenBytes = 0;
+    bool HasPending() const { return !pendingKeys.empty() || !pendingGen.empty(); }
     bool PendingOverlaps(uint32_t base, uint32_t size) {
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (const PendingGeneric& g : pendingGen) {
+            const uint64_t glo = g.d.base & 0x1FFFFFFFu;
+            if (glo < hi && lo < glo + g.destBytes) return true;
+        }
         for (uint32_t k : pendingKeys) {
             const Snap& e = snaps[k];
             if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) return true;
@@ -607,6 +624,7 @@ struct VulkanRenderer::Impl {
         Snap& e = snaps[key];
         const VkFormat fmt = src->image.format;
         // A pending surface of another base overlapping this one is written first (order matters).
+        if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
         for (uint32_t k : pendingKeys) {
             const Snap& o = snaps[k];
             if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
@@ -654,7 +672,7 @@ struct VulkanRenderer::Impl {
         return true;
     }
     void FlushPending(prof::Stat why = prof::kFlushSync) {
-        if (pendingKeys.empty()) return;
+        if (!HasPending()) return;
         prof::Add(why, 1);
         std::vector<uint32_t> keys;
         keys.swap(pendingKeys);
@@ -666,18 +684,24 @@ struct VulkanRenderer::Impl {
             total += (VkDeviceSize(snaps[k].w) * snaps[k].h * 4 + 15) & ~VkDeviceSize(15);
         }
         EndRendering();
-        if (total > readback.size) {
-            SubmitAndWait();
+        if (pendingGenBytes + total > readback.size) {
+            // The generic resolves already recorded live in the current buffer: run them before replacing it.
+            {
+                prof::Scope pw_(prof::kResolveWait);
+                SubmitAndWait();
+            }
             Begin();
+            FinishGenerics();
             DestroyBuffer(readback);
-            CreateBuffer(readback, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            CreateBuffer(readback, std::max<VkDeviceSize>(total, 16u << 20), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
         }
         Begin();
         Barrier();
+        const VkDeviceSize snapBase = pendingGenBytes;
         for (size_t i = 0; i < keys.size(); i++) {
             Snap& e = snaps[keys[i]];
             VkBufferImageCopy bic{};
-            bic.bufferOffset = offs[i];
+            bic.bufferOffset = snapBase + offs[i];
             bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             bic.imageExtent = {e.w, e.h, 1};
             vkCmdCopyImageToBuffer(cmd, e.img.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
@@ -690,12 +714,13 @@ struct VulkanRenderer::Impl {
         Begin();
         prof::Scope pc_(prof::kResolveCpu);
         const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
+        FinishGenerics();
         for (size_t i = 0; i < keys.size(); i++) {
             Snap& e = snaps[keys[i]];
             e.pending = false;
             if (!e.valid) continue;  // overwritten since: nothing to write
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
-            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + offs[i], destBytes)) {
+            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + snapBase + offs[i], destBytes)) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes);  // other textures over this memory are stale now
                 e.valid = keep;
@@ -704,6 +729,61 @@ struct VulkanRenderer::Impl {
                 e.valid = false;
             }
         }
+    }
+
+    // Converts the generic resolves recorded since the last flush into guest memory (their pixels are in readback).
+    void FinishGenerics() {
+        if (pendingGen.empty()) return;
+        std::vector<PendingGeneric> jobs;
+        jobs.swap(pendingGen);
+        pendingGenBytes = 0;
+        const uint8_t* rbase = static_cast<const uint8_t*>(readback.map);
+        for (const PendingGeneric& j : jobs) FinishGeneric(j, rbase + j.off);
+    }
+    void FinishGeneric(const PendingGeneric& j, const uint8_t* rb) {
+        const ResolveDest& d = j.d;
+        if (ResolveRaw(d, j.fmt, j.isDepth, j.x0, j.y0, j.w, j.h, rb, j.destBytes)) {
+            InvalidateTextures(d.base, j.destBytes);
+            return;
+        }
+        const uint32_t w = j.w, h = j.h, bpp = j.bpp;
+        std::vector<float>& px = resolvePx;
+        px.resize(size_t(w) * h * 4);
+        const bool fix1616 = !j.isDepth && Rt1616Scaled() && (j.srcFormat == xe::kRt16_16 || j.srcFormat == xe::kRt16_16_16_16) &&
+                             d.format >= 24 && d.format <= 26;
+        auto toFloat = [&](size_t i) {
+            if (j.isDepth) {
+                float z;
+                if (depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) std::memcpy(&z, rb + i * 4, 4);
+                else { uint32_t u; std::memcpy(&u, rb + i * 4, 4); z = float(u & 0xFFFFFF) / 16777215.0f; }
+                px[i * 4] = z;
+                px[i * 4 + 1] = 0.0f;
+                px[i * 4 + 2] = 0.0f;
+                px[i * 4 + 3] = 1.0f;
+            } else {
+                ReadbackToFloat(j.fmt, rb + i * bpp, &px[i * 4]);
+                if (fix1616)
+                    for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
+            }
+        };
+        uint8_t* dst = mem.HostPtrWrite(d.base, j.destBytes);
+        if (dst) {
+            rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
+                for (size_t i = size_t(ya) * w; i < size_t(yb) * w; i++) toFloat(i);
+                EncodeResolve(d, j.x0, j.y0 + ya, w, yb - ya, px.data() + size_t(ya) * w * 4, dst);
+            });
+        } else {
+            for (size_t i = 0; i < size_t(w) * h; i++) toFloat(i);
+            std::vector<uint8_t> tmp(j.destBytes);
+            for (uint32_t i = 0; i + 4 <= j.destBytes; i += 4) {
+                uint32_t be = mem.Read32(d.base + i);
+                tmp[i] = uint8_t(be >> 24); tmp[i + 1] = uint8_t(be >> 16); tmp[i + 2] = uint8_t(be >> 8); tmp[i + 3] = uint8_t(be);
+            }
+            EncodeResolve(d, j.x0, j.y0, w, h, px.data(), tmp.data());
+            for (uint32_t i = 0; i + 4 <= j.destBytes; i += 4)
+                mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
+        }
+        InvalidateTextures(d.base, j.destBytes);
     }
 
     // View of a still valid snapshot that matches this texture fetch, or null.
@@ -1584,7 +1664,7 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
-        if (!pendingKeys.empty() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
+        if (HasPending() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
         const uint8_t* src = mem.HostPtr(t.base, size);
         std::vector<uint8_t> padded;
         if (!src) {
@@ -2232,6 +2312,7 @@ struct VulkanRenderer::Impl {
 
     // Reads several pixels of a colour target in one submit.
     void ProbePixels(RenderTarget* rt, const std::vector<std::pair<int, int>>& pts, std::vector<std::array<float, 4>>& out) {
+        FlushPending();  // the readback buffer holds pending resolves
         const uint32_t bpp = VkFormatBytes(rt->image.format);
         const VkDeviceSize stride = 32;
         const VkDeviceSize need = stride * pts.size();
@@ -2267,6 +2348,7 @@ struct VulkanRenderer::Impl {
         static int count = 0;
         static const int maxPng = [] { const char* e = std::getenv("FA_RENDER_DUMP_MAXPNG"); return e ? std::atoi(e) : 300; }();
         if (count >= maxPng || !r.extent.width || !r.extent.height) return;
+        FlushPending();  // the readback buffer holds pending resolves
         uint32_t bpp = VkFormatBytes(rt->image.format);
         VkDeviceSize bytes = VkDeviceSize(r.extent.width) * r.extent.height * bpp;
         EndRendering();
@@ -2545,8 +2627,33 @@ struct VulkanRenderer::Impl {
                 }
                 SnapLog("resolve", isDepth ? "depth" : (x0 || y0) ? "offset" : d.endian > 3 ? "endian" : d.expBias ? "expbias" : "format", d.base & 0x1FFFFFFFu,
                         d.format, src->image.format, w, h, d.endian, uint32_t(x0 | y0));
-                if (!pendingKeys.empty() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending(prof::kFlushOverlap);
+                if (HasPending() && PendingOverlaps(d.base, ResolveDestByteSize(d))) FlushPending(prof::kFlushOverlap);
                 uint32_t bpp = isDepth ? 4 : VkFormatBytes(src->image.format);
+                if (lazyWriteback && !DumpFrame()) {
+                    // Deferred: copy the pixels out now (in command order), convert them at the next flush.
+                    const uint32_t destBytes = ResolveDestByteSize(d);
+                    const VkDeviceSize need = (VkDeviceSize(w) * h * bpp + 15) & ~VkDeviceSize(15);
+                    if (pendingGenBytes + need > readback.size) FlushPending(prof::kFlushCap);
+                    if (need > readback.size) {
+                        SubmitAndWait();
+                        Begin();
+                        DestroyBuffer(readback);
+                        CreateBuffer(readback, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+                    }
+                    EndRendering();
+                    VkBufferImageCopy bic{};
+                    bic.bufferOffset = pendingGenBytes;
+                    bic.imageSubresource = {VkImageAspectFlags(isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+                    bic.imageOffset = {x0, y0, 0};
+                    bic.imageExtent = {w, h, 1};
+                    Barrier();
+                    vkCmdCopyImageToBuffer(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
+                    Barrier();
+                    pendingGen.push_back({d, src->image.format, isDepth, srcFormat, uint32_t(x0), uint32_t(y0), w, h, destBytes, bpp, pendingGenBytes});
+                    pendingGenBytes += need;
+                    InvalidateTextures(d.base, destBytes);  // anything sampled from this memory is stale until the flush
+                    goto clears;
+                }
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
                 if (bytes > readback.size) {
                     SubmitAndWait();
