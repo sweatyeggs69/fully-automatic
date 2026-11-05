@@ -2721,6 +2721,18 @@ struct VulkanRenderer::Impl {
         const uint32_t nIdx = fi.mode ? fi.count : uint32_t(hd.indices.size());
         prof::Add(prof::kIdxCount, nIdx);
         if (fi.mode) prof::Add(prof::kIdxFast, nIdx);
+        if (prof::g_enabled && !fi.mode) {
+            // Why the fast path was not taken, in guest indices.
+            const bool reset = dc.indexed && ((regs[xe::PA_SU_SC_MODE_CNTL] >> 21) & 1);
+            const uint32_t pt = dc.primType;
+            prof::Add(pt == xe::kPrimTriangleStrip ? (reset ? prof::kIdxStripReset : prof::kIdxStrip)
+                      : !dc.inlineIndices.empty() ? prof::kIdxInline
+                      : (pt == xe::kPrimTriangleList || pt == xe::kPrimRectangleList || pt == xe::kPrimPointList || pt == xe::kPrimLineList || pt == xe::kPrimTriangleWithWFlags) ? prof::kIdxListSlow
+                      : prof::kIdxOther, dc.indexCount);
+            if (dc.indexed && dc.inlineIndices.empty() && !dc.index32 && pt == xe::kPrimTriangleStrip && reset &&
+                (regs[xe::VGT_MULTI_PRIM_IB_RESET_INDX] & 0xFFFF) == 0xFFFF)
+                prof::Add(prof::kIdxStripFFFF, dc.indexCount);
+        }
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 

@@ -53,8 +53,8 @@ inline std::atomic<uint64_t> g_ns[kCount];
 inline std::atomic<uint64_t> g_count[kCount];
 
 // Plain counters (bytes, items) printed per frame after the timed sections.
-enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kVbSame, kVbSameCnt, kVbUnbCnt, kFtGen, kFtSnap, kWbSnapKB, kWbGenKB, kDescFull, kVbDirectKB, kIdxFast, kStatCount };
-inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us", "vb KB unchanged", "unb pools unchanged", "unb pool copies", "flushtex by generic", "flushtex by snap", "wb snap KB", "wb gen KB", "desc pool full", "vb KB direct", "indices fast"};
+enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kVbSame, kVbSameCnt, kVbUnbCnt, kFtGen, kFtSnap, kWbSnapKB, kWbGenKB, kDescFull, kVbDirectKB, kIdxFast, kIdxStrip, kIdxStripReset, kIdxStripFFFF, kIdxInline, kIdxListSlow, kIdxOther, kStatCount };
+inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us", "vb KB unchanged", "unb pools unchanged", "unb pool copies", "flushtex by generic", "flushtex by snap", "wb snap KB", "wb gen KB", "desc pool full", "vb KB direct", "indices fast", "idx strip", "idx strip reset", "idx strip reset ffff 16-bit", "idx inline", "idx list slow", "idx other"};
 inline std::atomic<uint64_t> g_stat[kStatCount];
 inline void Add(Stat s, uint64_t n) {
     if (g_enabled) g_stat[s].fetch_add(n, std::memory_order_relaxed);
