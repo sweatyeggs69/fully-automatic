@@ -2300,7 +2300,13 @@ struct VulkanRenderer::Impl {
         key.vs = dc.vsHash;
         key.ps = dc.psHash;
         key.prim = uint32_t(hd.prim);
-        for (int i = 0; i < 4; i++) key.colorFormats[i] = color[i] && ((colorMask >> (4 * i)) & 0xF) ? color[i]->image.format : VK_FORMAT_UNDEFINED;
+        // A depth-only draw (no colour written) on the depth buffer of the running pass stays in that pass
+        // with its colour attachments bound and write masks of zero, instead of splitting the pass.
+        RenderTarget* attach[4];
+        static const bool noKeep = [] { const char* e = std::getenv("FA_KEEP_PASS"); return e && e[0] == '0'; }();
+        const bool keepPass = !noKeep && !colorMask && depth && renderingActive && curDepth == depth;
+        for (int i = 0; i < 4; i++) attach[i] = keepPass ? curColor[i] : ((colorMask >> (4 * i)) & 0xF ? color[i] : nullptr);
+        for (int i = 0; i < 4; i++) key.colorFormats[i] = attach[i] ? attach[i]->image.format : VK_FORMAT_UNDEFINED;
         key.depthFormat = depth ? depthFormat : VK_FORMAT_UNDEFINED;
         static const uint32_t blendRegs[4] = {xe::RB_BLENDCONTROL0, xe::RB_BLENDCONTROL1, xe::RB_BLENDCONTROL2, xe::RB_BLENDCONTROL3};
         for (int i = 0; i < 4; i++) key.blend[i] = key.colorFormats[i] ? (dbgNoBlend ? 0x00010001u : regs[blendRegs[i]] & 0x1FFF1FFF) : 0;
@@ -2316,10 +2322,10 @@ struct VulkanRenderer::Impl {
 
         // Rendering pass for this target set.
         bool same = renderingActive && curDepth == depth;
-        for (int i = 0; i < 4 && same; i++) same = curColor[i] == (key.colorFormats[i] ? color[i] : nullptr);
+        for (int i = 0; i < 4 && same; i++) same = curColor[i] == attach[i];
         if (!same) {
             EndRendering();
-            for (int i = 0; i < 4; i++) curColor[i] = key.colorFormats[i] ? color[i] : nullptr;
+            for (int i = 0; i < 4; i++) curColor[i] = attach[i];
             curDepth = depth;
             curW = areaW;
             curH = areaH;
