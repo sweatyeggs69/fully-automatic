@@ -975,6 +975,8 @@ struct VulkanRenderer::Impl {
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
+    const bool vbHashOn = [] { const char* e = std::getenv("FA_VBHASH"); return e && e[0] == '1'; }();
+    std::unordered_map<uint64_t, uint64_t> vbHashSeen;  // FA_VBHASH: last content hash per (pool address, size), kept across batches
     struct VbExt { VkDeviceSize at; uint32_t words; };
     std::unordered_map<uint32_t, VbExt> vbExt;  // largest copy per guest address in this batch: smaller draws of the same pool reuse it
     // Fetches whose extent cannot be bounded copy from their address to the end of the fetch constant's range.
@@ -2444,6 +2446,21 @@ struct VulkanRenderer::Impl {
                     std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, words * 4);
                     prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                     prof::Add(prof::kVbUnbounded, uint64_t(words) * 4);
+                    if (vbHashOn) {
+                        // Measurement (FA_VBHASH=1): would a copy kept from an earlier batch still be valid?
+                        uint64_t h = 0x9E3779B97F4A7C15ull ^ words;
+                        const size_t n8 = size_t(words) / 2;
+                        for (size_t k = 0; k < n8; k++) {
+                            uint64_t v;
+                            std::memcpy(&v, src + k * 8, 8);
+                            h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+                            h ^= h >> 29;
+                        }
+                        uint64_t& last = vbHashSeen[(uint64_t(vf.address) << 32) ^ words];
+                        prof::Add(prof::kVbUnbCnt, 1);
+                        if (last == h) { prof::Add(prof::kVbSame, uint64_t(words) * 4); prof::Add(prof::kVbSameCnt, 1); }
+                        last = h;
+                    }
                     unbCache[endKey] = {vf.address, at};
                 }
                 sys.vf[s][0] = uint32_t(at / 4);
