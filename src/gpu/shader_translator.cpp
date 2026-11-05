@@ -106,8 +106,10 @@ private:
     std::string TempRef(uint32_t idx, bool rel) const {
         return rel ? "r[clamp(" + Num(int(idx)) + " + aL, 0, 63)]" : "r[" + Num(int(idx)) + "]";
     }
+    mutable uint32_t constMax_ = 0;  // float constants this stage can read (count from its base)
     std::string ConstRef(uint32_t idx, bool addressed, bool a0rel) const {
         int base = Ps() ? 256 : 0;
+        constMax_ = std::max<uint32_t>(constMax_, addressed ? 256u : idx + 1);
         if (!addressed) return "xe_c.c[" + Num(base + int(idx)) + "]";
         return "xe_c.c[clamp(" + Num(base + int(idx)) + " + " + (a0rel ? "a0" : "aL") + ", " + Num(base) + ", " +
                Num(base + 255) + ")]";
@@ -925,6 +927,7 @@ void Translator::Run() {
         out_.vfetchEnd[i] = vfEnd_[i];
         out_.vfetchWhy[i] = vfWhy_[i];
     }
+    out_.constMax = constMax_ > 256 ? 256 : constMax_;
     out_.ok = true;
 }
 
