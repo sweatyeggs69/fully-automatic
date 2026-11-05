@@ -836,7 +836,13 @@ struct VulkanRenderer::Impl {
             e.pending = false;
             if (!e.valid) continue;  // overwritten since: nothing to write
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
-            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes)) {
+            prof::Add(prof::kWbSnapKB, destBytes / 1024);
+            bool raw;
+            {
+                prof::Scope pr_(prof::kRcRaw);
+                raw = ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes);
+            }
+            if (raw) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes, 766);  // other textures over this memory are stale now
                 e.valid = keep;
@@ -858,6 +864,8 @@ struct VulkanRenderer::Impl {
     // Converts the generic resolves recorded since the last flush into guest memory (their pixels are in readback).
     void FinishGenerics() {
         if (pendingGen.empty()) return;
+        prof::Scope pg_(prof::kRcGen);
+        for (const PendingGeneric& j : pendingGen) prof::Add(prof::kWbGenKB, j.destBytes / 1024);
         std::vector<PendingGeneric> jobs;
         jobs.swap(pendingGen);
         pendingGenBytes = 0;
