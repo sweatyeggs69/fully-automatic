@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
@@ -1550,6 +1552,81 @@ struct VulkanRenderer::Impl {
         ProbeDmaBuf();
     }
 
+    // ---- direct vertex reads ---------------------------------------------------------------
+    // FA_VB_DIRECT=1: wrap guest physical memory (the memfd) in a udmabuf and import it as one
+    // storage buffer, so vertex fetches read guest memory on the GPU instead of being copied into
+    // the ring for every draw. udmabuf pins the pages, so the runtime stops punching holes on free.
+    VkBuffer guestBuf = VK_NULL_HANDLE;
+    VkDeviceMemory guestMem = VK_NULL_HANDLE;
+    uint32_t guestSize = 0;
+    void SetupDirectVb() {
+        const char* e = std::getenv("FA_VB_DIRECT");
+        if (!e || e[0] != '1') return;
+        auto fail = [](const char* why, int code) { std::fprintf(stderr, "[vbdirect] off: %s (%d)\n", why, code); };
+        int memfd = mem.PhysicalFd();
+        uint32_t size = mem.PhysicalSize();
+        if (memfd < 0 || !size) return fail("no physical memory fd", 0);
+        if (!haveMemFd || !haveDmaBuf) return fail("no dma-buf import extensions", 0);
+        int dev_fd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (dev_fd < 0) return fail("cannot open /dev/udmabuf", errno);
+        struct { uint32_t memfd, flags; uint64_t offset, size; } cr{uint32_t(memfd), 0x01 /* UDMABUF_FLAGS_CLOEXEC */, 0, size};
+        // UDMABUF_CREATE = _IOW('u', 0x42, struct udmabuf_create)
+        const unsigned long kCreate = (1ul << 30) | (uint32_t(sizeof cr) << 16) | ('u' << 8) | 0x42;
+        auto t0 = std::chrono::steady_clock::now();
+        int buf_fd = ioctl(dev_fd, kCreate, &cr);
+        int ioErr = errno;
+        close(dev_fd);
+        if (buf_fd < 0) return fail("UDMABUF_CREATE failed", ioErr);
+        auto getFdProps = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdPropertiesKHR");
+        VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+        VkResult r = getFdProps ? getFdProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buf_fd, &fp) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (r != VK_SUCCESS || !fp.memoryTypeBits) { close(buf_fd); return fail("dma-buf fd properties", int(r)); }
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.pNext = &eb;
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if ((r = vkCreateBuffer(dev, &bci, nullptr, &guestBuf)) != VK_SUCCESS) { close(buf_fd); guestBuf = VK_NULL_HANDLE; return fail("buffer", int(r)); }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, guestBuf, &req);
+        uint32_t bits = req.memoryTypeBits & fp.memoryTypeBits, type = 0;
+        while (bits && !(bits & 1u)) { bits >>= 1; type++; }
+        if (!bits || req.size > size) {
+            close(buf_fd);
+            vkDestroyBuffer(dev, guestBuf, nullptr);
+            guestBuf = VK_NULL_HANDLE;
+            return fail("no memory type or size mismatch", int(req.size >> 20));
+        }
+        VkImportMemoryFdInfoKHR imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        imp.fd = buf_fd;  // owned by the driver on success
+        VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        ded.buffer = guestBuf;
+        imp.pNext = &ded;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &imp;
+        mai.allocationSize = size;
+        mai.memoryTypeIndex = type;
+        r = vkAllocateMemory(dev, &mai, nullptr, &guestMem);
+        if (r == VK_SUCCESS) r = vkBindBufferMemory(dev, guestBuf, guestMem, 0);
+        if (r != VK_SUCCESS) {
+            if (!guestMem) close(buf_fd);
+            if (guestMem) vkFreeMemory(dev, guestMem, nullptr);
+            vkDestroyBuffer(dev, guestBuf, nullptr);
+            guestBuf = VK_NULL_HANDLE;
+            guestMem = VK_NULL_HANDLE;
+            return fail("import", int(r));
+        }
+        guestSize = size;
+        mem.PhysicalPinned();
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[vbdirect] on: %u MB guest memory imported (memory type %u, flags %x) in %.1f ms\n", size >> 20, type,
+                     memProps.memoryTypes[type].propertyFlags, ms);
+    }
+    // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
+    static uint32_t GuestPhys(uint32_t a) { return a < 0x20000000u ? a : (a & 0x1FFFFFFFu); }
+
     // The driver refuses shared (memfd) pages for host pointer import, so probe the reverse:
     // let Vulkan allocate the memory, export it as a dma-buf and map that fd several times the
     // way guest physical memory is mapped into its three views. Checks that writes through one
@@ -1742,6 +1819,7 @@ struct VulkanRenderer::Impl {
         if (r != VK_SUCCESS) return Fail(err, "vkCreateDevice", r);
         vkGetDeviceQueue(dev, qfam, 0, &queue);
         ProbeGuestImport();
+        SetupDirectVb();
 
         // Depth format: D32S8 where available (AMD has no D24S8), else D24S8.
         VkFormatProperties fp;
@@ -1781,15 +1859,15 @@ struct VulkanRenderer::Impl {
         }
 
         // Descriptor layouts.
-        VkDescriptorSetLayoutBinding b0[4] = {};
-        for (uint32_t i = 0; i < 4; i++) {
+        VkDescriptorSetLayoutBinding b0[5] = {};
+        for (uint32_t i = 0; i < 5; i++) {
             b0[i].binding = i;
-            b0[i].descriptorType = i == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            b0[i].descriptorType = i >= 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             b0[i].descriptorCount = 1;
             b0[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         }
         VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        lci.bindingCount = 4;
+        lci.bindingCount = 5;
         lci.pBindings = b0;
         vkCreateDescriptorSetLayout(dev, &lci, nullptr, &set0Layout);
         std::vector<VkDescriptorSetLayoutBinding> b1(64);
@@ -1808,7 +1886,7 @@ struct VulkanRenderer::Impl {
         plci.pSetLayouts = layouts;
         vkCreatePipelineLayout(dev, &plci, nullptr, &pipeLayout);
 
-        VkDescriptorPoolSize ps0[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        VkDescriptorPoolSize ps0[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dpci.maxSets = 1;
         dpci.poolSizeCount = 2;
@@ -1819,10 +1897,11 @@ struct VulkanRenderer::Impl {
         dsai.descriptorSetCount = 1;
         dsai.pSetLayouts = &set0Layout;
         vkAllocateDescriptorSets(dev, &dsai, &set0);
-        VkDescriptorBufferInfo bufInfo[4] = {{ring.buf, 0, 8192}, {ring.buf, 0, 160}, {ring.buf, 0, sizeof(XeSystemConstants)},
-                                             {ring.buf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet w[4] = {};
-        for (uint32_t i = 0; i < 4; i++) {
+        // Binding 4 is guest physical memory for direct vertex reads (FA_VB_DIRECT=1), else the ring as a stand-in.
+        VkDescriptorBufferInfo bufInfo[5] = {{ring.buf, 0, 8192}, {ring.buf, 0, 160}, {ring.buf, 0, sizeof(XeSystemConstants)},
+                                             {ring.buf, 0, VK_WHOLE_SIZE}, {guestBuf ? guestBuf : ring.buf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[5] = {};
+        for (uint32_t i = 0; i < 5; i++) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet = set0;
             w[i].dstBinding = i;
@@ -1830,7 +1909,7 @@ struct VulkanRenderer::Impl {
             w[i].descriptorType = b0[i].descriptorType;
             w[i].pBufferInfo = &bufInfo[i];
         }
-        vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(dev, 5, w, 0, nullptr);
         // Every set of this layout takes all 64 bindings from the pool, used or not. Sizing it for 8 per set
         // ran the pool dry after 512 sets, and each refill was a full SubmitAndWait (about 3 per race frame).
         VkDescriptorPoolSize ps1 = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextureSets * 64};
@@ -1926,6 +2005,8 @@ struct VulkanRenderer::Impl {
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
             DestroyBuffer(readback);
+            if (guestBuf) vkDestroyBuffer(dev, guestBuf, nullptr);
+            if (guestMem) vkFreeMemory(dev, guestMem, nullptr);
             SavePipelineCache();
             if (pipeCache) vkDestroyPipelineCache(dev, pipeCache, nullptr);
             if (texPool) vkDestroyDescriptorPool(dev, texPool, nullptr);
@@ -2804,6 +2885,18 @@ struct VulkanRenderer::Impl {
                     std::fprintf(stderr, "[vbunb] vs %016llx slot %u: why 0x%x fetch words %u, indices %zu\n",
                                  (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, hd.indices.size());
             }
+            if (guestBuf) {
+                // Direct read: the shader fetches from guest memory (binding 4); nothing is copied.
+                const uint32_t pa = GuestPhys(vf.address);
+                if (uint64_t(pa) + uint64_t(words) * 4 <= guestSize && mem.HostPtr(vf.address, words * 4)) {
+                    sys.vf[s][0] = pa / 4;
+                    sys.vf[s][1] = vf.endian;
+                    sys.vf[s][2] = words;
+                    sys.vf[s][3] = 1;
+                    prof::Add(prof::kVbDirectKB, uint64_t(words) / 256);
+                    continue;
+                }
+            }
             if (!vs->info.vfetchStride[s]) {
                 const uint64_t endKey = uint64_t(vf.address) + uint64_t(words) * 4;
                 auto uit = unbCache.find(endKey);
@@ -3248,7 +3341,7 @@ struct VulkanRenderer::Impl {
     void ReuploadVbs(XeSystemConstants& sys, Shader* vs, const RegisterFile& regs) {
         bool f;
         for (uint32_t s = 0; s < 96; s++) {
-            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32))) || !sys.vf[s][2]) continue;
+            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32))) || !sys.vf[s][2] || sys.vf[s][3]) continue;
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             const uint8_t* src = mem.HostPtr(vf.address, sys.vf[s][2] * 4);
             if (!src) { sys.vf[s][2] = 0; continue; }

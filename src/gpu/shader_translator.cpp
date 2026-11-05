@@ -650,6 +650,7 @@ layout(std140, set = 0, binding = 2) uniform XeSystem {
   uvec4 flags; vec4 misc; uvec4 vf[96]; vec4 texxf[32];
 } xe_s;
 layout(std430, set = 0, binding = 3) readonly buffer XeVertexWords { uint w[]; } xe_vb;
+layout(std430, set = 0, binding = 4) readonly buffer XeGuestWords { uint w[]; } xe_gm;
 
 vec4 r[64];
 float ps = 0.0;
@@ -704,7 +705,7 @@ uint xe_swap(uint v, uint e) {
 uint xe_vword(uint slot, uint i) {
   uvec4 f = xe_s.vf[slot];
   if (i >= f.z) return 0u;
-  return xe_swap(xe_vb.w[f.x + i], f.y);
+  return xe_swap(f.w != 0u ? xe_gm.w[f.x + i] : xe_vb.w[f.x + i], f.y);
 }
 )";
 

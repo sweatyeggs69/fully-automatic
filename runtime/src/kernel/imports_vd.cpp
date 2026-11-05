@@ -113,6 +113,7 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
     }
     int PhysicalFd() const override { return g_mem.phys_fd(); }
     uint32_t PhysicalSize() const override { return kPhysicalSize; }
+    void PhysicalPinned() override { g_mem.set_physical_pinned(); }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;
