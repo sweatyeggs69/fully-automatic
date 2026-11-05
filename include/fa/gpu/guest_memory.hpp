@@ -17,6 +17,13 @@ public:
     // Writable raw pointer (resolves write render targets back to guest memory). nullptr = use
     // Write32 instead.
     virtual uint8_t* HostPtrWrite(uint32_t guestAddr, uint32_t size) { return nullptr; }
+    // File descriptor of the guest's physical memory (physical address p at offset p), so the
+    // renderer can map it for the GPU. -1 = not available.
+    virtual int PhysicalFd() const { return -1; }
+    virtual uint32_t PhysicalSize() const { return 0; }
+    // The renderer pinned physical memory for the GPU (udmabuf): freeing must zero pages in place
+    // instead of dropping them, or the GPU would keep seeing the old pages.
+    virtual void PhysicalPinned() {}
 };
 
 }  // namespace fa::gpu

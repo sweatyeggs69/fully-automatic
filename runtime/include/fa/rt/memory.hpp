@@ -49,6 +49,10 @@ public:
         uint32_t page = addr >> 12;
         return (committed_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
     }
+    // memfd holding physical memory (physical address p at offset p).
+    int phys_fd() const { return phys_fd_; }
+    // Physical pages are pinned by a GPU import: free zeroes them in place instead of punching holes.
+    void set_physical_pinned() { phys_pinned_.store(true); }
     // Start and size of the allocation containing addr, false if none.
     bool find_allocation(uint32_t addr, uint32_t& start, uint32_t& size);
 
@@ -65,6 +69,7 @@ private:
     uint8_t* base_ = nullptr;
     std::atomic<uint64_t> committed_[(kGuestSpace >> 12) / 64] = {};
     int phys_fd_ = -1;
+    std::atomic<bool> phys_pinned_{false};
     std::mutex mu_;
     std::mutex malloc_mu_;
     std::map<uint32_t, uint32_t> allocs_;  // start -> size (page rounded)

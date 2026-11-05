@@ -23,6 +23,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
 #include <sys/stat.h>
 
 #include "fa/gpu/gpu_profile.hpp"
@@ -1115,7 +1120,6 @@ struct VulkanRenderer::Impl {
     // (from the lowest start seen so far) serves all of them.
     struct UnbCopy { uint32_t start; VkDeviceSize at; };
     std::unordered_map<uint64_t, UnbCopy> unbCache;
-    std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
     uint32_t lastVsN = 0, lastPsN = 0;
     int drawsTraced = 0;
@@ -1409,9 +1413,43 @@ struct VulkanRenderer::Impl {
         Barrier();
         MarkTs(curPassLabel);
     }
+    // FA_VB_CHECK=1: for direct vertex reads, hash the fetched range (first 16 KB) when the draw is
+    // recorded and again at submit and after the GPU finished. A change means the GPU read different
+    // vertex data than a copy at record time would have given (the game rewrote the buffer early).
+    static inline const bool vbCheck = [] { const char* e = std::getenv("FA_VB_CHECK"); return e && e[0] == '1'; }();
+    struct VbCheck { uint32_t addr, words; uint64_t vs; uint32_t slot; uint64_t h; };
+    std::vector<VbCheck> vbChecks;
+    uint64_t HashGuest(uint32_t addr, uint32_t words) const {
+        const uint8_t* p = mem.HostPtr(addr, words * 4);
+        if (!p) return 0;
+        uint64_t h = 0x9E3779B97F4A7C15ull ^ words;
+        for (uint32_t k = 0; k + 1 < words; k += 2) {
+            uint64_t v;
+            std::memcpy(&v, p + size_t(k) * 4, 8);
+            h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+            h ^= h >> 29;
+        }
+        return h;
+    }
+    void VbCheckPass(const char* when, prof::Stat draws, prof::Stat kb) {
+        static int logged = 0, loggedLate = 0;
+        for (auto& c : vbChecks) {
+            uint64_t h = HashGuest(c.addr, c.words);
+            if (h == c.h) continue;
+            prof::Add(draws, 1);
+            prof::Add(kb, c.words / 256);
+            c.h = h;  // count each change once
+            if (frame < 600 ? logged++ < 20 : loggedLate++ < 40) {
+                std::fprintf(stderr, "[vbcheck] %s: vs %016llx slot %u, %08x, %u words changed since record\n", when,
+                             (unsigned long long)c.vs, c.slot, c.addr, c.words);
+            }
+        }
+    }
+
     // Submits everything recorded so far and waits for it. All per-batch resources are reset.
     void SubmitAndWait() {
         if (!recording) return;
+        if (vbCheck) VbCheckPass("submit", prof::kVbChgSubmit, prof::kVbChgSubmitKB);
         EndRendering("submit");
         MarkTs("other");
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
@@ -1422,6 +1460,11 @@ struct VulkanRenderer::Impl {
         Check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
         Check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         vkResetFences(dev, 1, &fence);
+        if (vbCheck) {
+            VbCheckPass("gpu done", prof::kVbChgGpu, prof::kVbChgGpuKB);
+            prof::Add(prof::kVbChecked, vbChecks.size());
+            vbChecks.clear();
+        }
         if (tsPool) {
             std::vector<uint64_t> ts(tsCount);
             if (tsCount >= 2 && vkGetQueryPoolResults(dev, tsPool, 0, tsCount, tsCount * sizeof(uint64_t), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -1468,6 +1511,275 @@ struct VulkanRenderer::Impl {
         }
         ringPos = at + size;
         return at;
+    }
+
+    // ---- direct guest memory probe ---------------------------------------------------------
+    // Step one of letting the GPU read vertex data straight from guest memory instead of copying
+    // it into the upload ring every draw: map the guest's physical memory a second time (an alias
+    // the guest never sees, read/write) and try to import it as one Vulkan buffer. Only logs the
+    // outcome for now; nothing uses the buffer yet. Runs only with FA_GUEST_IMPORT=1.
+    bool haveHostImport = false, haveMemFd = false, haveDmaBuf = false;
+    void ProbeGuestImport() {
+        const char* e = std::getenv("FA_GUEST_IMPORT");
+        if (!e || e[0] != '1') return;
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &hp;
+        vkGetPhysicalDeviceProperties2(phys, &p2);
+        std::fprintf(stderr, "[import] device %s, host import ext %d, align %llu, max storage range %u\n",
+                     props.deviceName, int(haveHostImport), (unsigned long long)hp.minImportedHostPointerAlignment,
+                     props.limits.maxStorageBufferRange);
+        if (!haveHostImport) return;
+        auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+        if (!getProps) { std::fprintf(stderr, "[import] no vkGetMemoryHostPointerPropertiesEXT\n"); return; }
+        auto tryImport = [&](const char* what, void* ptr, VkDeviceSize size) {
+            auto t0 = std::chrono::steady_clock::now();
+            VkMemoryHostPointerPropertiesEXT mp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            VkResult r = getProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &mp);
+            if (r != VK_SUCCESS || !mp.memoryTypeBits) {
+                std::fprintf(stderr, "[import] %s: host pointer properties failed (%d, types %x)\n", what, int(r), mp.memoryTypeBits);
+                return false;
+            }
+            VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.pNext = &eb;
+            bci.size = size;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VkBuffer b = VK_NULL_HANDLE;
+            r = vkCreateBuffer(dev, &bci, nullptr, &b);
+            if (r != VK_SUCCESS) { std::fprintf(stderr, "[import] %s: vkCreateBuffer %d\n", what, int(r)); return false; }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(dev, b, &req);
+            uint32_t bits = req.memoryTypeBits & mp.memoryTypeBits, type = 0;
+            while (bits && !(bits & 1u)) { bits >>= 1; type++; }
+            if (!bits) {
+                std::fprintf(stderr, "[import] %s: no memory type (buffer %x, host %x)\n", what, req.memoryTypeBits, mp.memoryTypeBits);
+                vkDestroyBuffer(dev, b, nullptr);
+                return false;
+            }
+            VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+            imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            imp.pHostPointer = ptr;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &imp;
+            mai.allocationSize = size;
+            mai.memoryTypeIndex = type;
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            r = vkAllocateMemory(dev, &mai, nullptr, &m);
+            if (r == VK_SUCCESS) r = vkBindBufferMemory(dev, b, m, 0);
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[import] %s: %llu MB, memory type %u (flags %x): %s (%d) in %.1f ms\n", what,
+                         (unsigned long long)(size >> 20), type, memProps.memoryTypes[type].propertyFlags,
+                         r == VK_SUCCESS ? "OK" : "FAILED", int(r), ms);
+            if (m) vkFreeMemory(dev, m, nullptr);
+            vkDestroyBuffer(dev, b, nullptr);
+            return r == VK_SUCCESS;
+        };
+        // Control: plain anonymous memory, which every driver should accept.
+        size_t anon = 16u << 20;
+        void* a = mmap(nullptr, anon, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (a != MAP_FAILED) { tryImport("anonymous", a, anon); munmap(a, anon); }
+        int fd = mem.PhysicalFd();
+        uint32_t size = mem.PhysicalSize();
+        if (fd < 0 || !size) { std::fprintf(stderr, "[import] guest physical memory fd not available\n"); return; }
+        void* g = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (g == MAP_FAILED) { std::fprintf(stderr, "[import] alias mmap failed\n"); return; }
+        tryImport("guest physical", g, size);
+        munmap(g, size);
+        ProbeDmaBuf();
+    }
+
+    // ---- direct vertex reads ---------------------------------------------------------------
+    // On unless FA_VB_DIRECT=0: wrap guest physical memory (the memfd) in a udmabuf and import it as one
+    // storage buffer, so vertex fetches read guest memory on the GPU instead of being copied into
+    // the ring for every draw. udmabuf pins the pages, so the runtime stops punching holes on free.
+    VkBuffer guestBuf = VK_NULL_HANDLE;
+    VkDeviceMemory guestMem = VK_NULL_HANDLE;
+    uint32_t guestSize = 0;
+    void SetupDirectVb() {
+        const char* e = std::getenv("FA_VB_DIRECT");
+        if (e && e[0] == '0') return;
+        auto fail = [](const char* why, int code) { std::fprintf(stderr, "[vbdirect] off: %s (%d)\n", why, code); };
+        int memfd = mem.PhysicalFd();
+        uint32_t size = mem.PhysicalSize();
+        if (memfd < 0 || !size) return fail("no physical memory fd", 0);
+        if (!haveMemFd || !haveDmaBuf) return fail("no dma-buf import extensions", 0);
+        int dev_fd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (dev_fd < 0) return fail("cannot open /dev/udmabuf", errno);
+        struct { uint32_t memfd, flags; uint64_t offset, size; } cr{uint32_t(memfd), 0x01 /* UDMABUF_FLAGS_CLOEXEC */, 0, size};
+        // UDMABUF_CREATE = _IOW('u', 0x42, struct udmabuf_create)
+        const unsigned long kCreate = (1ul << 30) | (uint32_t(sizeof cr) << 16) | ('u' << 8) | 0x42;
+        auto t0 = std::chrono::steady_clock::now();
+        int buf_fd = ioctl(dev_fd, kCreate, &cr);
+        int ioErr = errno;
+        close(dev_fd);
+        if (buf_fd < 0) return fail("UDMABUF_CREATE failed", ioErr);
+        auto getFdProps = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdPropertiesKHR");
+        VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+        VkResult r = getFdProps ? getFdProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buf_fd, &fp) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (r != VK_SUCCESS || !fp.memoryTypeBits) { close(buf_fd); return fail("dma-buf fd properties", int(r)); }
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.pNext = &eb;
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if ((r = vkCreateBuffer(dev, &bci, nullptr, &guestBuf)) != VK_SUCCESS) { close(buf_fd); guestBuf = VK_NULL_HANDLE; return fail("buffer", int(r)); }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, guestBuf, &req);
+        uint32_t bits = req.memoryTypeBits & fp.memoryTypeBits, type = 0;
+        while (bits && !(bits & 1u)) { bits >>= 1; type++; }
+        if (!bits || req.size > size) {
+            close(buf_fd);
+            vkDestroyBuffer(dev, guestBuf, nullptr);
+            guestBuf = VK_NULL_HANDLE;
+            return fail("no memory type or size mismatch", int(req.size >> 20));
+        }
+        VkImportMemoryFdInfoKHR imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        imp.fd = buf_fd;  // owned by the driver on success
+        VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        ded.buffer = guestBuf;
+        imp.pNext = &ded;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &imp;
+        mai.allocationSize = size;
+        mai.memoryTypeIndex = type;
+        r = vkAllocateMemory(dev, &mai, nullptr, &guestMem);
+        if (r == VK_SUCCESS) r = vkBindBufferMemory(dev, guestBuf, guestMem, 0);
+        if (r != VK_SUCCESS) {
+            if (!guestMem) close(buf_fd);
+            if (guestMem) vkFreeMemory(dev, guestMem, nullptr);
+            vkDestroyBuffer(dev, guestBuf, nullptr);
+            guestBuf = VK_NULL_HANDLE;
+            guestMem = VK_NULL_HANDLE;
+            return fail("import", int(r));
+        }
+        guestSize = size;
+        mem.PhysicalPinned();
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[vbdirect] on: %u MB guest memory imported (memory type %u, flags %x) in %.1f ms\n", size >> 20, type,
+                     memProps.memoryTypes[type].propertyFlags, ms);
+    }
+    // Streaming vertex memory (the game's per-frame vertex ring, run 73: one shader's fetches at
+    // ever-advancing addresses) is rewritten by the game before our GPU runs the draw, because fences
+    // are signalled when the commands are recorded, not when the GPU finishes. Those regions keep
+    // the copy at record time. A 1 MB region counts as streaming once more than FA_VB_STREAM (24)
+    // fetch bases in one frame advance by small steps past the previous one; it stays so for 600
+    // frames after the last frame that qualified.
+    struct StreamRegion { uint64_t frame = ~0ull; uint32_t lastBase = 0; uint32_t advances = 0; uint64_t until = 0; };
+    std::unordered_map<uint32_t, StreamRegion> streamRegions;
+    bool StreamingRegion(uint32_t pa) {
+        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 24u; }();
+        if (!limit) return false;
+        StreamRegion& r = streamRegions[pa >> 20];
+        if (r.frame != frame) { r.frame = frame; r.advances = 0; }
+        if (pa > r.lastBase && pa - r.lastBase <= 0x40000 && ++r.advances == limit) {
+            if (frame >= r.until) {
+                static int logged = 0;
+                if (logged++ < 20) std::fprintf(stderr, "[vbstream] region %08x streams (frame %llu): copied, not read directly\n", pa & ~0xFFFFFu, (unsigned long long)frame);
+            }
+            r.until = frame + 600;
+        }
+        if (pa != r.lastBase) r.lastBase = pa;
+        return frame < r.until;
+    }
+    // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
+    static uint32_t GuestPhys(uint32_t a) { return a < 0x20000000u ? a : (a & 0x1FFFFFFFu); }
+
+    // The driver refuses shared (memfd) pages for host pointer import, so probe the reverse:
+    // let Vulkan allocate the memory, export it as a dma-buf and map that fd several times the
+    // way guest physical memory is mapped into its three views. Checks that writes through one
+    // mapping show in another, that mprotect works on it, and how fast the CPU reads it.
+    void ProbeDmaBuf() {
+        bool udma = access("/dev/udmabuf", R_OK | W_OK) == 0;
+        int lim = -1;
+        if (FILE* f = std::fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+            if (std::fscanf(f, "%d", &lim) != 1) lim = -1;
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[import] /dev/udmabuf usable %d, size limit %d MB; memory fd ext %d, dma-buf ext %d\n",
+                     int(udma), lim, int(haveMemFd), int(haveDmaBuf));
+        if (!haveMemFd || !haveDmaBuf) return;
+        auto getFd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR");
+        if (!getFd) return;
+        const VkDeviceSize size = 512ull << 20;
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.pNext = &eb;
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        VkBuffer b = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev, &bci, nullptr, &b) != VK_SUCCESS) { std::fprintf(stderr, "[import] dma-buf: buffer failed\n"); return; }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(dev, b, &req);
+        for (int pass = 0; pass < 2; pass++) {
+            // Pass 0 wants host cached memory (what the CPU side would need), pass 1 any host visible.
+            VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                         (pass == 0 ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+            uint32_t type = ~0u;
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
+                if ((req.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want &&
+                    !(memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = i; break; }
+            if (type == ~0u) { std::fprintf(stderr, "[import] dma-buf pass %d: no memory type\n", pass); continue; }
+            VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+            ex.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+            ded.buffer = b;
+            ex.pNext = &ded;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &ex;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = type;
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            VkResult r = vkAllocateMemory(dev, &mai, nullptr, &m);
+            if (r != VK_SUCCESS) { std::fprintf(stderr, "[import] dma-buf pass %d: allocate %d\n", pass, int(r)); continue; }
+            VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+            gi.memory = m;
+            gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            int fd = -1;
+            r = getFd(dev, &gi, &fd);
+            std::string res;
+            char buf[256];
+            if (r != VK_SUCCESS || fd < 0) {
+                res = "export failed " + std::to_string(int(r));
+            } else {
+                uint8_t* v1 = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                uint8_t* v2 = (uint8_t*)mmap(nullptr, size - 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x1000);
+                if (v1 == MAP_FAILED || v2 == MAP_FAILED) {
+                    res = std::string("mmap failed: ") + std::strerror(errno);
+                } else {
+                    v1[0x2345] = 0x5a;
+                    v2[0x10000] = 0xa5;  // = v1[0x11000]
+                    bool alias = v2[0x1345] == 0x5a && v1[0x11000] == 0xa5;
+                    bool prot = mprotect(v1 + (64u << 20), 1u << 20, PROT_NONE) == 0 &&
+                                mprotect(v1 + (64u << 20), 1u << 20, PROT_READ | PROT_WRITE) == 0;
+                    // CPU write then read bandwidth over 256 MB (first touch faults pages in).
+                    auto t0 = std::chrono::steady_clock::now();
+                    std::memset(v1, 1, 256u << 20);
+                    auto t1 = std::chrono::steady_clock::now();
+                    uint64_t sum = 0;
+                    for (size_t i = 0; i < (256u << 20); i += 8) sum += *(const uint64_t*)(v1 + i);
+                    auto t2 = std::chrono::steady_clock::now();
+                    std::memset(v1, 1, 256u << 20);
+                    auto t3 = std::chrono::steady_clock::now();
+                    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                    std::snprintf(buf, sizeof buf, "alias %d, mprotect %d, 256 MB first write %.1f ms, read %.1f ms, rewrite %.1f ms (sum %llu)",
+                                  int(alias), int(prot), ms(t0, t1), ms(t1, t2), ms(t2, t3), (unsigned long long)(sum & 1));
+                    res = buf;
+                }
+                if (v1 != MAP_FAILED) munmap(v1, size);
+                if (v2 != MAP_FAILED) munmap(v2, size - 0x1000);
+                close(fd);
+            }
+            std::fprintf(stderr, "[import] dma-buf pass %d: memory type %u (flags %x): %s\n", pass, type,
+                         memProps.memoryTypes[type].propertyFlags, res.c_str());
+            vkFreeMemory(dev, m, nullptr);
+            if (pass == 0) break;
+        }
+        vkDestroyBuffer(dev, b, nullptr);
     }
 
     // ---- init ------------------------------------------------------------------------------
@@ -1544,13 +1856,31 @@ struct VulkanRenderer::Impl {
         qci.queueFamilyIndex = qfam;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
+        std::vector<const char*> devExts;
+        {
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> ep(ne);
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, ep.data());
+            for (auto& e : ep)
+                if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) haveHostImport = true;
+                else if (!std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) haveMemFd = true;
+                else if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) haveDmaBuf = true;
+            if (haveHostImport) devExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            if (haveMemFd) devExts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            if (haveMemFd && haveDmaBuf) devExts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        }
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &use;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = uint32_t(devExts.size());
+        dci.ppEnabledExtensionNames = devExts.data();
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (r != VK_SUCCESS) return Fail(err, "vkCreateDevice", r);
         vkGetDeviceQueue(dev, qfam, 0, &queue);
+        ProbeGuestImport();
+        SetupDirectVb();
 
         // Depth format: D32S8 where available (AMD has no D24S8), else D24S8.
         VkFormatProperties fp;
@@ -1590,15 +1920,15 @@ struct VulkanRenderer::Impl {
         }
 
         // Descriptor layouts.
-        VkDescriptorSetLayoutBinding b0[4] = {};
-        for (uint32_t i = 0; i < 4; i++) {
+        VkDescriptorSetLayoutBinding b0[5] = {};
+        for (uint32_t i = 0; i < 5; i++) {
             b0[i].binding = i;
-            b0[i].descriptorType = i == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            b0[i].descriptorType = i >= 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             b0[i].descriptorCount = 1;
             b0[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         }
         VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        lci.bindingCount = 4;
+        lci.bindingCount = 5;
         lci.pBindings = b0;
         vkCreateDescriptorSetLayout(dev, &lci, nullptr, &set0Layout);
         std::vector<VkDescriptorSetLayoutBinding> b1(64);
@@ -1617,7 +1947,7 @@ struct VulkanRenderer::Impl {
         plci.pSetLayouts = layouts;
         vkCreatePipelineLayout(dev, &plci, nullptr, &pipeLayout);
 
-        VkDescriptorPoolSize ps0[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        VkDescriptorPoolSize ps0[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dpci.maxSets = 1;
         dpci.poolSizeCount = 2;
@@ -1628,10 +1958,11 @@ struct VulkanRenderer::Impl {
         dsai.descriptorSetCount = 1;
         dsai.pSetLayouts = &set0Layout;
         vkAllocateDescriptorSets(dev, &dsai, &set0);
-        VkDescriptorBufferInfo bufInfo[4] = {{ring.buf, 0, 8192}, {ring.buf, 0, 160}, {ring.buf, 0, sizeof(XeSystemConstants)},
-                                             {ring.buf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet w[4] = {};
-        for (uint32_t i = 0; i < 4; i++) {
+        // Binding 4 is guest physical memory for direct vertex reads (see SetupDirectVb), else the ring as a stand-in.
+        VkDescriptorBufferInfo bufInfo[5] = {{ring.buf, 0, 8192}, {ring.buf, 0, 160}, {ring.buf, 0, sizeof(XeSystemConstants)},
+                                             {ring.buf, 0, VK_WHOLE_SIZE}, {guestBuf ? guestBuf : ring.buf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[5] = {};
+        for (uint32_t i = 0; i < 5; i++) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet = set0;
             w[i].dstBinding = i;
@@ -1639,8 +1970,10 @@ struct VulkanRenderer::Impl {
             w[i].descriptorType = b0[i].descriptorType;
             w[i].pBufferInfo = &bufInfo[i];
         }
-        vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
-        VkDescriptorPoolSize ps1 = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextureSets * 8};
+        vkUpdateDescriptorSets(dev, 5, w, 0, nullptr);
+        // Every set of this layout takes all 64 bindings from the pool, used or not. Sizing it for 8 per set
+        // ran the pool dry after 512 sets, and each refill was a full SubmitAndWait (about 3 per race frame).
+        VkDescriptorPoolSize ps1 = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextureSets * 64};
         dpci.maxSets = kMaxTextureSets;
         dpci.poolSizeCount = 1;
         dpci.pPoolSizes = &ps1;
@@ -1733,6 +2066,8 @@ struct VulkanRenderer::Impl {
             DestroyImage(dummyCube);
             DestroyBuffer(ring);
             DestroyBuffer(readback);
+            if (guestBuf) vkDestroyBuffer(dev, guestBuf, nullptr);
+            if (guestMem) vkFreeMemory(dev, guestMem, nullptr);
             SavePipelineCache();
             if (pipeCache) vkDestroyPipelineCache(dev, pipeCache, nullptr);
             if (texPool) vkDestroyDescriptorPool(dev, texPool, nullptr);
@@ -2265,6 +2600,7 @@ struct VulkanRenderer::Impl {
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = key.prim == uint32_t(HostPrim::Points) ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                     : key.prim == uint32_t(HostPrim::Lines) ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                    : key.prim == uint32_t(HostPrim::TriStrip) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
                     : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vps.viewportCount = 1;
@@ -2358,6 +2694,75 @@ struct VulkanRenderer::Impl {
     }
 
     // ---- draws -------------------------------------------------------------------------------
+    struct FastIdx {
+        int mode = 0;           // 0 = host index list (BuildHostDraw), 1 = guest u16, 2 = guest u32, 3 = auto
+        HostPrim prim = HostPrim::Triangles;
+        uint32_t count = 0;     // indices drawn
+        uint32_t offset = 0;    // VGT_INDX_OFFSET, applied as the vertex offset
+        uint32_t maxIdx = 0;    // largest final index (offset applied)
+        const uint8_t* src = nullptr;
+    };
+    // List primitives (points, lines, triangles, rectangles) keep their indices as they are, so the
+    // host list BuildHostDraw makes is the guest list plus the offset. Falls back for strips, fans
+    // and quads, inline indices, unusual endian modes, a reset index present in the data, or an
+    // index that would wrap past 24 bits. Opt-in with FA_FAST_IDX=1.
+    bool TryFastIndices(const DrawCall& dc, const RegisterFile& regs, FastIdx& fi) {
+        // Off by default: run 69 showed black triangles on light pole debris with it on (run 70 clean
+        // with it off), cause not found yet. It covered only ~700 indices per race frame anyway.
+        static const bool off = [] { const char* e = std::getenv("FA_FAST_IDX"); return !(e && e[0] == '1'); }();
+        if (off || !dc.indexCount) return false;
+        uint32_t per;
+        HostPrim prim;
+        switch (dc.primType) {
+            case xe::kPrimPointList: per = 1; prim = HostPrim::Points; break;
+            case xe::kPrimLineList: per = 2; prim = HostPrim::Lines; break;
+            case xe::kPrimTriangleList:
+            case xe::kPrimTriangleWithWFlags: per = 3; prim = HostPrim::Triangles; break;
+            case xe::kPrimRectangleList: per = 3; prim = HostPrim::Rects; break;
+            // Strips are drawn as native strips: same triangles and winding as the list BuildHostDraw
+            // makes (odd triangles have their first two vertices swapped either way).
+            case xe::kPrimTriangleStrip: per = 1; prim = HostPrim::TriStrip; break;
+            default: return false;
+        }
+        const uint32_t offset = regs[xe::VGT_INDX_OFFSET] & 0xFFFFFF;
+        const uint32_t n = dc.indexCount / per * per;
+        if (!n || (prim == HostPrim::TriStrip && n < 3)) return false;
+        if (!dc.indexed) {
+            if (uint64_t(offset) + n > 0xFFFFFF) return false;
+            fi = {3, prim, n, offset, offset + n - 1, nullptr};
+            return true;
+        }
+        if (!dc.inlineIndices.empty() || !dc.indexGuestAddr) return false;
+        if (dc.index32 ? dc.indexEndian != kEndian8in32 : dc.indexEndian != kEndian8in16) return false;
+        const uint32_t bytes = dc.indexCount * (dc.index32 ? 4 : 2);
+        const uint8_t* p = mem.HostPtr(dc.indexGuestAddr, (bytes + 3) & ~3u);
+        if (!p) return false;
+        const bool resetEnabled = (regs[xe::PA_SU_SC_MODE_CNTL] >> 21) & 1;
+        const uint32_t resetMask = dc.index32 ? 0xFFFFFF : 0xFFFF;
+        const uint32_t reset = resetEnabled ? (regs[xe::VGT_MULTI_PRIM_IB_RESET_INDX] & resetMask) : ~0u;
+        uint32_t mx = 0;
+        if (dc.index32) {
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v;
+                std::memcpy(&v, p + size_t(i) * 4, 4);
+                v = __builtin_bswap32(v);
+                if ((v & resetMask) == reset || v > 0xFFFFFF) return false;
+                mx = std::max(mx, v);
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                uint16_t v;
+                std::memcpy(&v, p + size_t(i) * 2, 2);
+                v = __builtin_bswap16(v);
+                if (v == reset) return false;
+                mx = std::max<uint32_t>(mx, v);
+            }
+        }
+        if (uint64_t(mx) + offset > 0xFFFFFF) return false;
+        fi = {dc.index32 ? 2 : 1, prim, n, offset, mx + offset, p};
+        return true;
+    }
+
     void Draw(const DrawCall& dc, const RegisterFile& regs) {
         prof::Scope ps_(prof::kDraw);
         uint32_t mode = regs[xe::RB_MODECONTROL] & 7;
@@ -2368,9 +2773,34 @@ struct VulkanRenderer::Impl {
         if (!vs->ok || !ps->ok) { stats.drawsSkipped++; return; }
         std::optional<prof::Scope> sec;
         sec.emplace(prof::kDrawBuild);
-        if (!BuildHostDraw(dc, regs, mem, hostDraw)) { stats.drawsSkipped++; return; }
+        // List primitives whose indices need no rewriting skip the host index list: the guest indices
+        // are byte swapped straight into the ring (fi.mode 1/2), or not uploaded at all for
+        // auto indices (mode 3). The index offset becomes the draw's vertex offset.
+        FastIdx fi;
         HostDraw& hd = hostDraw;
-        prof::Add(prof::kIdxCount, hd.indices.size());
+        if (TryFastIndices(dc, regs, fi)) {
+            hd.indices.clear();
+            hd.prim = fi.prim;
+            hd.supported = true;
+        } else if (!BuildHostDraw(dc, regs, mem, hostDraw)) {
+            stats.drawsSkipped++;
+            return;
+        }
+        const uint32_t nIdx = fi.mode ? fi.count : uint32_t(hd.indices.size());
+        prof::Add(prof::kIdxCount, nIdx);
+        if (fi.mode) prof::Add(prof::kIdxFast, nIdx);
+        if (prof::g_enabled && !fi.mode) {
+            // Why the fast path was not taken, in guest indices.
+            const bool reset = dc.indexed && ((regs[xe::PA_SU_SC_MODE_CNTL] >> 21) & 1);
+            const uint32_t pt = dc.primType;
+            prof::Add(pt == xe::kPrimTriangleStrip ? (reset ? prof::kIdxStripReset : prof::kIdxStrip)
+                      : !dc.inlineIndices.empty() ? prof::kIdxInline
+                      : (pt == xe::kPrimTriangleList || pt == xe::kPrimRectangleList || pt == xe::kPrimPointList || pt == xe::kPrimLineList || pt == xe::kPrimTriangleWithWFlags) ? prof::kIdxListSlow
+                      : prof::kIdxOther, dc.indexCount);
+            if (dc.indexed && dc.inlineIndices.empty() && !dc.index32 && pt == xe::kPrimTriangleStrip && reset &&
+                (regs[xe::VGT_MULTI_PRIM_IB_RESET_INDX] & 0xFFFF) == 0xFFFF)
+                prof::Add(prof::kIdxStripFFFF, dc.indexCount);
+        }
         if (hd.prim == HostPrim::Rects && !haveGs) hd.prim = HostPrim::Triangles;
         Begin();
 
@@ -2472,12 +2902,13 @@ struct VulkanRenderer::Impl {
             }
             if (!sameSet) {
             prof::Scope pd_(prof::kDtDesc);
-            if (texSetsUsed >= kMaxTextureSets) { SubmitAndWait(); Begin(); }
+            if (texSetsUsed >= kMaxTextureSets) { prof::Add(prof::kDescFull, 1); SubmitAndWait(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
             ai.descriptorSetCount = 1;
             ai.pSetLayouts = &set1Layout;
             if (vkAllocateDescriptorSets(dev, &ai, &texSet) != VK_SUCCESS) {
+                prof::Add(prof::kDescFull, 1);
                 SubmitAndWait();
                 Begin();
                 vkAllocateDescriptorSets(dev, &ai, &texSet);
@@ -2506,12 +2937,14 @@ struct VulkanRenderer::Impl {
         VkDeviceSize constsOff;
         const uint32_t* consts = &regs.r[pm4::kAluConstBase];
         // Only the float constants the two shaders can read are compared and copied (vs c0.., ps c256..).
-        // lastConsts holds what the ring copy has for the ranges lastVsN / lastPsN (vec4 counts).
+        // The ring copy at lastConstsOff is valid for the ranges lastVsN / lastPsN (vec4 counts).
         static const bool fullConsts = [] { const char* e = std::getenv("FA_CONST_RANGE"); return e && e[0] == '0'; }();  // 0: always all 512
         const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
-        if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && vsN <= lastVsN && psN <= lastPsN &&
-            !std::memcmp(lastConsts.data(), consts, vsN * 16) &&
-            !std::memcmp(lastConsts.data() + 1024, consts + 1024, psN * 16)) {
+        // Compared against the ring copy itself (host cached), so no second copy is kept.
+        const uint8_t* lastRing = lastConstsOff != ~0ull ? static_cast<const uint8_t*>(ring.map) + lastConstsOff : nullptr;
+        if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
+            !std::memcmp(lastRing, consts, vsN * 16) &&
+            !std::memcmp(lastRing + 4096, consts + 1024, psN * 16)) {
             constsOff = lastConstsOff;
         } else {
             prof::Add(prof::kConstUploads, 1);
@@ -2519,15 +2952,12 @@ struct VulkanRenderer::Impl {
             uint8_t* cdst = static_cast<uint8_t*>(ring.map) + constsOff;
             std::memcpy(cdst, consts, vsN * 16);
             std::memcpy(cdst + 4096, consts + 1024, psN * 16);
-            lastConsts.resize(2048);
-            std::memcpy(lastConsts.data(), consts, vsN * 16);
-            std::memcpy(lastConsts.data() + 1024, consts + 1024, psN * 16);
             lastVsN = vsN;
             lastPsN = psN;
             lastConstsOff = constsOff;
         }
         VkDeviceSize boolOff = RingAlloc(160, uboAlign, flushed);
-        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastConsts.assign(consts, consts + 2048); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
+        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
@@ -2583,12 +3013,30 @@ struct VulkanRenderer::Impl {
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             uint32_t words = std::min<uint32_t>(vf.sizeWords, 4u << 20);
             if (vf.type != 3 || !words) continue;
+            // Direct read: the shader fetches from guest memory (binding 4); nothing is copied, so the
+            // whole fetch range is used and the draw's largest index is not needed.
+            auto tryDirect = [&](uint32_t n) {
+                const uint32_t pa = GuestPhys(vf.address);
+                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) || !mem.HostPtr(vf.address, n * 4)) return false;
+                sys.vf[s][0] = pa / 4;
+                sys.vf[s][1] = vf.endian;
+                sys.vf[s][2] = n;
+                sys.vf[s][3] = 1;
+                prof::Add(prof::kVbDirectKB, uint64_t(n) / 256);
+                if (vbCheck) {
+                    const uint32_t hw = std::min<uint32_t>(n, 4096);
+                    vbChecks.push_back({vf.address, hw, dc.vsHash, s, HashGuest(vf.address, hw)});
+                }
+                return true;
+            };
+            if (guestBuf && tryDirect(words)) continue;
             // Games often give the fetch constant a whole pool as its size; only the part the draw's
             // indices can reach needs copying (when the shader indexes straight from the vertex index).
             if (vs->info.vfetchStride[s]) {
                 if (maxIdx == ~0u) {
                     maxIdx = 0;
-                    for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
+                    if (fi.mode) maxIdx = fi.maxIdx;
+                    else for (uint32_t ix : hd.indices) maxIdx = std::max(maxIdx, ix);
                 }
                 uint64_t need = uint64_t(maxIdx) * vs->info.vfetchStride[s] + vs->info.vfetchEnd[s];
                 words = uint32_t(std::min<uint64_t>(words, need));
@@ -2600,7 +3048,7 @@ struct VulkanRenderer::Impl {
                     logged++;
                     std::fprintf(stderr, "[vbprof] vs %016llx slot %u: fetch words %u, copy %u, stride %u end %u, indices %zu max %d\n",
                                  (unsigned long long)dc.vsHash, s, vf.sizeWords, words, vs->info.vfetchStride[s],
-                                 vs->info.vfetchEnd[s], hd.indices.size(), maxIdx == ~0u ? -1 : int(maxIdx));
+                                 vs->info.vfetchEnd[s], size_t(nIdx), maxIdx == ~0u ? -1 : int(maxIdx));
                 }
             }
             if (prof::g_enabled && !vs->info.vfetchStride[s] && vs->info.vfetchUsed[s / 32]) {
@@ -2608,8 +3056,9 @@ struct VulkanRenderer::Impl {
                 static std::set<uint64_t> seenUnb;
                 if (seenUnb.size() < 60 && seenUnb.insert(dc.vsHash ^ (uint64_t(s) << 56)).second)
                     std::fprintf(stderr, "[vbunb] vs %016llx slot %u: why 0x%x fetch words %u, indices %zu\n",
-                                 (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, hd.indices.size());
+                                 (unsigned long long)dc.vsHash, s, vs->info.vfetchWhy[s], vf.sizeWords, size_t(nIdx));
             }
+            if (guestBuf && tryDirect(words)) continue;
             if (!vs->info.vfetchStride[s]) {
                 const uint64_t endKey = uint64_t(vf.address) + uint64_t(words) * 4;
                 auto uit = unbCache.find(endKey);
@@ -2674,16 +3123,25 @@ struct VulkanRenderer::Impl {
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
-        VkDeviceSize idxOff = RingAlloc(hd.indices.size() * 4, 16, flushed);
+        const VkDeviceSize idxBytes = fi.mode == 3 ? 0 : fi.mode == 1 ? VkDeviceSize(nIdx) * 2 : VkDeviceSize(nIdx) * 4;
+        VkDeviceSize idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         if (flushed) {
             // Batch restarted: everything above has to be uploaded again into the new batch.
             RecoverConsts(consts, constsOff, boolOff, regs, uboAlign);
             ReuploadVbs(sys, vs, regs);
             sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
             std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
-            idxOff = RingAlloc(hd.indices.size() * 4, 16, flushed);
+            idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         }
-        std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
+        if (fi.mode == 1) {
+            uint16_t* d = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(ring.map) + idxOff);
+            for (uint32_t i = 0; i < nIdx; i++) { uint16_t v; std::memcpy(&v, fi.src + size_t(i) * 2, 2); d[i] = __builtin_bswap16(v); }
+        } else if (fi.mode == 2) {
+            uint32_t* d = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(ring.map) + idxOff);
+            for (uint32_t i = 0; i < nIdx; i++) { uint32_t v; std::memcpy(&v, fi.src + size_t(i) * 4, 4); d[i] = __builtin_bswap32(v); }
+        } else if (!fi.mode) {
+            std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
+        }
 
         sub.reset();
         // Pipeline.
@@ -2705,7 +3163,7 @@ struct VulkanRenderer::Impl {
         key.colorMask = colorMask;
         key.depthControl = depth ? depthCtl : 0;
         if (depth && !(depthCtl & 1)) key.depthControl &= 0xFF & ~0x80u;  // stencil off: ignore its fields
-        bool tri = hd.prim == HostPrim::Triangles;
+        bool tri = hd.prim == HostPrim::Triangles || hd.prim == HostPrim::TriStrip;
         key.cull = tri ? ((sc & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((sc & 2) ? VK_CULL_MODE_BACK_BIT : 0) : 0;
         key.frontFace = (sc & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         key.depthBias = depth && ((sc >> 11) & 3) ? 1 : 0;
@@ -2760,8 +3218,12 @@ struct VulkanRenderer::Impl {
         vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, (srmBf >> 16) & 0xFF);
         vkCmdSetDepthBias(cmd, xe::AsFloat(regs[xe::PA_SU_POLY_OFFSET_FRONT_OFFSET]), 0.0f,
                           xe::AsFloat(regs[xe::PA_SU_POLY_OFFSET_FRONT_SCALE]));
-        vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
+        if (fi.mode == 3) {
+            vkCmdDraw(cmd, nIdx, 1, fi.offset, 0);
+        } else {
+            vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, fi.mode == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, nIdx, 1, 0, int32_t(fi.offset), 0);
+        }
         if (tsPool && DrawTsOn()) {
             char lb[40];
             std::snprintf(lb, sizeof lb, "D ps %016llx", (unsigned long long)dc.psHash);
@@ -2775,7 +3237,7 @@ struct VulkanRenderer::Impl {
             std::fprintf(stderr,
                          "[render] frame %llu draw %llu (#%llu in frame): prim %u -> %u, %zu indices, vs %016llx ps %016llx, color %03x/%03x mask %04x depth %s "
                          "pitch %u scissor %d,%d %ux%u wo %g,%g vte %03x\n",
-                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), hd.indices.size(),
+                         (unsigned long long)frame, (unsigned long long)stats.draws.load(), (unsigned long long)(drawInFrame - 1), dc.primType, uint32_t(hd.prim), size_t(nIdx),
                          (unsigned long long)dc.vsHash, (unsigned long long)dc.psHash, regs[xe::RB_COLOR_INFO] & 0xFFF,
                          (regs[xe::RB_COLOR_INFO] >> 16) & 0xF, colorMask, depth ? "on" : "off", pitch, scissor.offset.x,
                          scissor.offset.y, scissor.extent.width, scissor.extent.height, wox, woy, vte);
@@ -2808,7 +3270,7 @@ struct VulkanRenderer::Impl {
                     l.first = now;
                     auto cf = [&](uint32_t i2, int k) { return xe::AsFloat(regs[pm4::kAluConstBase + (256 + i2) * 4 + k]); };
                     std::fprintf(stderr, "[psconst] frame %llu ps %016llx vs %016llx idx %zu draws %u:", (unsigned long long)frame,
-                                 (unsigned long long)dc.psHash, (unsigned long long)dc.vsHash, hd.indices.size(), l.second);
+                                 (unsigned long long)dc.psHash, (unsigned long long)dc.vsHash, size_t(nIdx), l.second);
                     for (uint32_t k = 0; k < 8; k++) std::fprintf(stderr, " c%u(%g %g %g %g)", k, cf(k, 0), cf(k, 1), cf(k, 2), cf(k, 3));
                     std::fprintf(stderr, "\n");
                     break;
@@ -2843,7 +3305,7 @@ struct VulkanRenderer::Impl {
                     probeLast[k] = f;
                     std::fprintf(stderr, "[probe] frame %llu draw %llu pixel(%d,%d) -> %.3f %.3f %.3f %.3f | prim %u idx %zu vs %016llx ps %016llx blend %08x\n",
                                  (unsigned long long)frame, (unsigned long long)stats.draws.load(), probePts[k].first, probePts[k].second,
-                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), hd.indices.size(), (unsigned long long)dc.vsHash,
+                                 f[0], f[1], f[2], f[3], uint32_t(hd.prim), size_t(nIdx), (unsigned long long)dc.vsHash,
                                  (unsigned long long)dc.psHash, regs[xe::RB_BLENDCONTROL0]);
                     if (probeTraced.insert({dc.vsHash, dc.psHash}).second) TraceInputs(regs, vs, ps, sys);
                 }
@@ -3045,7 +3507,6 @@ struct VulkanRenderer::Impl {
         bool f;
         constsOff = RingAlloc(8192, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
-        lastConsts.assign(consts, consts + 2048);
         lastVsN = lastPsN = 256;
         lastConstsOff = constsOff;
         boolOff = RingAlloc(160, uboAlign, f);
@@ -3054,7 +3515,7 @@ struct VulkanRenderer::Impl {
     void ReuploadVbs(XeSystemConstants& sys, Shader* vs, const RegisterFile& regs) {
         bool f;
         for (uint32_t s = 0; s < 96; s++) {
-            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32))) || !sys.vf[s][2]) continue;
+            if (!(vs->info.vfetchUsed[s / 32] & (1u << (s % 32))) || !sys.vf[s][2] || sys.vf[s][3]) continue;
             xe::VertexFetch vf = xe::ParseVertexFetch(regs[pm4::kFetchConstBase + s * 2], regs[pm4::kFetchConstBase + s * 2 + 1]);
             const uint8_t* src = mem.HostPtr(vf.address, sys.vf[s][2] * 4);
             if (!src) { sys.vf[s][2] = 0; continue; }

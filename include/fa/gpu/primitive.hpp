@@ -10,7 +10,8 @@
 
 namespace fa::gpu {
 
-enum class HostPrim : uint32_t { Points = 0, Lines = 1, Triangles = 2, Rects = 3 };
+// TriStrip is only produced by the renderer's fast index path (guest strips drawn natively).
+enum class HostPrim : uint32_t { Points = 0, Lines = 1, Triangles = 2, Rects = 3, TriStrip = 4 };
 
 struct HostDraw {
     HostPrim prim = HostPrim::Triangles;

@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 
 namespace fa::rt {
@@ -27,11 +28,13 @@ bool GuestMemory::init() {
     g_base = base_;
     // Physical memory is one shared 512 MiB block seen through three views, as on the console:
     // 0xA0000000 + p, 0xC0000000 + p and 0xE0000000 + p - 0x1000.
-    phys_fd_ = memfd_create("fa-physical", 0);
+    // Sealable, so the renderer can wrap it in a udmabuf (which requires a shrink seal).
+    phys_fd_ = memfd_create("fa-physical", MFD_ALLOW_SEALING);
     if (phys_fd_ < 0 || ftruncate(phys_fd_, kPhysicalSize) != 0) {
         std::perror("physical memory");
         return false;
     }
+    fcntl(phys_fd_, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
     for (uint32_t view : {0xA0000000u, 0xC0000000u}) {
         if (mmap(base_ + view, kPhysicalSize, PROT_NONE, MAP_SHARED | MAP_FIXED, phys_fd_, 0) == MAP_FAILED) {
             std::perror("mmap physical view");
@@ -147,7 +150,8 @@ bool GuestMemory::free(uint32_t addr, uint32_t* freed_size) {
     uint32_t size = it->second;
     // Drop the pages so a later allocation sees zeroed memory, and trap stale accesses.
     int64_t phys = physical_of(addr);
-    if (phys >= 0) fallocate(phys_fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, phys, size);
+    if (phys >= 0 && phys_pinned_.load(std::memory_order_relaxed)) std::memset(base_ + addr, 0, size);
+    else if (phys >= 0) fallocate(phys_fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, phys, size);
     else madvise(base_ + addr, size, MADV_DONTNEED);
     protect(addr, size, PROT_NONE);
     allocs_.erase(it);
