@@ -982,6 +982,7 @@ struct VulkanRenderer::Impl {
     std::unordered_map<uint64_t, UnbCopy> unbCache;
     std::vector<uint32_t> lastConsts;
     VkDeviceSize lastConstsOff = ~0ull;
+    uint32_t lastVsN = 0, lastPsN = 0;
     int drawsTraced = 0;
     uint64_t frame = 0;  // swaps seen
     // FA_RENDER_DUMP=<dir>: every 30th frame (12 of them) gets all its draws logged and all its
@@ -2317,21 +2318,34 @@ struct VulkanRenderer::Impl {
 
         // Uniforms and vertex data.
         sec.emplace(prof::kDrawUpload);
+        std::optional<prof::Scope> sub;
+        sub.emplace(prof::kUpConst);
         const VkDeviceSize uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
         bool flushed;
         VkDeviceSize constsOff;
         const uint32_t* consts = &regs.r[pm4::kAluConstBase];
-        if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && !std::memcmp(lastConsts.data(), consts, 8192)) {
+        // Only the float constants the two shaders can read are compared and copied (vs c0.., ps c256..).
+        // lastConsts holds what the ring copy has for the ranges lastVsN / lastPsN (vec4 counts).
+        const uint32_t vsN = std::min<uint32_t>(vs->info.constMax, 256), psN = std::min<uint32_t>(ps->info.constMax, 256);
+        if (lastConstsOff != ~0ull && lastConsts.size() == 2048 && vsN <= lastVsN && psN <= lastPsN &&
+            !std::memcmp(lastConsts.data(), consts, vsN * 16) &&
+            !std::memcmp(lastConsts.data() + 1024, consts + 1024, psN * 16)) {
             constsOff = lastConstsOff;
         } else {
             prof::Add(prof::kConstUploads, 1);
             constsOff = RingAlloc(8192, uboAlign, flushed);
-            std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
-            lastConsts.assign(consts, consts + 2048);
+            uint8_t* cdst = static_cast<uint8_t*>(ring.map) + constsOff;
+            std::memcpy(cdst, consts, vsN * 16);
+            std::memcpy(cdst + 4096, consts + 1024, psN * 16);
+            lastConsts.resize(2048);
+            std::memcpy(lastConsts.data(), consts, vsN * 16);
+            std::memcpy(lastConsts.data() + 1024, consts + 1024, psN * 16);
+            lastVsN = vsN;
+            lastPsN = psN;
             lastConstsOff = constsOff;
         }
         VkDeviceSize boolOff = RingAlloc(160, uboAlign, flushed);
-        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastConstsOff = constsOff; }
+        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastConsts.assign(consts, consts + 2048); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
@@ -2378,6 +2392,7 @@ struct VulkanRenderer::Impl {
         sys.misc[1] = float((regs[xe::PA_SU_POINT_SIZE] >> 16) & 0xFFFF) / 8.0f;
         if (sys.misc[1] <= 0.0f) sys.misc[1] = 1.0f;
 
+        sub.emplace(prof::kUpVb);
         // Vertex buffers used by the vertex shader.
         uint32_t maxIdx = ~0u;  // largest vertex index of this draw, computed on first use
         for (uint32_t s = 0; s < 96; s++) {
@@ -2452,6 +2467,7 @@ struct VulkanRenderer::Impl {
             sys.vf[s][1] = vf.endian;
             sys.vf[s][2] = words;
         }
+        sub.emplace(prof::kUpIdx);
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
@@ -2466,6 +2482,7 @@ struct VulkanRenderer::Impl {
         }
         std::memcpy(static_cast<uint8_t*>(ring.map) + idxOff, hd.indices.data(), hd.indices.size() * 4);
 
+        sub.reset();
         // Pipeline.
         sec.emplace(prof::kDrawRecord);
         PipelineKey key{};
@@ -2826,6 +2843,7 @@ struct VulkanRenderer::Impl {
         constsOff = RingAlloc(8192, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
         lastConsts.assign(consts, consts + 2048);
+        lastVsN = lastPsN = 256;
         lastConstsOff = constsOff;
         boolOff = RingAlloc(160, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
