@@ -911,6 +911,90 @@ struct VulkanRenderer::Impl {
     }
 
     // View of a still valid snapshot that matches this texture fetch, or null.
+    // Cube maps the game renders face by face: six resolves at consecutive bases (one face apart, 4 KB aligned)
+    // fetched as one cube texture. When all six faces are valid snapshots they are copied into a cube image on the
+    // GPU instead of writing them back and decoding guest memory (FA_SNAP_CUBE=0 disables).
+    struct CubeSnap {
+        Image img;
+        uint64_t ver[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+        std::unordered_map<uint32_t, VkImageView> views;  // by fetch swizzle
+    };
+    std::unordered_map<uint32_t, CubeSnap> cubeSnaps;  // by base of face 0
+    VkImageView CubeSnapView(const TextureFetch& t) {
+        static const bool off = [] { const char* e = std::getenv("FA_SNAP_CUBE"); return e && e[0] == '0'; }();
+        if (off || t.dimension != 3 || !t.tiled || t.width != t.height) return VK_NULL_HANDLE;
+        const uint32_t base = t.base & 0x1FFFFFFFu;
+        auto f0 = snaps.find(base);
+        if (f0 == snaps.end() || !f0->second.valid) return VK_NULL_HANDLE;
+        TextureFetch tf = t;
+        tf.dimension = 1;
+        const uint32_t stride = (HostTextureByteSize(tf) + 4095u) & ~4095u;  // face size, as HostTextureByteSize lays out cubes
+        Snap* faces[6];
+        for (uint32_t k = 0; k < 6; k++) {
+            tf.base = t.base + k * stride;
+            // SnapView does the format, size, pitch, sign, endian and guest memory sample checks for each face.
+            if (!SnapView(tf)) return VK_NULL_HANDLE;
+            auto it = snaps.find(base + k * stride);
+            if (it == snaps.end()) return VK_NULL_HANDLE;
+            faces[k] = &it->second;
+            if (faces[k]->w != t.width || faces[k]->h != t.height || faces[k]->img.format != faces[0]->img.format ||
+                faces[k]->swapRB != faces[0]->swapRB)
+                return VK_NULL_HANDLE;
+        }
+        std::memset(curXf, 0, sizeof curXf);  // cube fetches take no conversion
+        CubeSnap& c = cubeSnaps[base];
+        if (c.img.img && (c.img.format != faces[0]->img.format || c.img.w != t.width)) {
+            for (auto& [sw, v] : c.views) garbageViews.push_back(v);
+            c.views.clear();
+            garbageImages.push_back(c.img);
+            c.img = Image{};
+        }
+        Begin();
+        if (!c.img.img) {
+            if (!CreateImage(c.img, faces[0]->img.format, t.width, t.height, 6, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             true, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                DestroyImage(c.img);
+                cubeSnaps.erase(base);
+                return VK_NULL_HANDLE;
+            }
+            EndRendering("cubesnap");
+            ImageToGeneral(c.img.img, VK_IMAGE_ASPECT_COLOR_BIT, 6);
+            for (auto& v : c.ver) v = ~0ull;
+        }
+        bool barrier = false;
+        for (uint32_t k = 0; k < 6; k++) {
+            if (c.ver[k] == faces[k]->version) continue;
+            if (!barrier) { EndRendering("cubesnap"); Barrier(); barrier = true; }
+            VkImageCopy ic{};
+            ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, k, 1};
+            ic.extent = {t.width, t.height, 1};
+            vkCmdCopyImage(cmd, faces[k]->img.img, VK_IMAGE_LAYOUT_GENERAL, c.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+            c.ver[k] = faces[k]->version;
+        }
+        if (barrier) Barrier();
+        auto v = c.views.find(t.swizzle);
+        if (v != c.views.end()) return v->second;
+        VkComponentMapping cm;
+        VkComponentSwizzle* comps[4] = {&cm.r, &cm.g, &cm.b, &cm.a};
+        for (int ch = 0; ch < 4; ch++) {
+            uint32_t sw = (t.swizzle >> (3 * ch)) & 7;
+            if (faces[0]->swapRB && sw < 4 && sw != 1 && sw != 3) sw = sw == 0 ? 2 : 0;
+            *comps[ch] = sw < 4 ? VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + sw)
+                       : sw == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+        }
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = c.img.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        vi.format = c.img.format;
+        vi.components = cm;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        c.views[t.swizzle] = view;
+        return view;
+    }
+
     VkImageView SnapView(const TextureFetch& t) {
         auto it = snaps.find(t.base & 0x1FFFFFFFu);
         if (it == snaps.end()) return VK_NULL_HANDLE;
@@ -1899,6 +1983,11 @@ struct VulkanRenderer::Impl {
             auto wit = textures.find(HashBytes(d, 6 * sizeof(uint32_t)) ^ (uint64_t(t.dimension) << 62));
             const bool reuse = wit != textures.end() && wit->second.validatedGen == generation && wit->second.ok;
             if (!reuse) WatchBytes("texture bind", t.base, HostTextureByteSize(t), "(will recheck memory)");  // reused binds are not logged
+        }
+        if (snapEnabled && cube && !snaps.empty()) {
+            prof::Scope pn_(prof::kDtSnap);
+            if (VkImageView cv = CubeSnapView(t)) return cv;
+            std::memset(curXf, 0, sizeof curXf);
         }
         if (snapEnabled && !cube && !snaps.empty()) {
             prof::Scope pn_(prof::kDtSnap);
@@ -3501,11 +3590,11 @@ void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const 
 }
 
 void VulkanRenderer::Sync() {
-    // Fences and interrupts from the command stream no longer force the pending resolves into guest memory (one
-    // GPU wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still do. Runs 36 and
-    // 57 showed no visual difference. FA_SYNC_FLUSH=1 restores the flush at every sync point. (Skipping the swap
-    // flush as well corrupted the scene in run 42: keep that one.)
-    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return e && e[0] == '1'; }();
+    // FA_SYNC_FLUSH=0: fences and interrupts from the command stream no longer force the pending resolves into
+    // guest memory (one GPU wait each, about 4 per frame); texture fetches, overlapping resolves and the swap still
+    // do. Faster (run 57), but cars flickered in the pause menu with it (run 58, not in run 59 with it on), so it
+    // stays opt-in. Skipping the swap flush as well corrupted the scene in run 42.
+    static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return !(e && e[0] == '0'); }();
     if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
 }
