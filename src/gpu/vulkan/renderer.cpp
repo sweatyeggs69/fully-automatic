@@ -559,10 +559,10 @@ struct VulkanRenderer::Impl {
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
-    void InvalidateTextures(uint32_t base, uint32_t size) {
+    void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
-            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) e.valid = false;
+            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
         for (auto& [k, t] : textures) {
             const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
             if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
@@ -599,6 +599,7 @@ struct VulkanRenderer::Impl {
         uint64_t version = 0;                       // bumped whenever the snapshot is rewritten
         uint64_t checkedGen = 0, checkedVer = ~0ull;  // frame and version at which the guest memory samples last matched
         bool valid = false;
+        uint32_t invBase = 0, invSize = 0, invSite = 0;  // what last invalidated it (FA_SNAPLOG)
         uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
         bool swapRB = false;
         bool pending = false;       // guest memory not written yet (see FlushPending)
@@ -626,6 +627,7 @@ struct VulkanRenderer::Impl {
         if (e.img.img) garbageImages.push_back(e.img);
         e.img = Image{};
         e.valid = false;
+        e.invSite = 628;
     }
     // Lazy writeback: snapshotted resolves do not read their pixels back right away. The snapshot
     // images hold the data and the guest memory is written in one batch (one GPU wait) when something
@@ -685,7 +687,7 @@ struct VulkanRenderer::Impl {
         const uint8_t* gp = mem.HostPtr(d.base, destBytes);
         uint32_t samples[64];
         if (!gp || !SnapSample(gp, destBytes, samples)) return false;
-        InvalidateTextures(d.base, destBytes);  // other textures over this memory are stale (may drop a pending write of e)
+        InvalidateTextures(d.base, destBytes, 688);  // other textures over this memory are stale (may drop a pending write of e)
         Barrier();
         VkImageCopy ic{};
         ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -763,11 +765,12 @@ struct VulkanRenderer::Impl {
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
             if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + snapBase + offs[i], destBytes)) {
                 const bool keep = e.valid;
-                InvalidateTextures(e.dest.base, destBytes);  // other textures over this memory are stale now
+                InvalidateTextures(e.dest.base, destBytes, 766);  // other textures over this memory are stale now
                 e.valid = keep;
                 if (const uint8_t* gp = mem.HostPtr(e.dest.base, destBytes)) SnapSample(gp, destBytes, e.samples);
             } else {
                 e.valid = false;
+                e.invSite = 770;
             }
         }
     }
@@ -784,7 +787,7 @@ struct VulkanRenderer::Impl {
     void FinishGeneric(const PendingGeneric& j, const uint8_t* rb) {
         const ResolveDest& d = j.d;
         if (ResolveRaw(d, j.fmt, j.isDepth, j.x0, j.y0, j.w, j.h, rb, j.destBytes)) {
-            InvalidateTextures(d.base, j.destBytes);
+            InvalidateTextures(d.base, j.destBytes, 787);
             return;
         }
         const uint32_t w = j.w, h = j.h, bpp = j.bpp;
@@ -824,14 +827,14 @@ struct VulkanRenderer::Impl {
             for (uint32_t i = 0; i + 4 <= j.destBytes; i += 4)
                 mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
         }
-        InvalidateTextures(d.base, j.destBytes);
+        InvalidateTextures(d.base, j.destBytes, 827);
     }
 
     // View of a still valid snapshot that matches this texture fetch, or null.
     VkImageView SnapView(const TextureFetch& t) {
         auto it = snaps.find(t.base & 0x1FFFFFFFu);
         if (it == snaps.end()) return VK_NULL_HANDLE;
-        if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, 0, 0, 0); return VK_NULL_HANDLE; }
+        if (!it->second.valid) { SnapLog("fetch", "snapshot invalid", t.base & 0x1FFFFFFFu, t.format, t.width, t.height, it->second.invBase, it->second.invSize, it->second.invSite); return VK_NULL_HANDLE; }
         Snap& e = it->second;
         const bool fmtOk = SnapClass(t.format) && SnapClass(t.format) == SnapClass(e.dest.format);
         auto rej = [&](const char* why) { SnapLog("fetch", why, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, e.w, e.h, t.pitch); return VK_NULL_HANDLE; };
@@ -847,7 +850,7 @@ struct VulkanRenderer::Impl {
         // is enough (the CPU writes textures between frames, as for ordinary textures).
         if (e.checkedGen != generation || e.checkedVer != e.version) {
             uint32_t cur[64];
-            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
+            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; e.invSite = 850; return rej("samples changed"); }
             e.checkedGen = generation;
             e.checkedVer = e.version;
         }
@@ -2869,7 +2872,7 @@ struct VulkanRenderer::Impl {
                     Barrier();
                     pendingGen.push_back({d, src->image.format, isDepth, srcFormat, uint32_t(x0), uint32_t(y0), w, h, destBytes, bpp, pendingGenBytes});
                     pendingGenBytes += need;
-                    InvalidateTextures(d.base, destBytes);  // anything sampled from this memory is stale until the flush
+                    InvalidateTextures(d.base, destBytes, 2872);  // anything sampled from this memory is stale until the flush
                     goto clears;
                 }
                 VkDeviceSize bytes = VkDeviceSize(w) * h * bpp;
@@ -2894,7 +2897,7 @@ struct VulkanRenderer::Impl {
                 const uint8_t* rb = static_cast<const uint8_t*>(readback.map);
                 uint32_t destBytes = ResolveDestByteSize(d);
                 if (!DumpFrame() && ResolveRaw(d, src->image.format, isDepth, uint32_t(x0), uint32_t(y0), w, h, rb, destBytes)) {
-                    InvalidateTextures(d.base, destBytes);
+                    InvalidateTextures(d.base, destBytes, 2900);
                     goto clears;
                 }
                 {
@@ -2937,7 +2940,7 @@ struct VulkanRenderer::Impl {
                     for (uint32_t i = 0; i + 4 <= destBytes; i += 4)
                         mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
                 }
-                InvalidateTextures(d.base, destBytes);
+                InvalidateTextures(d.base, destBytes, 2940);
                 WatchBytes("after resolve", d.base, destBytes, dst ? "(direct write)" : "(dword write path)");
                 static int logged = 0;
                 if (logged++ < std::max(16, opt.traceDraws * 4) || DumpFrame())
