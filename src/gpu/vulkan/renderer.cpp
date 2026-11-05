@@ -1888,11 +1888,18 @@ struct VulkanRenderer::Impl {
                 const uint64_t lo = t.base & 0x1FFFFFFFu, hi = lo + size;
                 for (const PendingGeneric& g : pendingGen) {
                     const uint64_t glo = g.d.base & 0x1FFFFFFFu;
-                    if (glo < hi && lo < glo + g.destBytes)
+                    if (glo < hi && lo < glo + g.destBytes) {
+                        prof::Add(prof::kFtGen, 1);
+                        if (ResTrace()) std::fprintf(stderr, "[restrace] f%llu flushtex by generic %08x (fetch %08x fmt %u)\n", (unsigned long long)frame, uint32_t(glo), uint32_t(lo), t.format);
                         SnapLog("flushtex", "g", uint32_t(lo), t.format, t.width, uint32_t(glo), g.d.format, uint32_t(g.fmt), uint32_t(int32_t(g.d.expBias)));
+                    }
                 }
                 for (uint32_t k : pendingKeys) {
                     const Snap& e = snaps[k];
+                    if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) {
+                        prof::Add(prof::kFtSnap, 1);
+                        if (ResTrace()) std::fprintf(stderr, "[restrace] f%llu flushtex by snapshot %08x (fetch %08x fmt %u)\n", (unsigned long long)frame, e.base, uint32_t(lo), t.format);
+                    }
                     if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size)
                         SnapLog("flushtex", "s", uint32_t(lo), t.format, t.width, e.base, e.dest.format, uint32_t(e.img.format), uint32_t(int32_t(t.expAdjust)));
                 }
