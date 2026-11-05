@@ -574,6 +574,7 @@ struct VulkanRenderer::Impl {
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+        prof::Scope pi_(prof::kInval);
         texEpoch++;
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
@@ -3071,7 +3072,12 @@ struct VulkanRenderer::Impl {
                     const uint32_t destBytes = ResolveDestByteSize(d);
                     const uint32_t key = d.base & 0x1FFFFFFFu;
                     curResolveSrcRt = srcFormat;
-                    if (mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h)) {
+                    bool stored;
+                    {
+                        prof::Scope pss_(prof::kRsSnap);
+                        stored = mem.HostPtrWrite(d.base, destBytes) && SnapStore(src, d, destBytes, key, w, h);
+                    }
+                    if (stored) {
                         if (!lazyWriteback) FlushPending();  // eager: write guest memory right away
                         goto clears;
                     }
