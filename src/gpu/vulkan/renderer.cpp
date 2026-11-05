@@ -3840,43 +3840,60 @@ struct VulkanRenderer::Impl {
         uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
+        auto xf = [&](uint32_t v) {
+            if (convert) {
+                if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
+                    v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
+                        (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
+                } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
+                    v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
+                        (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
+                }
+            }
+            if (d.swapRB) {
+                if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+            }
+            switch (x8) {
+                case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+                case 3: v = __builtin_bswap32(v); break;
+                case 2: v = (v << 16) | (v >> 16); break;
+                default: break;
+            }
+            return v;
+        };
+        // In the Xenos tiling, 4 horizontally adjacent 4-byte blocks (2 for 8-byte blocks) starting at a
+        // multiple of the run length are contiguous in memory, so one tiled offset serves the whole run.
+        const uint32_t run = bpp == 4 ? 4 : bpp == 8 ? 2 : 1;
         rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
         for (uint32_t y = ya; y < yb; y++) {
             const uint32_t ty = dy + y;
             if (ty >= height) break;
             const uint8_t* row = rb + size_t(y) * w * bpp;
-            for (uint32_t x = 0; x < w; x++) {
+            for (uint32_t x = 0; x < w;) {
                 const uint32_t tx = dx + x;
                 if (tx >= pitch) break;
                 const uint32_t off = TiledBlockOffset(tx, ty, pitch, bpp);
-                if (off + bpp > destBytes) continue;
+                uint32_t n = 1;
+                if (run > 1 && !(tx & (run - 1)) && x + run <= w && tx + run <= pitch) n = run;
+                if (off + n * bpp > destBytes) {
+                    if (n == 1) { x++; continue; }
+                    n = 1;  // let the single-pixel path check each pixel
+                    if (off + bpp > destBytes) { x++; continue; }
+                }
                 if (bpp == 4) {
-                    uint32_t v;
-                    std::memcpy(&v, row + x * 4, 4);
-                    if (convert) {
-                        if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
-                            v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
-                                (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
-                        } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
-                            v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
-                                (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
-                        }
+                    for (uint32_t k = 0; k < n; k++) {
+                        uint32_t v;
+                        std::memcpy(&v, row + (x + k) * 4, 4);
+                        v = xf(v);
+                        std::memcpy(dst + off + k * 4, &v, 4);
                     }
-                    if (d.swapRB) {
-                        if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
-                        else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
-                    }
-                    switch (x8) {
-                        case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
-                        case 3: v = __builtin_bswap32(v); break;
-                        case 2: v = (v << 16) | (v >> 16); break;
-                        default: break;
-                    }
-                    std::memcpy(dst + off, &v, 4);
                 } else {
                     const uint8_t* p = row + size_t(x) * bpp;
-                    for (uint32_t k = 0; k < bpp; k++) dst[(off + k) ^ x8] = p[k];
+                    if (!x8) std::memcpy(dst + off, p, size_t(n) * bpp);
+                    else for (uint32_t k = 0; k < n * bpp; k++) dst[(off + k) ^ x8] = p[k];
                 }
+                x += n;
             }
         }
         });
