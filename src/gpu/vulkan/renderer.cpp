@@ -560,11 +560,17 @@ struct VulkanRenderer::Impl {
         static const bool on = [] { const char* e = std::getenv("FA_RESTRACE"); return e && e[0] == '1'; }();
         return on && frame % 300 == 7;
     }
+    // Bumped by anything that can change what a texture fetch resolves to (new frame, a resolve or snapshot write,
+    // a texture or snapshot invalidation). Draws repeating the previous lookup of a slot within one epoch reuse it.
+    uint64_t texEpoch = 1;
+    struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; };
+    SlotMemo slotMemo[32];
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+        texEpoch++;
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
             if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
@@ -623,6 +629,7 @@ struct VulkanRenderer::Impl {
         return true;
     }
     void ReleaseSnapImage(Snap& e) {
+        texEpoch++;
         for (auto& [k, v] : e.views) garbageViews.push_back(v);
         e.views.clear();
         for (auto& [k, c] : e.crops) {
@@ -2221,8 +2228,21 @@ struct VulkanRenderer::Impl {
                 VkSampler smp;
                 VkImageView view;
                 {
-                    prof::Scope pg_(prof::kDtGet);
-                    view = GetTexture(regs, s, cube, smp);
+                    static const bool noMemo = [] { const char* e = std::getenv("FA_TEX_MEMO"); return e && e[0] == '0'; }();
+                    SlotMemo& m = slotMemo[s];
+                    const uint32_t* fc = &regs.r[pm4::kFetchConstBase + s * 6];
+                    if (!noMemo && m.epoch == texEpoch && m.cube == cube && !std::memcmp(m.d, fc, sizeof m.d)) {
+                        view = m.view;
+                        smp = m.smp;
+                    } else {
+                        prof::Scope pg_(prof::kDtGet);
+                        view = GetTexture(regs, s, cube, smp);
+                        m.epoch = texEpoch;
+                        m.cube = cube;
+                        std::memcpy(m.d, fc, sizeof m.d);
+                        m.view = view;
+                        m.smp = smp;
+                    }
                 }
                 ii[nw] = {smp, view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -3223,6 +3243,7 @@ struct VulkanRenderer::Impl {
             if (nowMs - pipeCacheDirtyAt > 30000) SavePipelineCache();
         }
         generation++;
+        texEpoch++;
         if (prof::g_enabled) {
             const char* h = std::getenv("HOME");
             struct stat st;
