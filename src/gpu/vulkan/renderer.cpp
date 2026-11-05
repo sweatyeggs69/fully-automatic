@@ -1884,6 +1884,19 @@ struct VulkanRenderer::Impl {
         tex.guestBase = t.base;
         tex.guestSize = size;
         if (HasPending() && PendingOverlaps(t.base, size)) {
+            {   // FA_SNAPLOG: which fetch forced the writeback, and of what (g = generic resolve, s = snapshot)
+                const uint64_t lo = t.base & 0x1FFFFFFFu, hi = lo + size;
+                for (const PendingGeneric& g : pendingGen) {
+                    const uint64_t glo = g.d.base & 0x1FFFFFFFu;
+                    if (glo < hi && lo < glo + g.destBytes)
+                        SnapLog("flushtex", "g", uint32_t(lo), t.format, t.width, uint32_t(glo), g.d.format, uint32_t(g.fmt), uint32_t(int32_t(g.d.expBias)));
+                }
+                for (uint32_t k : pendingKeys) {
+                    const Snap& e = snaps[k];
+                    if (uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size)
+                        SnapLog("flushtex", "s", uint32_t(lo), t.format, t.width, e.base, e.dest.format, uint32_t(e.img.format), uint32_t(int32_t(t.expAdjust)));
+                }
+            }
             prof::Scope pf_(prof::kDtFlush);
             FlushPending(prof::kFlushTex);
         }
