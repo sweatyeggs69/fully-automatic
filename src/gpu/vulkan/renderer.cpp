@@ -1490,6 +1490,7 @@ struct VulkanRenderer::Impl {
         vbExt.clear();
         unbCache.clear();
         lastConstsOff = ~0ull;
+        cblkHave = 0;
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
         for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
@@ -2948,7 +2949,13 @@ struct VulkanRenderer::Impl {
         const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
         // Compared against the ring copy itself (host cached), so no second copy is kept.
         const uint8_t* lastRing = lastConstsOff != ~0ull ? static_cast<const uint8_t*>(ring.map) + lastConstsOff : nullptr;
-        if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
+        if (ConstBlocksOn()) {
+            // Shaders read constants by block through sys.cblk; binding 0 stays bound but unused.
+            constsOff = 0;
+            blkVsN = vsN;
+            blkPsN = psN;
+            UploadConstBlocks(regs);
+        } else if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
             !std::memcmp(lastRing, consts, vsN * 16) &&
             !std::memcmp(lastRing + 4096, consts + 1024, psN * 16)) {
             constsOff = lastConstsOff;
@@ -2963,11 +2970,13 @@ struct VulkanRenderer::Impl {
             lastConstsOff = constsOff;
         }
         VkDeviceSize boolOff = RingAlloc(160, uboAlign, flushed);
-        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
+        if (flushed && ConstBlocksOn()) { cblkHave = 0; UploadConstBlocks(regs); }
+        else if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
         std::memcpy(sys.texXf, texXf, sizeof texXf);
+        std::memcpy(sys.cblk, cblk, sizeof cblk);
         const uint32_t vte = regs[xe::PA_CL_VTE_CNTL];
         const float vs_[3] = {xe::AsFloat(regs[xe::PA_CL_VPORT_XSCALE]), xe::AsFloat(regs[xe::PA_CL_VPORT_YSCALE]),
                               xe::AsFloat(regs[xe::PA_CL_VPORT_ZSCALE])};
@@ -3130,6 +3139,7 @@ struct VulkanRenderer::Impl {
         sub.emplace(prof::kUpIdx);
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
+        std::memcpy(sys.cblk, cblk, sizeof cblk);
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
         const VkDeviceSize idxBytes = fi.mode == 3 ? 0 : fi.mode == 1 ? VkDeviceSize(nIdx) * 2 : VkDeviceSize(nIdx) * 4;
         VkDeviceSize idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
@@ -3138,6 +3148,7 @@ struct VulkanRenderer::Impl {
             RecoverConsts(consts, constsOff, boolOff, regs, uboAlign);
             ReuploadVbs(sys, vs, regs);
             sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
+            std::memcpy(sys.cblk, cblk, sizeof cblk);
             std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
             idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         }
@@ -3510,13 +3521,46 @@ struct VulkanRenderer::Impl {
                      sys.flags[1], sys.flags[2]);
     }
 
+    // Float constants by block (see ConstBlocksOn): the blocks the two shaders can read are uploaded
+    // when they were written since their last upload in this batch, or have no copy in it yet.
+    // cblk[b] is the vec4 index of block b's latest ring copy.
+    uint32_t cblk[32] = {};
+    uint32_t cblkHave = 0;  // blocks with a copy in the current batch's ring
+    uint32_t blkVsN = 256, blkPsN = 256;
+    void UploadConstBlocks(const RegisterFile& regs) {
+        const uint32_t vsB = (blkVsN + 15) / 16, psB = (blkPsN + 15) / 16;
+        const uint32_t used = (vsB >= 16 ? 0xFFFFu : (1u << vsB) - 1) | ((psB >= 16 ? 0xFFFFu : (1u << psB) - 1) << 16);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            uint32_t need = used & (~cblkHave | regs.aluDirty);
+            bool flushed = false;
+            while (need) {
+                const uint32_t b = uint32_t(__builtin_ctz(need));
+                need &= need - 1;
+                VkDeviceSize at = RingAlloc(256, 16, flushed);
+                if (flushed) break;
+                std::memcpy(static_cast<uint8_t*>(ring.map) + at, &regs.r[pm4::kAluConstBase + b * 64], 256);
+                cblk[b] = uint32_t(at / 16);
+                cblkHave |= 1u << b;
+                regs.aluDirty &= ~(1u << b);
+                prof::Add(prof::kConstBlocks, 1);
+            }
+            if (!flushed) return;
+            cblkHave = 0;  // the ring was reset: every block needs a new copy
+        }
+    }
     void RecoverConsts(const uint32_t* consts, VkDeviceSize& constsOff, VkDeviceSize& boolOff, const RegisterFile& regs,
                        VkDeviceSize uboAlign) {
         bool f;
-        constsOff = RingAlloc(8192, uboAlign, f);
-        std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
-        lastVsN = lastPsN = 256;
-        lastConstsOff = constsOff;
+        if (ConstBlocksOn()) {
+            constsOff = 0;
+            cblkHave = 0;
+            UploadConstBlocks(regs);
+        } else {
+            constsOff = RingAlloc(8192, uboAlign, f);
+            std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
+            lastVsN = lastPsN = 256;
+            lastConstsOff = constsOff;
+        }
         boolOff = RingAlloc(160, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
     }

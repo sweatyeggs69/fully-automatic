@@ -50,7 +50,7 @@ int main() {
         TranslatedShader t = TranslateShader(ShaderStage::Pixel, ps.data(), ps.size());
         CHECK(Compile(t, "color ps"));
         CHECK(t.colorWritten == 1);
-        CHECK(t.glsl.find("xe_c.c[256]") != std::string::npos);  // pixel constants start at 256
+        CHECK(t.glsl.find(ConstBlocksOn() ? "xe_cv(256)" : "xe_c.c[256]") != std::string::npos);  // pixel constants start at 256
     }
     {
         auto ps = TexturePS();

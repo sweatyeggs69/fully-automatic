@@ -14,6 +14,7 @@
 //   set 1 binding N / 32+N / 64+N  texture fetch slot N as sampler2D / samplerCube / sampler3D
 //   VS -> PS: 16 vec4 interpolators at locations 0..15. PS writes oC0..3 at locations 0..3.
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -67,7 +68,15 @@ struct XeSystemConstants {
     uint32_t vf[96][4];    // vertex fetch slot: x = word offset in XeVertexWords, y = endian, z = size words
     float texXf[32][4];    // texture slot conversion: x = mode (0 none, 1 scale + clamp, 2 float bits as unorm32),
                            // y = scale, z = clamp low, w = mask of result components to convert
+    uint32_t cblk[32];     // float constant block b (c[16b..16b+15]) starts at vec4 index cblk[b] of the ring
 };
-static_assert(sizeof(XeSystemConstants) == 96 + 96 * 16 + 32 * 16, "std140 layout");
+static_assert(sizeof(XeSystemConstants) == 96 + 96 * 16 + 32 * 16 + 128, "std140 layout");
+
+// Float constants are read through per-block ring offsets (XeSystem.cblk) unless FA_CONST_BLOCKS=0,
+// so a draw uploads only the 256-byte blocks written since the last upload.
+inline bool ConstBlocksOn() {
+    static const bool on = [] { const char* e = std::getenv("FA_CONST_BLOCKS"); return !(e && e[0] == '0'); }();
+    return on;
+}
 
 }  // namespace fa::gpu

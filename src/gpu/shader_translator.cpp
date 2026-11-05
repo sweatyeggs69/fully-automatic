@@ -110,9 +110,11 @@ private:
     std::string ConstRef(uint32_t idx, bool addressed, bool a0rel) const {
         int base = Ps() ? 256 : 0;
         constMax_ = std::max<uint32_t>(constMax_, addressed ? 256u : idx + 1);
-        if (!addressed) return "xe_c.c[" + Num(base + int(idx)) + "]";
-        return "xe_c.c[clamp(" + Num(base + int(idx)) + " + " + (a0rel ? "a0" : "aL") + ", " + Num(base) + ", " +
-               Num(base + 255) + ")]";
+        const char* open = ConstBlocksOn() ? "xe_cv(" : "xe_c.c[";
+        const char* close = ConstBlocksOn() ? ")" : "]";
+        if (!addressed) return open + Num(base + int(idx)) + close;
+        return std::string(open) + "clamp(" + Num(base + int(idx)) + " + " + (a0rel ? "a0" : "aL") + ", " + Num(base) + ", " +
+               Num(base + 255) + ")" + close;
     }
 
     struct Alu {
@@ -647,9 +649,11 @@ layout(std140, set = 0, binding = 0) uniform XeConsts { vec4 c[512]; } xe_c;
 layout(std140, set = 0, binding = 1) uniform XeBoolLoop { uvec4 b[2]; uvec4 l[8]; } xe_bl;
 layout(std140, set = 0, binding = 2) uniform XeSystem {
   vec4 ndc_scale; vec4 ndc_offset; vec4 vport_scale; vec4 vport_offset;
-  uvec4 flags; vec4 misc; uvec4 vf[96]; vec4 texxf[32];
+  uvec4 flags; vec4 misc; uvec4 vf[96]; vec4 texxf[32]; uvec4 cblk[8];
 } xe_s;
 layout(std430, set = 0, binding = 3) readonly buffer XeVertexWords { uint w[]; } xe_vb;
+layout(std430, set = 0, binding = 3) readonly buffer XeRingVec4 { vec4 v[]; } xe_rv;
+vec4 xe_cv(int i) { return xe_rv.v[xe_s.cblk[i >> 6][(i >> 4) & 3] + uint(i & 15)]; }
 layout(std430, set = 0, binding = 4) readonly buffer XeGuestWords { uint w[]; } xe_gm;
 
 vec4 r[64];
