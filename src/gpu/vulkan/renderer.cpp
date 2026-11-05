@@ -436,7 +436,13 @@ struct VulkanRenderer::Impl {
 
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkQueryPool tsPool = VK_NULL_HANDLE;  // timestamps per batch: GPU execution time and per-pass attribution (FA_PROFILE)
-    static constexpr uint32_t kTsMax = 1024;
+    // FA_DRAWTS=1 (with FA_PROFILE): a timestamp after every draw, labelled by pixel shader hash, to find the
+    // shaders that dominate GPU time (timestamps themselves add overhead; compare shaders, not totals).
+    static bool DrawTsOn() {
+        static const bool on = [] { const char* e = std::getenv("FA_DRAWTS"); return e && e[0] == '1'; }();
+        return on;
+    }
+    const uint32_t kTsMax = DrawTsOn() ? 16384 : 1024;
     uint32_t tsCount = 0;
     std::vector<std::string> tsLabels;  // label of the interval that ends at timestamp i (i >= 1)
     struct PassStat { double us = 0; uint32_t n = 0; };
@@ -2432,6 +2438,11 @@ struct VulkanRenderer::Impl {
                           xe::AsFloat(regs[xe::PA_SU_POLY_OFFSET_FRONT_SCALE]));
         vkCmdBindIndexBuffer(cmd, ring.buf, idxOff, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, uint32_t(hd.indices.size()), 1, 0, 0, 0);
+        if (tsPool && DrawTsOn()) {
+            char lb[40];
+            std::snprintf(lb, sizeof lb, "D ps %016llx", (unsigned long long)dc.psHash);
+            MarkTs(lb);
+        }
         stats.draws++;
         drawInFrame++;
 
@@ -3111,7 +3122,8 @@ struct VulkanRenderer::Impl {
             nullPsNow = h && ::stat((std::string(h) + "/.cache/fullauto/null_ps").c_str(), &st) == 0;
         }
         if (tsPool && frame % 300 == 0 && !passStats.empty()) {
-            std::vector<std::pair<std::string, PassStat>> v(passStats.begin(), passStats.end());
+            std::vector<std::pair<std::string, PassStat>> v;
+            for (auto& kv : passStats) if (kv.first[0] != 'D') v.push_back(kv);
             std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
             std::string line = "[gpupass] ms/frame (count/frame):";
             char b[160];
@@ -3120,6 +3132,18 @@ struct VulkanRenderer::Impl {
                 line += b;
             }
             std::fprintf(stderr, "%s\n", line.c_str());
+            if (DrawTsOn()) {
+                std::vector<std::pair<std::string, PassStat>> dv;
+                double tot = 0;
+                for (auto& kv : passStats) if (kv.first[0] == 'D') { dv.push_back(kv); tot += kv.second.us; }
+                std::sort(dv.begin(), dv.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+                std::string l3 = "[gpudraw] total " + std::to_string(tot / 300000.0) + " ms/frame; top pixel shaders ms/frame (draws/frame):";
+                for (size_t i = 0; i < dv.size() && i < 12; i++) {
+                    std::snprintf(b, sizeof b, " | %s %.2f (%.1f)", dv[i].first.c_str() + 5, dv[i].second.us / 300000.0, dv[i].second.n / 300.0);
+                    l3 += b;
+                }
+                std::fprintf(stderr, "%s\n", l3.c_str());
+            }
             std::vector<std::pair<std::string, uint32_t>> er(endReasons.begin(), endReasons.end());
             std::sort(er.begin(), er.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
             std::string l2 = "[gpupass] pass ends per frame:";
