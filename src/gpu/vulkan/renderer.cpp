@@ -533,17 +533,11 @@ struct VulkanRenderer::Impl {
             std::fprintf(stderr, "[snaplog] %s %s base %08x: %u %u %u %u %u %u\n", kind, why, base, a, b, c, d, e, f);
         }
     }
-    // Per-slot memo of the last GetTexture result: same fetch constant, same frame, and no snapshot or resolve
-    // invalidation since (texEpoch) means the same view, so the hashing and map lookups can be skipped.
-    struct TexMemo { uint32_t d[6]; bool cube; uint64_t gen, epoch; VkImageView view; VkSampler smp; };
-    TexMemo texMemo[32] = {};
-    uint64_t texEpoch = 1;
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
     void InvalidateTextures(uint32_t base, uint32_t size) {
-        texEpoch++;
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
             if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) e.valid = false;
@@ -610,7 +604,6 @@ struct VulkanRenderer::Impl {
         if (e.img.img) garbageImages.push_back(e.img);
         e.img = Image{};
         e.valid = false;
-        texEpoch++;
     }
     // Lazy writeback: snapshotted resolves do not read their pixels back right away. The snapshot
     // images hold the data and the guest memory is written in one batch (one GPU wait) when something
@@ -752,7 +745,7 @@ struct VulkanRenderer::Impl {
         // is enough (the CPU writes textures between frames, as for ordinary textures).
         if (e.checkedGen != generation || e.checkedVer != e.version) {
             uint32_t cur[64];
-            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; texEpoch++; return rej("samples changed"); }
+            if (!SnapSample(src, e.size, cur) || std::memcmp(cur, e.samples, sizeof cur)) { e.valid = false; return rej("samples changed"); }
             e.checkedGen = generation;
             e.checkedVer = e.version;
         }
@@ -1566,29 +1559,6 @@ struct VulkanRenderer::Impl {
 
     // Returns the image view for texture fetch slot `slot` (uploading it if its bytes changed).
     VkImageView GetTexture(const RegisterFile& regs, uint32_t slot, bool cube, VkSampler& sampler) {
-        if (slot >= 32) return GetTextureSlow(regs, slot, cube, sampler);
-        uint32_t fc[6];
-        for (int k = 0; k < 6; k++) fc[k] = regs[pm4::kFetchConstBase + slot * 6 + k];
-        TexMemo& m = texMemo[slot];
-        if (m.view && m.gen == generation && m.epoch == texEpoch && m.cube == cube && !std::memcmp(m.d, fc, sizeof fc)) {
-            sampler = m.smp;
-            return m.view;
-        }
-        const uint64_t epochBefore = texEpoch;
-        VkImageView v = GetTextureSlow(regs, slot, cube, sampler);
-        // Fallbacks (dummy textures) are logged by the slow path and never memoised; neither is a result that an
-        // invalidation raced with while it was produced.
-        if (v && v != dummy2D.view && v != dummyCube.view && texEpoch == epochBefore) {
-            std::memcpy(m.d, fc, sizeof fc);
-            m.cube = cube;
-            m.gen = generation;
-            m.epoch = texEpoch;
-            m.view = v;
-            m.smp = sampler;
-        }
-        return v;
-    }
-    VkImageView GetTextureSlow(const RegisterFile& regs, uint32_t slot, bool cube, VkSampler& sampler) {
         uint32_t d[6];
         for (int k = 0; k < 6; k++) d[k] = regs[pm4::kFetchConstBase + slot * 6 + k];
         TextureFetch t = ParseTextureFetch(d);
