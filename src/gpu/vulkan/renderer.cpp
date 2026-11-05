@@ -555,6 +555,11 @@ struct VulkanRenderer::Impl {
             std::fprintf(stderr, "[snaplog] %s %s base %08x: %u %u %u %u %u %u\n", kind, why, base, a, b, c, d, e, f);
         }
     }
+    // FA_RESTRACE=1: every resolve and every texture fetch that lands on a snapshot, in order, for one frame in 300.
+    bool ResTrace() const {
+        static const bool on = [] { const char* e = std::getenv("FA_RESTRACE"); return e && e[0] == '1'; }();
+        return on && frame % 300 == 7;
+    }
     uint64_t generation = 1;  // bumped once per frame: textures are rechecked against guest memory
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
@@ -1791,7 +1796,15 @@ struct VulkanRenderer::Impl {
         }
         if (snapEnabled && !cube && !snaps.empty()) {
             prof::Scope pn_(prof::kDtSnap);
-            if (VkImageView sv = SnapView(t)) return sv;
+            VkImageView sv = SnapView(t);
+            if (ResTrace()) {
+                auto sit = snaps.find(t.base & 0x1FFFFFFFu);
+                if (sit != snaps.end())
+                    std::fprintf(stderr, "[restrace] f%llu fetch slot %u base %08x fmt %u %ux%u exp %d -> %s (snap %ux%u fmt %u valid %d)\n",
+                                 (unsigned long long)frame, slot, t.base & 0x1FFFFFFFu, t.format, t.width, t.height, int(t.expAdjust),
+                                 sv ? "SNAPSHOT" : "miss", sit->second.w, sit->second.h, sit->second.dest.format, int(sit->second.valid));
+            }
+            if (sv) return sv;
         }
         uint64_t key = HashBytes(d, 6 * sizeof(uint32_t));  // bytes of the whole fetch constant (HashBytes counts bytes): format, base, size, swizzle, mip range and address
         key ^= uint64_t(t.dimension) << 62;
@@ -2831,6 +2844,11 @@ struct VulkanRenderer::Impl {
             if (!d.height) d.height = uint32_t(y1);
             if (!d.pitch) d.pitch = uint32_t(x1);
             if (d.format == xe::kTex8_A || d.format == xe::kTex8_B) d.format = xe::kTex8;
+            if (ResTrace()) {
+                std::fprintf(stderr, "[restrace] f%llu resolve dest %08x fmt %u %ux%u (dest pitch %u height %u) rect x0 %d y0 %d bytes %u bias %d endian %u src vkfmt %d depth %d\n",
+                             (unsigned long long)frame, d.base & 0x1FFFFFFFu, d.format, w, h, d.pitch, d.height, int(x0), int(y0),
+                             ResolveDestByteSize(d), int(d.expBias), d.endian, int(src->image.format), int(isDepth));
+            }
             if (!ResolveFormatSupported(d.format)) {
                 static int warned = 0;
                 if (warned++ < 10) std::fprintf(stderr, "[render] resolve to unsupported format %u\n", d.format);
