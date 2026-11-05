@@ -975,6 +975,8 @@ struct VulkanRenderer::Impl {
 
     // Per-batch upload dedup.
     std::unordered_map<uint64_t, VkDeviceSize> vbCache;
+    struct VbExt { VkDeviceSize at; uint32_t words; };
+    std::unordered_map<uint32_t, VbExt> vbExt;  // largest copy per guest address in this batch: smaller draws of the same pool reuse it
     // Fetches whose extent cannot be bounded copy from their address to the end of the fetch constant's range.
     // Meshes of one vertex pool start at different offsets but end at the same place, so one copy per range end
     // (from the lowest start seen so far) serves all of them.
@@ -1309,6 +1311,7 @@ struct VulkanRenderer::Impl {
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
         ringPos = 0;
         vbCache.clear();
+        vbExt.clear();
         unbCache.clear();
         lastConstsOff = ~0ull;
         for (auto& im : garbageImages) DestroyImage(im);
@@ -2451,8 +2454,12 @@ struct VulkanRenderer::Impl {
             uint64_t key = (uint64_t(vf.address) << 32) ^ words;
             auto it = vbCache.find(key);
             VkDeviceSize at;
+            auto xit = vbExt.find(vf.address);
             if (it != vbCache.end()) {
                 at = it->second;
+            } else if (xit != vbExt.end() && xit->second.words >= words) {
+                at = xit->second.at;
+                vbCache[key] = at;
             } else {
                 const uint8_t* src = mem.HostPtr(vf.address, words * 4);
                 if (!src) continue;
@@ -2462,6 +2469,7 @@ struct VulkanRenderer::Impl {
                 prof::Add(prof::kVbBytes, uint64_t(words) * 4);
                 if (!vs->info.vfetchStride[s]) prof::Add(prof::kVbUnbounded, uint64_t(words) * 4);  // whole-buffer copies
                 vbCache[key] = at;
+                if (xit == vbExt.end() || xit->second.words < words) vbExt[vf.address] = {at, words};
             }
             sys.vf[s][0] = uint32_t(at / 4);
             sys.vf[s][1] = vf.endian;
@@ -2859,6 +2867,7 @@ struct VulkanRenderer::Impl {
             std::memcpy(static_cast<uint8_t*>(ring.map) + at, src, sys.vf[s][2] * 4);
             sys.vf[s][0] = uint32_t(at / 4);
             vbCache[(uint64_t(vf.address) << 32) ^ sys.vf[s][2]] = at;
+            { auto& e = vbExt[vf.address]; if (e.words < sys.vf[s][2]) e = {at, sys.vf[s][2]}; }
         }
     }
 
