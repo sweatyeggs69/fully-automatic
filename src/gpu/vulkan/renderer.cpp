@@ -1161,12 +1161,39 @@ struct VulkanRenderer::Impl {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
     }
+    // Render targets live in GENERAL layout everywhere else. With FA_RT_LAYOUT=1 they are moved to the
+    // attachment-optimal layouts for the duration of a pass (and back at its end) so the driver may use
+    // its compressed (HTILE/DCC) paths for the pass.
+    struct AttachImg { VkImage img; VkImageAspectFlags aspect; };
+    AttachImg attachImgs[5];
+    uint32_t attachCount = 0;
+    void LayoutBarrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {aspect, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &b);
+    }
+    static bool RtLayoutOn() {
+        static const bool on = [] { const char* e = std::getenv("FA_RT_LAYOUT"); return e && e[0] == '1'; }();
+        return on;
+    }
     std::map<std::string, uint32_t> endReasons;
     void EndRendering(const char* why = "other") {
         if (!renderingActive) return;
         if (tsPool) endReasons[curPassLabel + " <- " + why]++;
         vkCmdEndRendering(cmd);
         renderingActive = false;
+        for (uint32_t i = 0; i < attachCount; i++)
+            LayoutBarrier(attachImgs[i].img, attachImgs[i].aspect,
+                          (attachImgs[i].aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                          VK_IMAGE_LAYOUT_GENERAL);
+        attachCount = 0;
         curPipeline = VK_NULL_HANDLE;
         Barrier();
         MarkTs(curPassLabel);
@@ -1623,17 +1650,31 @@ struct VulkanRenderer::Impl {
     }
 
     void BeginRendering(RenderTarget* const color[4], RenderTarget* depth, VkRect2D area) {
+        const bool lay = RtLayoutOn();
+        attachCount = 0;
+        if (lay) {
+            for (int i = 0; i < 4; i++)
+                if (color[i]) {
+                    LayoutBarrier(color[i]->image.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                    attachImgs[attachCount++] = {color[i]->image.img, VK_IMAGE_ASPECT_COLOR_BIT};
+                }
+            if (depth) {
+                const VkImageAspectFlags da_ = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                LayoutBarrier(depth->image.img, da_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                attachImgs[attachCount++] = {depth->image.img, da_};
+            }
+        }
         VkRenderingAttachmentInfo ca[4] = {};
         for (int i = 0; i < 4; i++) {
             ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
             ca[i].imageView = color[i] ? color[i]->image.view : VK_NULL_HANDLE;
-            ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ca[i].imageLayout = lay ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         da.imageView = depth ? depth->image.view : VK_NULL_HANDLE;
-        da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        da.imageLayout = lay ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
         da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
