@@ -893,10 +893,14 @@ void Translator::Run() {
     } else {
         g += "  for (int i = 0; i < 4; i++) xe_oc[i] = vec4(0.0);\n";
         for (int i = 0; i < 16; i++) g += "  if (" + Num(i) + "u < xe_s.flags.w) r[" + Num(i) + "] = xe_interp" + Num(i) + ";\n";
+        // Statically indexed writes only: one dynamic r[xe_s.flags.z] write would force the whole r[64] array
+        // into driver scratch memory for every pixel shader.
         g += R"(  if (xe_s.flags.z < 64u) {
     vec2 fc = floor(gl_FragCoord.xy);
-    r[xe_s.flags.z] = vec4(gl_FrontFacing ? fc.x : -fc.x, fc.y, 0.0, 0.0);
-  }
+    vec4 xe_pc = vec4(gl_FrontFacing ? fc.x : -fc.x, fc.y, 0.0, 0.0);
+)";
+        for (int i = 0; i < 64; i++) g += "    if (xe_s.flags.z == " + Num(i) + "u) r[" + Num(i) + "] = xe_pc;\n";
+        g += R"(  }
   xe_body();
   if (xe_killed) discard;
   uint af = xe_s.flags.y;
