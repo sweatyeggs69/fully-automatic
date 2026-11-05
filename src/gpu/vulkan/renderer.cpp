@@ -606,6 +606,7 @@ struct VulkanRenderer::Impl {
         bool valid = false;
         uint32_t invBase = 0, invSize = 0, invSite = 0;  // what last invalidated it (FA_SNAPLOG)
         uint32_t base = 0, size = 0, pitch = 0, endian = 0, w = 0, h = 0;
+        uint32_t filled = 0;  // rows from the top written by resolves so far (h once complete; tiled frames arrive in parts)
         bool swapRB = false;
         bool pending = false;       // guest memory not written yet (see FlushPending)
         ResolveDest dest{};         // how to write it when it is
@@ -669,20 +670,66 @@ struct VulkanRenderer::Impl {
     }
     // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
     bool SnapStore(RenderTarget* src, const ResolveDest& d, uint32_t destBytes, uint32_t key, uint32_t w, uint32_t h) {
-        Snap& e = snaps[key];
         const VkFormat fmt = src->image.format;
+        const uint32_t pitchAl = (std::max(d.pitch, 32u) + 31) & ~31u;
+        // Tiled frames (predicated tiling): the game resolves one surface in parts, each to a base further into the
+        // same destination (here 256 rows = 0x140000 bytes apart). A part landing inside a snapshot's range at the
+        // next unfilled row is copied into that snapshot instead of replacing or invalidating it.
+        if (!snaps.count(key) || !snaps[key].valid) {
+            static const bool noTiles = [] { const char* e = std::getenv("FA_SNAP_TILES"); return e && e[0] == '0'; }();
+            for (auto& [pk, P] : snaps) {
+                if (noTiles) break;
+                if (pk == key || !P.valid || !P.img.img || P.filled >= P.h) continue;
+                if (P.pitch != pitchAl || P.w != w || P.img.format != fmt || P.endian != d.endian || P.swapRB != d.swapRB) continue;
+                if (SnapClass(P.dest.format) != SnapClass(d.format) || key <= P.base || uint64_t(key) + destBytes > uint64_t(P.base) + P.size) continue;
+                const uint32_t rowBytes = P.pitch * 4;
+                if ((key - P.base) % (rowBytes * 32u) != 0) continue;
+                const uint32_t ry = (key - P.base) / rowBytes;
+                if (ry != P.filled || ry + h > P.img.h) continue;
+                if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
+                for (uint32_t k : pendingKeys) {
+                    const Snap& o = snaps[k];
+                    if (k != pk && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
+                }
+                if (!P.valid) break;
+                const bool keep = P.valid;
+                InvalidateTextures(key, destBytes, 689);
+                P.valid = keep;
+                Barrier();
+                VkImageCopy ic{};
+                ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                ic.dstOffset = {0, int32_t(ry), 0};
+                ic.extent = {w, h, 1};
+                vkCmdCopyImage(cmd, src->image.img, VK_IMAGE_LAYOUT_GENERAL, P.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                Barrier();
+                if (!P.pending) {
+                    P.pending = true;
+                    pendingKeys.push_back(pk);
+                }
+                pendingBytes += uint64_t(w) * h * 4;
+                P.filled = ry + h;
+                P.version++;
+                if (pendingBytes > (96u << 20)) FlushPending(prof::kFlushCap);
+                return true;
+            }
+        }
+        Snap& e = snaps[key];
+        // A resolve of the first part of a taller destination allocates the whole surface.
+        uint32_t H = h;
+        if (d.height > h && d.height <= 2048 && w == d.pitch && uint64_t(pitchAl) * 4 * ((d.height + 31) & ~31u) == destBytes) H = d.height;
         // A pending surface of another base overlapping this one is written first (order matters).
         if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
         for (uint32_t k : pendingKeys) {
             const Snap& o = snaps[k];
             if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
         }
-        if (e.img.img && (e.img.w != w || e.img.h != h || e.img.format != fmt)) {
+        if (e.img.img && (e.img.w != w || e.img.h != H || e.img.format != fmt)) {
             if (e.pending) FlushPending(prof::kFlushOverlap);
             ReleaseSnapImage(e);
         }
         if (!e.img.img) {
-            if (!CreateImage(e.img, fmt, w, h, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            if (!CreateImage(e.img, fmt, w, H, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false, VK_IMAGE_ASPECT_COLOR_BIT)) {
                 ReleaseSnapImage(e);
                 return false;
@@ -711,7 +758,8 @@ struct VulkanRenderer::Impl {
         e.endian = d.endian;
         e.swapRB = d.swapRB;
         e.w = w;
-        e.h = h;
+        e.h = H;
+        e.filled = h;
         e.dest = d;
         std::memcpy(e.samples, samples, sizeof samples);
         e.version++;
@@ -729,7 +777,7 @@ struct VulkanRenderer::Impl {
         std::vector<VkDeviceSize> offs;
         for (uint32_t k : keys) {
             offs.push_back(total);
-            total += (VkDeviceSize(snaps[k].w) * snaps[k].h * 4 + 15) & ~VkDeviceSize(15);
+            total += (VkDeviceSize(snaps[k].w) * snaps[k].filled * 4 + 15) & ~VkDeviceSize(15);
         }
         EndRendering("flushpending");
         if (pendingGenBytes + total > readback.size) {
@@ -751,7 +799,7 @@ struct VulkanRenderer::Impl {
             VkBufferImageCopy bic{};
             bic.bufferOffset = snapBase + offs[i];
             bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            bic.imageExtent = {e.w, e.h, 1};
+            bic.imageExtent = {e.w, e.filled, 1};
             vkCmdCopyImageToBuffer(cmd, e.img.img, VK_IMAGE_LAYOUT_GENERAL, readback.buf, 1, &bic);
         }
         Barrier();
@@ -768,7 +816,7 @@ struct VulkanRenderer::Impl {
             e.pending = false;
             if (!e.valid) continue;  // overwritten since: nothing to write
             const uint32_t destBytes = ResolveDestByteSize(e.dest);
-            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.h, rb + snapBase + offs[i], destBytes)) {
+            if (ResolveRaw(e.dest, e.img.format, false, 0, 0, e.w, e.filled, rb + snapBase + offs[i], destBytes)) {
                 const bool keep = e.valid;
                 InvalidateTextures(e.dest.base, destBytes, 766);  // other textures over this memory are stale now
                 e.valid = keep;
@@ -846,6 +894,7 @@ struct VulkanRenderer::Impl {
         if (!t.tiled || t.dimension != 1 || !fmtOk) return rej("tile/dim/fmt");
         if (t.endian != e.endian || t.expAdjust != 0) return rej("endian/exp");
         // The resolve rectangle is rounded up to 8 texels; the texture may be a little smaller.
+        if (t.height > e.filled) return rej("incomplete");
         if (t.width > e.w || t.height > e.h || e.w - t.width >= 32 || e.h - t.height >= 32) return rej("size");
         for (int c = 0; c < 4; c++) if (t.sign[c]) return rej("sign");
         if (((std::max(t.pitch ? t.pitch : t.width, 32u) + 31) & ~31u) != e.pitch) return rej("pitch");
