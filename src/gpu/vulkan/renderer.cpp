@@ -1883,7 +1883,12 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
-        if (HasPending() && PendingOverlaps(t.base, size)) FlushPending(prof::kFlushTex);
+        if (HasPending() && PendingOverlaps(t.base, size)) {
+            prof::Scope pf_(prof::kDtFlush);
+            FlushPending(prof::kFlushTex);
+        }
+        std::optional<prof::Scope> pp_;
+        pp_.emplace(prof::kDtPtr);
         const uint8_t* src = mem.HostPtr(t.base, size);
         std::vector<uint8_t> padded;
         if (!src) {
@@ -1919,6 +1924,7 @@ struct VulkanRenderer::Impl {
         // Mip levels 1.. live at the mip address. They are optional: when that memory is not
         // readable the texture is uploaded with its base level only.
         const uint8_t* mipSrc = mipBytes ? mem.HostPtr(t.mipBase, mipBytes) : nullptr;
+        pp_.reset();
         auto sampled = [&]() {
             uint64_t sh = SampleHash(src, size);
             if (mipSrc) sh = sh * 0x9E3779B97F4A7C15ull + SampleHash(mipSrc, mipBytes) + 1;
