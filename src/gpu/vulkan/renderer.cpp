@@ -588,7 +588,7 @@ struct VulkanRenderer::Impl {
             case 1: case 2: return src == VK_FORMAT_R8G8B8A8_UNORM || src == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             case 3: return src == VK_FORMAT_R32_SFLOAT;
             case 4: return src == VK_FORMAT_R16G16_SFLOAT;
-            case 5: return src == VK_FORMAT_R16G16_SNORM;  // 16_16 (unsigned in memory, fetched back with the opposite exponent)
+            case 5: { static const bool off = [] { const char* e = std::getenv("FA_SNAP_1616"); return e && e[0] == '0'; }(); return !off && src == VK_FORMAT_R16G16_SNORM; }  // 16_16 (unsigned in memory, fetched back with the opposite exponent)
         }
         return false;
     }
