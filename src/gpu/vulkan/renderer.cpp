@@ -3232,7 +3232,10 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
-        FlushPending(prof::kFlushSwap);
+        // FA_SWAP_FLUSH=0 (with FA_SYNC_FLUSH=0): resolves stay on the GPU across frames and are written to guest
+        // memory only when something needs the bytes (texture miss, overlapping resolve, buffer cap).
+        static const bool swapFlush = [] { const char* e = std::getenv("FA_SWAP_FLUSH"); return !(e && e[0] == '0'); }();
+        if (swapFlush) FlushPending(prof::kFlushSwap);
         {
             prof::Scope ps_(prof::kOtherWait);
             SubmitAndWait();
