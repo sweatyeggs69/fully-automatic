@@ -34,6 +34,8 @@ PPC_FUNC_IMPL(__imp__sub_82147370);
 PPC_FUNC_IMPL(__imp__sub_823162F8);
 PPC_FUNC_IMPL(__imp__sub_82147160);
 PPC_FUNC_IMPL(__imp__sub_82142490);
+PPC_FUNC_IMPL(__imp__sub_82146F60);
+PPC_FUNC_IMPL(__imp__sub_82147020);
 
 namespace {
 // FA_TAP=1 turns on the observe-only taps and parity report. FA_DIRECT is a bit mask of hooked families
@@ -1118,6 +1120,48 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
     return true;
 }
 
+// ---- FA_DIRECT bit 8 (256), stage C3: the game's dirty-state flush (82148508) emits no state ----------------
+// Its three stream writers (82146F60 render-state windows, 82147020 fetch constants, 82147160 vec4 constants) are
+// skipped while the flush runs outside a resolve, so the CP no longer sees constants, fetch constants or render state
+// (64% of command bytes, and game-thread time). Every direct draw and resolve already takes them from records. What
+// the CP still draws or resolves itself (inline-index draws, draws without a record or chain, resolves without a
+// complete record) gets the record image overlaid on its registers instead of the CP's now stale ones.
+thread_local int t_flush_depth = 0, t_resolve_depth = 0;
+inline bool c3_skip() { return (g_direct & 256) && t_flush_depth > 0 && t_resolve_depth == 0; }
+uint64_t g_c3_skipped = 0, g_c3_draws = 0, g_c3_resolves = 0;  // skipped writer calls (game thread), CP fallbacks
+
+void overlay_image(fa::gpu::RegisterFile& rf, std::initializer_list<uint32_t> keep_cp, const fa::gpu::RegisterFile& regs) {
+    std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
+    std::memcpy(rf.r.data() + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
+    for (uint32_t reg : kCpRegs) rf[reg] = regs[reg];
+    for (uint32_t reg : keep_cp) rf[reg] = regs[reg];
+    rf.aluDirty = ~0u;
+    rf.tileRows = regs.tileRows;
+}
+
+bool direct_draw_c3(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    if (direct_draw_queue(dc, regs, backend)) return true;
+    if (!(g_direct & 256) || !g_cur_init) return false;
+    static fa::gpu::RegisterFile rf;
+    rf = regs;
+    overlay_image(rf, {}, regs);
+    backend.Draw(dc, rf);
+    g_c3_draws++;
+    return true;
+}
+
+bool direct_resolve_c3(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    if (direct_resolve_queue(dc, regs, backend)) return true;
+    if (!(g_direct & 256) || !g_cur_init) return false;
+    // The resolve's own output (copy setup, RB_MODECONTROL, the rectangle's fetch constant) still reaches the CP.
+    static fa::gpu::RegisterFile rf;
+    rf = regs;
+    overlay_image(rf, {0x2208, 0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801}, regs);
+    backend.Resolve(rf);
+    g_c3_resolves++;
+    return true;
+}
+
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
     cp_parity(regs);
     exact_compare(dc.packetAddr, regs, &dc);
@@ -1281,7 +1325,9 @@ void apply_pending_locked(const uint8_t* base);
 PPC_FUNC(sub_82142490) {
     const uint32_t dev = ctx.r3.u32;
     const uint32_t before = (g_direct & 8) ? __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev)) : 0;
+    t_resolve_depth++;
     __imp__sub_82142490(ctx, base);
+    t_resolve_depth--;
     if (g_direct & 8) {
         const uint32_t after = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev));
         push_resolve_record(base, before, after);
@@ -1327,7 +1373,19 @@ PPC_FUNC(sub_82148508) {
         apply_pending_locked(base);
         g_flushes++;
     }
+    t_flush_depth++;
     __imp__sub_82148508(ctx, base);
+    t_flush_depth--;
+}
+
+// Stage C3 writers: skipped inside the flush (see c3_skip).
+PPC_FUNC(sub_82146F60) {
+    if (c3_skip()) { g_c3_skipped++; return; }
+    __imp__sub_82146F60(ctx, base);
+}
+PPC_FUNC(sub_82147020) {
+    if (c3_skip()) { g_c3_skipped++; return; }
+    __imp__sub_82147020(ctx, base);
 }
 
 // Vec4 range writer (82147160): r4 dirty bits (MSB first, 4 vec4 per bit), r5 first register, r6 shadow pointer.
@@ -1342,6 +1400,7 @@ PPC_FUNC(sub_82147160) {
             for (uint32_t i = 0; i < 16; i++) g_mirror[k * 16 + i] = __builtin_bswap32(shadow[k * 16 + i]);
         }
     }
+    if (c3_skip()) { g_c3_skipped++; return; }
     __imp__sub_82147160(ctx, base);
 }
 
@@ -1387,8 +1446,8 @@ void direct_tap_frame_end() {
     if (!g_on) return;
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
     if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
-    if ((g_direct & 8) && !fa::gpu::g_direct_resolve) fa::gpu::g_direct_resolve = direct_resolve_queue;
-    if ((g_direct & 8) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw_queue;
+    if ((g_direct & 8) && !fa::gpu::g_direct_resolve) fa::gpu::g_direct_resolve = direct_resolve_c3;
+    if ((g_direct & 8) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw_c3;
     else if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
     {
@@ -1423,6 +1482,9 @@ void direct_tap_frame_end() {
             std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
                          (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
+        if (g_direct & 256)
+            std::fprintf(stderr, "[direct] stage C3: flush writer calls skipped %llu | CP draws from the image %llu, CP resolves from the image %llu\n",
+                         (unsigned long long)g_c3_skipped, (unsigned long long)g_c3_draws, (unsigned long long)g_c3_resolves);
         std::fprintf(stderr, "[direct] stage B replays: draws kept %llu (packets %zu, chains %zu, %zu words), draws without a record with a chain %llu (replay runs %llu, rebuilds %llu), without %llu, drawn from the replay %llu\n",
                      (unsigned long long)g_rpl_stored, g_replay.size(), g_chains.size(), g_chain_words, (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
                      (unsigned long long)g_rpl_rebuilds, (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
