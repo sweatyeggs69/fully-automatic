@@ -55,6 +55,7 @@ public:
     void Sync() override;
     bool WriteWhenDone(uint32_t addr, uint32_t value) override;
     void Idle() override;
+    void Drain() override;
     bool DrawDirect(const DirectDraw& draw, const uint8_t* payload) override;
     // Register state the direct records have built up (tests, diagnostics).
     const RegisterFile& DirectRegisters() const;

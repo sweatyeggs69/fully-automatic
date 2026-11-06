@@ -52,14 +52,17 @@ public:
     void Touch(uint32_t phys, uint32_t size);
     // Once per frame, before lookups: collects the pages written since the last call.
     void Harvest();
-    // Clean's kernel query normally skips a view in 2 MB regions where Harvest never saw that view
-    // write (most memory is only ever written through one of the three views). The cost: the very
-    // first write to a region through a new view is seen at the next Harvest instead of right away.
-    // true asks every view every time.
+    // Clean's kernel query (writes since the last Harvest) is only made for ranges with a page that
+    // Harvest saw written in the last kHotHarvests harvests, and only through views Harvest saw
+    // writing in that 2 MB region. Memory the game rewrites keeps being asked about; memory that has
+    // been quiet (most textures) is not. The cost: the first write after a quiet spell, or through a
+    // new view, is seen at the next Harvest instead of right away. true asks every view every time.
     void SetQueryAllViews(bool all) { queryAllViews_ = all; }
+    // Skipping the query for quiet memory is opt-in until checked in game (run 119 showed broken textures).
+    void SetSkipCold(bool skip) { skipCold_ = skip; }
 
     struct Stats {
-        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0, querySkips = 0;
+        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0, querySkips = 0, queryCold = 0;
         double ms = 0, queryMs = 0;
     };
     // Since the last call.
@@ -83,7 +86,11 @@ private:
     mutable Stats stats_;
     static constexpr uint32_t kRegionShift = 9;  // 512 pages = 2 MB
     std::vector<std::vector<uint8_t>> viewSeen_;  // per view, per region: Harvest saw a write through it
+    static constexpr uint32_t kHotHarvests = 120;  // about 4 s at 30 fps
+    std::vector<uint32_t> seenAt_;                 // per page: harvest number that last saw it written (0 = never)
+    uint32_t harvestNo_ = 0;
     bool queryAllViews_ = false;
+    bool skipCold_ = false;
 };
 
 }  // namespace fa::mem

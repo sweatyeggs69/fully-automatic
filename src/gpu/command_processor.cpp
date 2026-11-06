@@ -262,6 +262,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
 
         case pm4::kInterrupt:
             backend_.Sync();
+            backend_.Drain();  // the handler reads fences and scratch registers written before this packet
             if (interrupt_) interrupt_(n ? d[0] : 0);
             break;
 

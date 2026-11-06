@@ -580,13 +580,20 @@ struct VulkanRenderer::Impl {
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
-    void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+    // `snapsToo` false: a write landing late (frames in flight, from a finished batch) that was recorded before
+    // the snapshots resolved since; those already invalidated what was older when they were stored, and are newer
+    // than this write, so they stay valid (and pending) and land over it at their own flush. Their guest memory
+    // samples are taken again: this write is ours, not the CPU's, and must not read as "samples changed".
+    void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0, bool snapsToo = true) {
         prof::Scope pi_(prof::kInval);
         texEpoch++;
         WwTouch(base, size);  // the host writes this memory now or at the next flush
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
-        for (auto& [k, e] : snaps)
-            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
+        for (auto& [k, e] : snaps) {
+            if (!e.valid || uint64_t(e.base) >= hi || lo >= uint64_t(e.base) + e.size) continue;
+            if (snapsToo) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; continue; }
+            if (const uint8_t* gp = mem.HostPtr(e.base, e.size)) SnapSample(gp, e.size, e.samples);
+        }
         for (auto& [k, t] : textures) {
             const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
             if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
@@ -696,6 +703,28 @@ struct VulkanRenderer::Impl {
         return false;
     }
     // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
+    // A pending snapshot of another base overlapping a new resolve to [key, key + bytes) must reach guest
+    // memory first, since the new one lands over it. One that the new resolve covers completely would only
+    // be overwritten: it can be dropped instead, which saves the GPU wait of a flush.
+    // `whole`: the new resolve writes all of [key, key + bytes) (not the first part of a taller surface).
+    // Opt-in (FA_SNAP_DROP=1) until checked in game: run 119 showed broken textures with it on.
+    void DropOrFlushOverlaps(uint32_t key, uint32_t bytes, uint32_t self, bool whole) {
+        static const bool drop = [] { const char* e = std::getenv("FA_SNAP_DROP"); return e && e[0] == '1'; }();
+        const bool noDrop = !drop || !whole;
+        const uint64_t lo = key, hi = uint64_t(key) + bytes;
+        for (size_t i = 0; i < pendingKeys.size();) {
+            const uint32_t k = pendingKeys[i];
+            Snap& o = snaps[k];
+            const uint64_t olo = o.base, ohi = uint64_t(o.base) + o.size;
+            if (k == self || olo >= hi || lo >= ohi) { i++; continue; }
+            if (noDrop || olo < lo || ohi > hi) { FlushPending(prof::kFlushOverlap); return; }
+            o.pending = false;
+            pendingBytes -= std::min<uint64_t>(pendingBytes, uint64_t(o.w) * o.filled * 4);
+            pendingKeys.erase(pendingKeys.begin() + i);
+            prof::Add(prof::kSnapDropped, 1);
+        }
+    }
+
     bool SnapStore(RenderTarget* src, const ResolveDest& d, uint32_t destBytes, uint32_t key, uint32_t w, uint32_t h) {
         const VkFormat fmt = src->image.format;
         const uint32_t pitchAl = (std::max(d.pitch, 32u) + 31) & ~31u;
@@ -714,10 +743,7 @@ struct VulkanRenderer::Impl {
                 const uint32_t ry = (key - P.base) / rowBytes;
                 if (ry != P.filled || ry + h > P.img.h) continue;
                 if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-                for (uint32_t k : pendingKeys) {
-                    const Snap& o = snaps[k];
-                    if (k != pk && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
-                }
+                DropOrFlushOverlaps(key, destBytes, pk, false);  // a part of P: not a whole destination
                 if (!P.valid) break;
                 const bool keep = P.valid;
                 InvalidateTextures(key, destBytes, 689);
@@ -747,10 +773,7 @@ struct VulkanRenderer::Impl {
         if (d.height > h && d.height <= 2048 && w == d.pitch && uint64_t(pitchAl) * 4 * ((d.height + 31) & ~31u) == destBytes) H = d.height;
         // A pending surface of another base overlapping this one is written first (order matters).
         if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-        for (uint32_t k : pendingKeys) {
-            const Snap& o = snaps[k];
-            if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
-        }
+        DropOrFlushOverlaps(key, destBytes, key, h >= d.height && w >= d.pitch);
         if (e.img.img && (e.img.w != w || e.img.h != H || e.img.format != fmt)) {
             if (e.pending) FlushPending(prof::kFlushOverlap);
             ReleaseSnapImage(e);
@@ -875,7 +898,8 @@ struct VulkanRenderer::Impl {
     // still take the waiting path.
     void FlushPendingAsync() {
         if (!HasPending()) return;
-        if (kBatches == 1 || !pendingGen.empty()) { FlushPending(prof::kFlushSwap); return; }
+        static const bool syncGen = [] { const char* e = std::getenv("FA_ASYNC_GEN"); return e && e[0] == '0'; }();
+        if (kBatches == 1 || (syncGen && !pendingGen.empty())) { FlushPending(prof::kFlushSwap); return; }
         prof::Add(prof::kFlushSwap, 1);
         std::vector<uint32_t> keys;
         keys.swap(pendingKeys);
@@ -890,13 +914,22 @@ struct VulkanRenderer::Impl {
             jobs.push_back({k, e.dest, e.img.format, e.srcRt, e.w, e.filled, e.version, total});
             total += (VkDeviceSize(e.w) * e.filled * 4 + 15) & ~VkDeviceSize(15);
         }
-        if (jobs.empty()) return;
+        // Generic resolves: their pixels are already being copied into the shared readback buffer in command
+        // order; the batch copies them on into its own buffer, so later resolves can reuse readback.
+        std::vector<PendingGeneric> gens;
+        gens.swap(pendingGen);
+        const VkDeviceSize genOff = total, genBytes = pendingGenBytes;
+        pendingGenBytes = 0;
+        total += genBytes;
+        if (jobs.empty() && gens.empty()) return;
         EndRendering("flushasync");
         if (wbBuf.size < total) {  // this batch's own buffer: not in use by the GPU
             DestroyBuffer(wbBuf);
             if (!CreateBuffer(wbBuf, std::max<VkDeviceSize>(total, 16u << 20), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) {
                 wbBuf = Buffer{};
                 for (const Job& j : jobs) { snaps[j.key].pending = true; pendingKeys.push_back(j.key); }
+                pendingGen.swap(gens);
+                pendingGenBytes = genBytes;
                 FlushPending(prof::kFlushSwap);
                 return;
             }
@@ -912,10 +945,26 @@ struct VulkanRenderer::Impl {
             const uint64_t lo = j.dest.base & 0x1FFFFFFFu;
             wbRanges.push_back({lo, lo + ResolveDestByteSize(j.dest)});
         }
+        if (genBytes) {
+            VkBufferCopy bc{0, genOff, genBytes};
+            vkCmdCopyBuffer(cmd, readback.buf, wbBuf.buf, 1, &bc);
+            for (const PendingGeneric& g : gens) {
+                const uint64_t lo = g.d.base & 0x1FFFFFFFu;
+                wbRanges.push_back({lo, lo + g.destBytes});
+            }
+        }
         Barrier();
         const uint8_t* rb = static_cast<const uint8_t*>(wbBuf.map);
-        doneActions.push_back([this, jobs = std::move(jobs), rb] {
+        doneActions.push_back([this, jobs = std::move(jobs), gens = std::move(gens), genOff, rb] {
             prof::Scope pc_(prof::kResolveCpu);
+            if (!gens.empty()) {
+                // In the order the waiting flush uses: generic resolves first, then the snapshots.
+                prof::Scope pg_(prof::kRcGen);
+                for (const PendingGeneric& g : gens) {
+                    prof::Add(prof::kWbGenKB, g.destBytes / 1024);
+                    FinishGeneric(g, rb + genOff + g.off, true);
+                }
+            }
             for (const Job& j : jobs) {
                 const uint32_t destBytes = ResolveDestByteSize(j.dest);
                 prof::Add(prof::kWbSnapKB, destBytes / 1024);
@@ -929,10 +978,10 @@ struct VulkanRenderer::Impl {
                     wrote = ResolveRaw(j.dest, j.fmt, false, 0, 0, j.w, j.filled, rb + j.off, destBytes);
                 }
                 if (wrote) {
-                    InvalidateTextures(j.dest.base, destBytes, 766);
+                    InvalidateTextures(j.dest.base, destBytes, 766, false);
                 } else if (SnapClass(j.dest.format) == 5) {
                     PendingGeneric g{j.dest, j.fmt, false, j.srcRt, 0, 0, j.w, j.filled, destBytes, VkFormatBytes(j.fmt), 0};
-                    FinishGeneric(g, rb + j.off);
+                    FinishGeneric(g, rb + j.off, true);
                     wrote = true;
                 }
                 if (!e) continue;
@@ -958,10 +1007,10 @@ struct VulkanRenderer::Impl {
         const uint8_t* rbase = static_cast<const uint8_t*>(readback.map);
         for (const PendingGeneric& j : jobs) FinishGeneric(j, rbase + j.off);
     }
-    void FinishGeneric(const PendingGeneric& j, const uint8_t* rb) {
+    void FinishGeneric(const PendingGeneric& j, const uint8_t* rb, bool late = false) {
         const ResolveDest& d = j.d;
         if (ResolveRaw(d, j.fmt, j.isDepth, j.x0, j.y0, j.w, j.h, rb, j.destBytes)) {
-            InvalidateTextures(d.base, j.destBytes, 787);
+            InvalidateTextures(d.base, j.destBytes, 787, !late);
             return;
         }
         const uint32_t w = j.w, h = j.h, bpp = j.bpp;
@@ -1001,7 +1050,7 @@ struct VulkanRenderer::Impl {
             for (uint32_t i = 0; i + 4 <= j.destBytes; i += 4)
                 mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
         }
-        InvalidateTextures(d.base, j.destBytes, 827);
+        InvalidateTextures(d.base, j.destBytes, 827, !late);
     }
 
     // View of a still valid snapshot that matches this texture fetch, or null.
@@ -1891,6 +1940,8 @@ struct VulkanRenderer::Impl {
         if (!ww.Init(views, mem.PhysicalSize(), &why)) { std::fprintf(stderr, "[writewatch] off: %s\n", why); return; }
         // FA_WW_ALLVIEWS=1: a texture check asks the kernel about every view, not only the views seen writing there.
         { const char* av = std::getenv("FA_WW_ALLVIEWS"); ww.SetQueryAllViews(av && av[0] == '1'); }
+        // FA_WW_COLD=1: no kernel query for memory not written in the last 120 frames (opt-in, see run 119).
+        { const char* wc = std::getenv("FA_WW_COLD"); ww.SetSkipCold(wc && wc[0] == '1'); }
         stats.writeWatch = 1;
         std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
     }
@@ -1919,6 +1970,7 @@ struct VulkanRenderer::Impl {
         prof::Add(prof::kWwQueries, st.queryCalls);
         prof::Add(prof::kWwQueryUs, uint64_t(st.queryMs * 1000.0));
         prof::Add(prof::kWwQuerySkips, st.querySkips);
+        prof::Add(prof::kWwQueryCold, st.queryCold);
     }
 
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
@@ -3908,7 +3960,11 @@ struct VulkanRenderer::Impl {
         if (!addr || !bytes || (bytes & 3) || bytes > 0x40000) return nullptr;
         DirectShader& e = directShaders[(uint64_t(addr) << 32) ^ (uint64_t(bytes) << 1) ^ type];
         const uint32_t n = bytes / 4;
-        if (e.ucode.size() == n && (e.frame == frame || (e.wwToken && WwClean(addr, bytes, e.wwToken)))) return &e;
+        if (e.ucode.size() == n && e.frame == frame) return &e;
+        if (e.ucode.size() == n && e.wwToken && WwClean(addr, bytes, e.wwToken)) {
+            e.frame = frame;  // checked once per frame, not on every draw
+            return &e;
+        }
         if (!mem.HostPtr(addr, bytes)) return nullptr;
         e.wwToken = WwWatch(addr, bytes);  // before reading: a write during the read makes it stale
         e.ucode.resize(n);
@@ -4366,8 +4422,21 @@ struct VulkanRenderer::Impl {
                          (unsigned long long)(total >> 20));
     }
 
-    void Swap() {
+    // fbBase/fbBytes: the front buffer the presenter reads from guest memory right after this returns.
+    void Swap(uint32_t fbBase = 0, uint32_t fbBytes = 0) {
         if (kBatches > 1) {
+            // The window shows the front buffer decoded from guest memory as soon as this returns, so its
+            // writeback cannot land later: memory the frame reused for other resolves (written by an earlier
+            // flush) would show instead (runs 130, 131, 133: garbage, the top tile black).
+            if (fbBytes && PendingOverlaps(fbBase, fbBytes)) {
+                prof::Add(prof::kFlushFront, 1);
+                FlushPending(prof::kFlushSwap);
+            }
+            if (fbBytes && InFlightWrites(fbBase, fbBytes)) {
+                prof::Add(prof::kFlushFront, 1);
+                prof::Scope pw_(prof::kResolveWait);
+                WaitIdle();
+            }
             FlushPendingAsync();
             prof::Scope ps_(prof::kOtherWait);
             Submit();
@@ -4498,7 +4567,13 @@ void VulkanRenderer::Resolve(const RegisterFile& regs) {
 }
 
 void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const RegisterFile& regs) {
-    if (p_->ready && !p_->broken) p_->Swap();
+    if (p_->ready && !p_->broken) {
+        // The front buffer the presenter reads (VdSwap put its fetch constant in slot 0).
+        uint32_t base = addr ? addr : (regs[pm4::kFetchConstBase + 1] & 0xFFFFF000u);
+        uint32_t w = width ? width : 1280, h = height ? height : 720;
+        const uint32_t bytes = ((w + 31) & ~31u) * ((h + 31) & ~31u) * 4;
+        p_->Swap(base & 0x1FFFFFFFu, base ? bytes : 0);
+    }
     if (p_->next) p_->next->Swap(addr, width, height, regs);
 }
 
@@ -4530,6 +4605,19 @@ void VulkanRenderer::Idle() {
         p_->RetireFinished();
     }
     if (p_->next) p_->next->Idle();
+}
+
+void VulkanRenderer::Drain() {
+    if (p_->ready && !p_->broken && Impl::kBatches > 1) {
+        bool pending = !p_->doneActions.empty();
+        for (const auto& b : p_->batches) pending |= b.inFlight && !b.done.empty();
+        if (pending) {
+            prof::Add(prof::kDrainWaits, 1);
+            p_->SubmitAndWait();  // retiring the batches applies their writes, in order
+            p_->Begin();
+        }
+    }
+    if (p_->next) p_->next->Drain();
 }
 
 void VulkanRenderer::Flush() {

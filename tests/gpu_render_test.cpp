@@ -101,7 +101,8 @@ static void Pixel(const FakeMem& mem, uint32_t base, uint32_t pitch, uint32_t he
 
 int main() {
     FakeMem mem;
-    setenv("FA_WW", "2", 0);  // write tracking without pinned memory (no udmabuf here)
+    setenv("FA_WW", "2", 0);
+    setenv("FA_SNAP_DROP", "1", 0);  // opt-in snapshot drop, covered by the resolve sections  // write tracking without pinned memory (no udmabuf here)
     VulkanRenderer r(mem, nullptr);
     VulkanRenderer::Options opt;
     opt.validation = std::getenv("FA_VK_VALIDATION") != nullptr;
@@ -351,6 +352,32 @@ int main() {
         std::printf("  fence written after %d idle polls, swap writeback (60,60) = %02x %02x %02x %02x\n", polls, p[0], p[1], p[2], p[3]);
     }
 
+    // An interrupt after a fence: the handler sees the fence in memory (with frames in flight the
+    // fence is deferred, so the command processor drains the backend before the handler runs).
+    {
+        const uint32_t fenceAddr = 0x284000;
+        mem.Write32(fenceAddr, 0);
+        uint32_t seen = 0;
+        int calls = 0;
+        cp.SetInterruptHandler([&](uint32_t) { seen = mem.Read32(fenceAddr); calls++; });
+        Stream q{mem, ring, ringBytes / 4, cp.ReadPtr()};
+        q.shader(0, xasm::ColorVS());
+        q.shader(1, xasm::ColorPS());
+        q.vfetch0(vb, 21);
+        q.draw(xe::kPrimTriangleList, 3);
+        q.put(T3(pm4::kEventWriteShd, 3));
+        q.put(0);
+        q.put(fenceAddr);
+        q.put(0x5678);
+        q.put(T3(pm4::kInterrupt, 1));
+        q.put(1);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        CHECK(calls == 1 && seen == 0x5678);
+        std::printf("  interrupt handler saw fence %08x\n", seen);
+        cp.SetInterruptHandler(nullptr);
+    }
+
     // Tile replay: a frame drawn in two 32-row tiles (predicated tiling, window offset per tile),
     // each resolved to its band of a 128x64 destination. With tile once (the default) the second frame
     // draws the first tile at full height and skips the second; the destination must match.
@@ -536,6 +563,100 @@ int main() {
             const bool ok = px[0] == want[i][0] && px[1] == want[i][1] && px[2] == want[i][2];
             if (!ok) std::printf("FAIL direct (%u,%u) = %02x %02x %02x %02x\n", pts[i][0], pts[i][1], px[0], px[1], px[2], px[3]);
             CHECK(ok);
+        }
+        // Two resolves in one frame where the second covers the first completely: the first is dropped
+        // (never written), and the memory must end up with the second one. Resolve 1 copies the scene's top
+        // 32 rows to the destination's bottom half and clears to white; resolve 2 copies the white surface.
+        {
+            const uint32_t destE = 0x3C0000;
+            rc[xe::RB_COLOR_CLEAR] = rc[xe::RB_COLOR_CLEAR_LO] = 0xFFFFFFFFu;
+            rc[xe::RB_COPY_CONTROL] = 1u << 8;  // copy, then clear colour
+            rc[xe::RB_COPY_DEST_BASE] = destE + 32 * 128 * 4;
+            rc[xe::RB_COPY_DEST_PITCH] = (32u << 16) | 128;
+            r.Resolve(rc);
+            rc[xe::RB_COPY_CONTROL] = 0;
+            rc[xe::RB_COPY_DEST_BASE] = destE;
+            rc[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rc);
+            r.Flush();
+            for (uint32_t y : {4u, 40u}) {
+                Pixel(mem, destE, 128, 64, 4, y, px);
+                const bool ok = px[0] == 255 && px[1] == 255 && px[2] == 255;
+                if (!ok) std::printf("FAIL covered resolve (4,%u) = %02x %02x %02x %02x\n", y, px[0], px[1], px[2], px[3]);
+                CHECK(ok);
+            }
+        }
+        // A generic resolve (offset rectangle, not a snapshot) written back by the swap: with frames in
+        // flight its pixels go through the batch's own buffer and land when the batch finished.
+        {
+            const uint32_t destG = 0x3E0000, halfRect = 0x109000;
+            const float hr[6] = {64, 0, 128, 0, 128, 64};
+            for (int i = 0; i < 6; i++) mem.Write32(halfRect + i * 4, F(hr[i]));
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destG + i * 4, 0);
+            RegisterFile rg = rc;
+            rg[pm4::kFetchConstBase] = halfRect | 3;
+            rg[xe::RB_COPY_CONTROL] = 0;
+            rg[xe::RB_COPY_DEST_BASE] = destG;
+            rg[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            const uint64_t res0 = st.resolves;
+            r.Resolve(rg);
+            r.Swap(0, 0, 0, rg);
+            r.Flush();
+            CHECK(st.resolves == res0 + 1);
+            Pixel(mem, destG, 128, 64, 100, 4, px);
+            const bool white = px[0] == 255 && px[1] == 255 && px[2] == 255;
+            Pixel(mem, destG, 128, 64, 4, 4, px);
+            const bool untouched = !px[0] && !px[1] && !px[2] && !px[3];
+            if (!white || !untouched) std::printf("FAIL generic resolve: copied part white %d, left part untouched %d\n", white, untouched);
+            CHECK(white && untouched);
+        }
+        // Frames in flight: last frame's generic resolve lands while this frame already resolved the same
+        // memory again (a snapshot). The late write must not invalidate the newer snapshot (it was skipped and
+        // never written back: runs 130 and 131 showed garbage everywhere), so the memory ends up red.
+        {
+            const uint32_t destH = 0x3A0000, scratch = 0x380000, halfRect = 0x109000;
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destH + i * 4, 0);
+            RegisterFile rg = rc;
+            rg[pm4::kFetchConstBase] = halfRect | 3;
+            rg[xe::RB_COPY_CONTROL] = 0;
+            rg[xe::RB_COPY_DEST_BASE] = destH;
+            rg[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rg);  // generic: the white right half
+            r.Swap(0, 0, 0, rg);
+            RegisterFile rs = rc;
+            rs[xe::RB_COLOR_CLEAR] = rs[xe::RB_COLOR_CLEAR_LO] = 0xFF0000FFu;  // red
+            rs[xe::RB_COPY_CONTROL] = 1u << 8;  // copy, then clear
+            rs[xe::RB_COPY_DEST_BASE] = scratch;
+            rs[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rs);
+            rs[xe::RB_COPY_CONTROL] = 0;
+            rs[xe::RB_COPY_DEST_BASE] = destH;
+            r.Resolve(rs);  // snapshot: all red
+            r.Flush();
+            for (uint32_t x : {4u, 100u}) {
+                Pixel(mem, destH, 128, 64, x, 4, px);
+                const bool red = px[0] == 255 && px[1] == 0 && px[2] == 0;
+                if (!red) std::printf("FAIL late generic write (%u,4) = %02x %02x %02x %02x\n", x, px[0], px[1], px[2], px[3]);
+                CHECK(red);
+            }
+        }
+        // The presenter decodes the front buffer from guest memory right after Swap returns: with frames in
+        // flight its writeback must not wait for the batch to finish (runs 130, 131, 133 showed whatever the
+        // frame had resolved there before).
+        {
+            const uint32_t destF = 0x360000;
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destF + i * 4, 0);
+            RegisterFile rs = rc;
+            rs[xe::RB_COPY_CONTROL] = 0;
+            rs[xe::RB_COPY_DEST_BASE] = destF;
+            rs[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rs);  // EDRAM is still red from the section above
+            r.Swap(destF, 128, 64, rs);
+            Pixel(mem, destF, 128, 64, 100, 40, px);
+            const bool red = px[0] == 255 && px[1] == 0 && px[2] == 0;
+            if (!red) std::printf("FAIL front buffer at swap = %02x %02x %02x %02x\n", px[0], px[1], px[2], px[3]);
+            CHECK(red);
+            r.Flush();
         }
         std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
                     (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());

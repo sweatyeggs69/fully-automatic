@@ -34,6 +34,7 @@ int main() {
         std::printf("write_watch_test: SKIPPED, not supported here: %s\n", why);
         return 0;
     }
+    ww.SetSkipCold(true);  // cover the opt-in quiet-memory rule too
 
     mprotect(b, 1u << 20, PROT_READ | PROT_WRITE);  // committed after Init, as allocations are
 
@@ -58,17 +59,32 @@ int main() {
     a[0x800010] = 1;
     ww.Harvest();
     CHECK(!ww.Clean(0x800000, 0x1000, t3));
-    // A write since the last Harvest is seen right away.
+    // A write since the last Harvest is seen right away on memory written recently (hot)...
+    ww.Watch(0x60000, 0x2000);
+    ww.Harvest();
+    b[0x61000 - 4096 + 4] = 4;  // physical 0x61004: makes the page hot
+    ww.Harvest();
     uint64_t t3b = ww.Watch(0x60000, 0x2000);
     ww.Harvest();
     CHECK(ww.Clean(0x60000, 0x2000, t3b));
     b[0x61000 - 4096 + 8] = 5;  // physical 0x61008, through the aliased view
     CHECK(!ww.Clean(0x60000, 0x2000, t3b));
     CHECK(ww.Clean(0x60000, 0x1000, t3b));
-    // A view never seen writing in a 2 MB region is not asked: the first write there through it is
-    // seen at the next Harvest (or right away with SetQueryAllViews).
+    // ...and at the next Harvest on memory that was quiet (cold): no kernel query for it.
+    uint64_t t3e = ww.Watch(0x70000, 0x1000);
+    ww.Harvest();
+    b[0x70000 - 4096 + 8] = 5;
+    CHECK(ww.Clean(0x70000, 0x1000, t3e));
+    ww.Harvest();
+    CHECK(!ww.Clean(0x70000, 0x1000, t3e));
+    // A view never seen writing in a 2 MB region is not asked, even for hot memory: the first write
+    // there through it is seen at the next Harvest (or right away with SetQueryAllViews).
     mprotect(b + 0x1400000 - 4096, 0x2000, PROT_READ | PROT_WRITE);
     uint64_t t3c = ww.Watch(0x1400000, 0x1000);  // region 10: no writes through either view so far
+    ww.Harvest();
+    a[0x1400000 + 4] = 4;  // hot, through view a only
+    ww.Harvest();
+    t3c = ww.Watch(0x1400000, 0x1000);
     ww.Harvest();
     b[0x1400000 - 4096 + 8] = 5;
     CHECK(ww.Clean(0x1400000, 0x1000, t3c));
@@ -144,8 +160,8 @@ int main() {
     CHECK(cleanCount == 1000);
     const double perClean = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tq0).count() / 1000.0;
     const auto qs = ww.TakeStats();
-    std::printf("write_watch_test: Clean of 64 KB about %.2f us (including one harvest), %llu queries, %llu views skipped\n", perClean,
-                (unsigned long long)qs.queryCalls, (unsigned long long)qs.querySkips);
+    std::printf("write_watch_test: Clean of 64 KB about %.2f us (including one harvest), %llu queries, %llu views skipped, %llu cold\n", perClean,
+                (unsigned long long)qs.queryCalls, (unsigned long long)qs.querySkips, (unsigned long long)qs.queryCold);
     auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
     std::printf("write_watch_test: %u first writes %.2f ms (%.2f us each), harvest %.2f ms (%llu pages), idle harvest %.2f ms\n",
                 big / 4096, ms(t0, t1w), ms(t0, t1w) * 1000.0 / (big / 4096), ms(t1w, t2h),
