@@ -32,6 +32,10 @@ struct DrawCall {
     uint32_t indexGuestAddr = 0;
     uint32_t packetAddr = 0;    // physical address of the DRAW_INDX packet header (diagnostics, direct hooks)
     uint32_t indexEndian = 0;   // Xenos endian swap mode for index data
+    // Where the CP met the packet (diagnostics, direct hooks): the indirect buffer it ran from (0 = the ring) and the
+    // predicated-tiling tile its bin select picks (-1 = not tiled).
+    uint32_t ibBase = 0;
+    int tile = -1;
     std::vector<uint32_t> inlineIndices;  // indices carried inside the packet (host order)
     // Shader microcode loaded with IM_LOAD / IM_LOAD_IMMEDIATE (host order dwords), owned by the
     // command processor and valid during the Draw call.

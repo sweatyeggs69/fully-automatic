@@ -549,7 +549,7 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool inde
     std::vector<uint32_t>& r = g_rec_buf;
     r.clear();
     r.resize(kRecHdr);
-    r[1] = full ? 1 : 0;
+    r[1] = (full ? 1 : 0) | ((base[dev + 10432] & 4) ? 8 : 0);  // bit 3: predicated-tiling recording variant
     r[2] = draw_key(base, dev, indexed);
     r[3] = a.prim;
     r[4] = a.count;
@@ -706,9 +706,10 @@ uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args =
 int g_b_printed = 0, g_b_sh_printed = 0;
 uint64_t g_b_bad_sh[2][2];  // [vs/ps][indexed/non-indexed]
 std::vector<uint8_t> g_b_payload;
-struct DrawnInfo { int swap; uint32_t surface, color, depth, window; };
+struct DrawnInfo { int swap; uint32_t surface, color, depth, window, ib; int tile; bool rec; };
 std::unordered_map<uint32_t, DrawnInfo> g_b_drawn;  // packet -> when and where it was drawn direct (CP thread)
 uint64_t g_b_repeats = 0, g_rp_never = 0, g_rp_seen = 0, g_rp_same_surface = 0, g_rp_same_window = 0, g_rp_same_swap = 0;
+uint64_t g_rp_same_ib = 0, g_rp_in_ib = 0, g_rp_first_rec = 0, g_rp_never_in_ib = 0, g_rp_tile[4], g_rp_first_tile[4];  // tile -1, 0, 1, 2+
 int g_rp_printed = 0;
 
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
@@ -743,17 +744,23 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
             // What the draws without a record are (run 118: skipping them as tile replays lost menu backgrounds and
             // most of the car-select car): same packet drawn before, and with which target and tile window.
             const auto it = g_b_drawn.find(dc.packetAddr);
-            if (it == g_b_drawn.end()) g_rp_never++;
+            g_rp_tile[dc.tile < 0 ? 0 : dc.tile > 2 ? 3 : dc.tile + 1]++;
+            g_rp_in_ib += dc.ibBase != 0;
+            if (it == g_b_drawn.end()) { g_rp_never++; g_rp_never_in_ib += dc.ibBase != 0; }
             else {
                 g_rp_seen++;
                 const DrawnInfo& di = it->second;
                 g_rp_same_surface += di.surface == regs[0x2000] && di.color == regs[0x2001] && di.depth == regs[0x2002];
                 g_rp_same_window += di.window == regs[0x2080];
                 g_rp_same_swap += di.swap == g_swaps_a.load(std::memory_order_relaxed);
+                g_rp_same_ib += di.ib == dc.ibBase;
+                g_rp_first_rec += di.rec;
+                g_rp_first_tile[di.tile < 0 ? 0 : di.tile > 2 ? 3 : di.tile + 1]++;
                 if (g_rp_printed < 12) {
                     g_rp_printed++;
-                    std::fprintf(stderr, "[direct] no record, packet %08x drawn before at swap %d: surface %08x->%08x color %08x->%08x depth %08x->%08x window %08x->%08x\n",
-                                 dc.packetAddr, di.swap, di.surface, regs[0x2000], di.color, regs[0x2001], di.depth, regs[0x2002], di.window, regs[0x2080]);
+                    std::fprintf(stderr, "[direct] no record, packet %08x drawn before at swap %d: surface %08x->%08x color %08x->%08x depth %08x->%08x window %08x->%08x ib %08x->%08x tile %d->%d recording variant %d\n",
+                                 dc.packetAddr, di.swap, di.surface, regs[0x2000], di.color, regs[0x2001], di.depth, regs[0x2002], di.window, regs[0x2080],
+                                 di.ib, dc.ibBase, di.tile, dc.tile, int(di.rec));
                 }
             }
         }
@@ -892,7 +899,8 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
     if ((g_direct & 64) || g_tap_report) {
         if (g_b_drawn.size() > 65536) g_b_drawn.clear();
-        g_b_drawn[dc.packetAddr] = {g_swaps_a.load(std::memory_order_relaxed), regs[0x2000], regs[0x2001], regs[0x2002], regs[0x2080]};
+        g_b_drawn[dc.packetAddr] = {g_swaps_a.load(std::memory_order_relaxed), regs[0x2000], regs[0x2001], regs[0x2002], regs[0x2080], dc.ibBase, dc.tile,
+                                     (g_q[(hdr + 1) & kQMask] & 8) != 0};
     }
     g_b_draws++;
     return true;
@@ -1269,6 +1277,11 @@ void direct_tap_frame_end() {
             std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
                          (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
+        if (g_tap_report)
+            std::fprintf(stderr, "[direct] draws without a record, where: in an indirect buffer %llu (never drawn: %llu), same buffer as before %llu, first draw was recording variant %llu | tile now -1:%llu 0:%llu 1:%llu 2+:%llu | tile at first draw -1:%llu 0:%llu 1:%llu 2+:%llu\n",
+                         (unsigned long long)g_rp_in_ib, (unsigned long long)g_rp_never_in_ib, (unsigned long long)g_rp_same_ib, (unsigned long long)g_rp_first_rec,
+                         (unsigned long long)g_rp_tile[0], (unsigned long long)g_rp_tile[1], (unsigned long long)g_rp_tile[2], (unsigned long long)g_rp_tile[3],
+                         (unsigned long long)g_rp_first_tile[0], (unsigned long long)g_rp_first_tile[1], (unsigned long long)g_rp_first_tile[2], (unsigned long long)g_rp_first_tile[3]);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B resolve check: compared %llu, image differs %llu | by reg:", (unsigned long long)g_rb_cmp, (unsigned long long)g_rb_diff);
             for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++)
