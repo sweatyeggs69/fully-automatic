@@ -10,7 +10,7 @@ target_include_directories(fa_core PUBLIC include)
 
 # Xenos GPU layer: PM4 command processor + backend interface (no graphics deps).
 add_library(fa_gpu src/gpu/command_processor.cpp src/gpu/texture.cpp src/gpu/frame_backend.cpp
-            src/gpu/shader_translator.cpp src/gpu/primitive.cpp)
+            src/gpu/shader_translator.cpp src/gpu/primitive.cpp src/mem/write_watch.cpp)
 target_include_directories(fa_gpu PUBLIC include)
 
 # Command line tool: list/extract ISO contents, inspect default.xex.
@@ -36,6 +36,11 @@ add_test(NAME gpu_pm4 COMMAND gpu_pm4_test)
 add_executable(gpu_texture_test tests/gpu_texture_test.cpp)
 target_link_libraries(gpu_texture_test fa_gpu)
 add_test(NAME gpu_texture COMMAND gpu_texture_test)
+
+# Kernel write tracking (userfaultfd + PAGEMAP_SCAN); skips itself on kernels without it.
+add_executable(write_watch_test tests/write_watch_test.cpp)
+target_link_libraries(write_watch_test fa_gpu)
+add_test(NAME write_watch COMMAND write_watch_test)
 
 # Shader translator: every ALU op, control flow and fetch format must compile with shaderc.
 if(TARGET PkgConfig::SHADERC)

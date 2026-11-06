@@ -26,7 +26,8 @@ file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
 # The GPU command processor lives in the top-level src/gpu.
 list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp
      ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/texture.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/frame_backend.cpp
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/shader_translator.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/primitive.cpp)
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/shader_translator.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/primitive.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/mem/write_watch.cpp)
 # The game window (SDL2 + Vulkan). Optional: FA_NO_WINDOW=ON or no Vulkan -> headless build.
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_present.cmake)
 
