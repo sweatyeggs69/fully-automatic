@@ -585,6 +585,30 @@ int main() {
                 CHECK(ok);
             }
         }
+        // A generic resolve (offset rectangle, not a snapshot) written back by the swap: with frames in
+        // flight its pixels go through the batch's own buffer and land when the batch finished.
+        {
+            const uint32_t destG = 0x3E0000, halfRect = 0x109000;
+            const float hr[6] = {64, 0, 128, 0, 128, 64};
+            for (int i = 0; i < 6; i++) mem.Write32(halfRect + i * 4, F(hr[i]));
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destG + i * 4, 0);
+            RegisterFile rg = rc;
+            rg[pm4::kFetchConstBase] = halfRect | 3;
+            rg[xe::RB_COPY_CONTROL] = 0;
+            rg[xe::RB_COPY_DEST_BASE] = destG;
+            rg[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            const uint64_t res0 = st.resolves;
+            r.Resolve(rg);
+            r.Swap(0, 0, 0, rg);
+            r.Flush();
+            CHECK(st.resolves == res0 + 1);
+            Pixel(mem, destG, 128, 64, 100, 4, px);
+            const bool white = px[0] == 255 && px[1] == 255 && px[2] == 255;
+            Pixel(mem, destG, 128, 64, 4, 4, px);
+            const bool untouched = !px[0] && !px[1] && !px[2] && !px[3];
+            if (!white || !untouched) std::printf("FAIL generic resolve: copied part white %d, left part untouched %d\n", white, untouched);
+            CHECK(white && untouched);
+        }
         std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
                     (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());
     }

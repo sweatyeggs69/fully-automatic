@@ -888,7 +888,8 @@ struct VulkanRenderer::Impl {
     // still take the waiting path.
     void FlushPendingAsync() {
         if (!HasPending()) return;
-        if (kBatches == 1 || !pendingGen.empty()) { FlushPending(prof::kFlushSwap); return; }
+        static const bool syncGen = [] { const char* e = std::getenv("FA_ASYNC_GEN"); return e && e[0] == '0'; }();
+        if (kBatches == 1 || (syncGen && !pendingGen.empty())) { FlushPending(prof::kFlushSwap); return; }
         prof::Add(prof::kFlushSwap, 1);
         std::vector<uint32_t> keys;
         keys.swap(pendingKeys);
@@ -903,13 +904,22 @@ struct VulkanRenderer::Impl {
             jobs.push_back({k, e.dest, e.img.format, e.srcRt, e.w, e.filled, e.version, total});
             total += (VkDeviceSize(e.w) * e.filled * 4 + 15) & ~VkDeviceSize(15);
         }
-        if (jobs.empty()) return;
+        // Generic resolves: their pixels are already being copied into the shared readback buffer in command
+        // order; the batch copies them on into its own buffer, so later resolves can reuse readback.
+        std::vector<PendingGeneric> gens;
+        gens.swap(pendingGen);
+        const VkDeviceSize genOff = total, genBytes = pendingGenBytes;
+        pendingGenBytes = 0;
+        total += genBytes;
+        if (jobs.empty() && gens.empty()) return;
         EndRendering("flushasync");
         if (wbBuf.size < total) {  // this batch's own buffer: not in use by the GPU
             DestroyBuffer(wbBuf);
             if (!CreateBuffer(wbBuf, std::max<VkDeviceSize>(total, 16u << 20), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) {
                 wbBuf = Buffer{};
                 for (const Job& j : jobs) { snaps[j.key].pending = true; pendingKeys.push_back(j.key); }
+                pendingGen.swap(gens);
+                pendingGenBytes = genBytes;
                 FlushPending(prof::kFlushSwap);
                 return;
             }
@@ -925,10 +935,26 @@ struct VulkanRenderer::Impl {
             const uint64_t lo = j.dest.base & 0x1FFFFFFFu;
             wbRanges.push_back({lo, lo + ResolveDestByteSize(j.dest)});
         }
+        if (genBytes) {
+            VkBufferCopy bc{0, genOff, genBytes};
+            vkCmdCopyBuffer(cmd, readback.buf, wbBuf.buf, 1, &bc);
+            for (const PendingGeneric& g : gens) {
+                const uint64_t lo = g.d.base & 0x1FFFFFFFu;
+                wbRanges.push_back({lo, lo + g.destBytes});
+            }
+        }
         Barrier();
         const uint8_t* rb = static_cast<const uint8_t*>(wbBuf.map);
-        doneActions.push_back([this, jobs = std::move(jobs), rb] {
+        doneActions.push_back([this, jobs = std::move(jobs), gens = std::move(gens), genOff, rb] {
             prof::Scope pc_(prof::kResolveCpu);
+            if (!gens.empty()) {
+                // In the order the waiting flush uses: generic resolves first, then the snapshots.
+                prof::Scope pg_(prof::kRcGen);
+                for (const PendingGeneric& g : gens) {
+                    prof::Add(prof::kWbGenKB, g.destBytes / 1024);
+                    FinishGeneric(g, rb + genOff + g.off);
+                }
+            }
             for (const Job& j : jobs) {
                 const uint32_t destBytes = ResolveDestByteSize(j.dest);
                 prof::Add(prof::kWbSnapKB, destBytes / 1024);
