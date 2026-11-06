@@ -698,9 +698,12 @@ struct VulkanRenderer::Impl {
     // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
     // A pending snapshot of another base overlapping a new resolve to [key, key + bytes) must reach guest
     // memory first, since the new one lands over it. One that the new resolve covers completely would only
-    // be overwritten: it is dropped instead, which saves the GPU wait of a flush (FA_SNAP_DROP=0 flushes).
-    void DropOrFlushOverlaps(uint32_t key, uint32_t bytes, uint32_t self) {
-        static const bool noDrop = [] { const char* e = std::getenv("FA_SNAP_DROP"); return e && e[0] == '0'; }();
+    // be overwritten: it can be dropped instead, which saves the GPU wait of a flush.
+    // `whole`: the new resolve writes all of [key, key + bytes) (not the first part of a taller surface).
+    // Opt-in (FA_SNAP_DROP=1) until checked in game: run 119 showed broken textures with it on.
+    void DropOrFlushOverlaps(uint32_t key, uint32_t bytes, uint32_t self, bool whole) {
+        static const bool drop = [] { const char* e = std::getenv("FA_SNAP_DROP"); return e && e[0] == '1'; }();
+        const bool noDrop = !drop || !whole;
         const uint64_t lo = key, hi = uint64_t(key) + bytes;
         for (size_t i = 0; i < pendingKeys.size();) {
             const uint32_t k = pendingKeys[i];
@@ -733,7 +736,7 @@ struct VulkanRenderer::Impl {
                 const uint32_t ry = (key - P.base) / rowBytes;
                 if (ry != P.filled || ry + h > P.img.h) continue;
                 if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-                DropOrFlushOverlaps(key, destBytes, pk);
+                DropOrFlushOverlaps(key, destBytes, pk, false);  // a part of P: not a whole destination
                 if (!P.valid) break;
                 const bool keep = P.valid;
                 InvalidateTextures(key, destBytes, 689);
@@ -763,7 +766,7 @@ struct VulkanRenderer::Impl {
         if (d.height > h && d.height <= 2048 && w == d.pitch && uint64_t(pitchAl) * 4 * ((d.height + 31) & ~31u) == destBytes) H = d.height;
         // A pending surface of another base overlapping this one is written first (order matters).
         if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-        DropOrFlushOverlaps(key, destBytes, key);
+        DropOrFlushOverlaps(key, destBytes, key, h >= d.height && w >= d.pitch);
         if (e.img.img && (e.img.w != w || e.img.h != H || e.img.format != fmt)) {
             if (e.pending) FlushPending(prof::kFlushOverlap);
             ReleaseSnapImage(e);
@@ -1930,6 +1933,8 @@ struct VulkanRenderer::Impl {
         if (!ww.Init(views, mem.PhysicalSize(), &why)) { std::fprintf(stderr, "[writewatch] off: %s\n", why); return; }
         // FA_WW_ALLVIEWS=1: a texture check asks the kernel about every view, not only the views seen writing there.
         { const char* av = std::getenv("FA_WW_ALLVIEWS"); ww.SetQueryAllViews(av && av[0] == '1'); }
+        // FA_WW_COLD=1: no kernel query for memory not written in the last 120 frames (opt-in, see run 119).
+        { const char* wc = std::getenv("FA_WW_COLD"); ww.SetSkipCold(wc && wc[0] == '1'); }
         stats.writeWatch = 1;
         std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
     }

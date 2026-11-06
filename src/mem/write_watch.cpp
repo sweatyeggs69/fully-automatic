@@ -108,7 +108,7 @@ bool WriteWatch::Clean(uint32_t phys, uint32_t size, uint64_t token) const {
     const uint32_t first = phys / kPage;
     const uint64_t end64 = (uint64_t(phys) + size + kPage - 1) / kPage;
     if (end64 > pages_) return false;
-    bool hot = queryAllViews_;
+    bool hot = queryAllViews_ || !skipCold_;
     for (uint32_t p = first; p < uint32_t(end64); p++) {
         if (!watched_[p] || written_[p] > token) return false;
         hot |= seenAt_[p] && harvestNo_ - seenAt_[p] < kHotHarvests;

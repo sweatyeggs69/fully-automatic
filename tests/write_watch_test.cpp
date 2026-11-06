@@ -34,6 +34,7 @@ int main() {
         std::printf("write_watch_test: SKIPPED, not supported here: %s\n", why);
         return 0;
     }
+    ww.SetSkipCold(true);  // cover the opt-in quiet-memory rule too
 
     mprotect(b, 1u << 20, PROT_READ | PROT_WRITE);  // committed after Init, as allocations are
 

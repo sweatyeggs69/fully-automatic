@@ -58,6 +58,8 @@ public:
     // been quiet (most textures) is not. The cost: the first write after a quiet spell, or through a
     // new view, is seen at the next Harvest instead of right away. true asks every view every time.
     void SetQueryAllViews(bool all) { queryAllViews_ = all; }
+    // Skipping the query for quiet memory is opt-in until checked in game (run 119 showed broken textures).
+    void SetSkipCold(bool skip) { skipCold_ = skip; }
 
     struct Stats {
         uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0, querySkips = 0, queryCold = 0;
@@ -88,6 +90,7 @@ private:
     std::vector<uint32_t> seenAt_;                 // per page: harvest number that last saw it written (0 = never)
     uint32_t harvestNo_ = 0;
     bool queryAllViews_ = false;
+    bool skipCold_ = false;
 };
 
 }  // namespace fa::mem

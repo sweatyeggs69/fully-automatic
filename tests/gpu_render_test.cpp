@@ -101,7 +101,8 @@ static void Pixel(const FakeMem& mem, uint32_t base, uint32_t pitch, uint32_t he
 
 int main() {
     FakeMem mem;
-    setenv("FA_WW", "2", 0);  // write tracking without pinned memory (no udmabuf here)
+    setenv("FA_WW", "2", 0);
+    setenv("FA_SNAP_DROP", "1", 0);  // opt-in snapshot drop, covered by the resolve sections  // write tracking without pinned memory (no udmabuf here)
     VulkanRenderer r(mem, nullptr);
     VulkanRenderer::Options opt;
     opt.validation = std::getenv("FA_VK_VALIDATION") != nullptr;
