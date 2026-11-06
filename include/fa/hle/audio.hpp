@@ -252,6 +252,10 @@ public:
         uint64_t frames = 0;         // XMA frames decoded
         uint64_t bad_frames = 0;     // invalid frame lengths skipped
         uint64_t decode_errors = 0;  // frames FFmpeg rejected
+        uint64_t drained = 0;        // passes that found a primed output ring empty (the reader caught up: a gap)
+        uint64_t dry = 0;            // passes that ran out of valid input buffers
+        uint64_t full = 0;           // passes that filled the output ring (read == write, output marked invalid)
+        uint64_t no_output = 0;      // kicked passes with the output buffer not valid
         int allocated = 0;           // contexts currently allocated
     };
     Stats stats();
@@ -272,7 +276,8 @@ private:
     std::atomic<uint64_t> st_kicks_{0}, st_passes_{0}, st_loops_{0};
     bool trace_ctx_ = std::getenv("FA_XMA_DEBUG") != nullptr;  // log kicked contexts that decode nothing
     // Bumped by the per-context decode loop (Context is a nested class).
-    static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_;
+    static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_, st_drained_, st_dry_, st_full_,
+        st_no_output_;
 };
 
 }  // namespace fa::hle
