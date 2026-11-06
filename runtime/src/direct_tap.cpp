@@ -598,7 +598,7 @@ constexpr uint32_t kImg = 0x4928, kBlocks = (kImg + 15) / 16;
 uint32_t g_cur[kImg], g_sent[kImg];
 uint64_t g_blk_dirty[(kBlocks + 63) / 64];
 bool g_cur_init = false, g_sent_valid = false;
-uint64_t g_b_nonidx = 0, g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
+uint64_t g_b_flushed = 0, g_b_nonidx = 0, g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
 uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args = 0;
 int g_b_printed = 0, g_b_sh_printed = 0;
 uint64_t g_b_bad_sh[2][2];  // [vs/ps][indexed/non-indexed]
@@ -607,8 +607,10 @@ std::vector<uint8_t> g_b_payload;
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
 
 bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
-    // FA_DIRECT bit 4 (16) adds non-indexed draws (auto indices); their records are queued either way.
-    if (!dc.inlineIndices.empty() || (!dc.indexed && !(g_direct & 16))) return false;
+    // FA_DIRECT bit 4 (16) adds non-indexed draws (auto indices). Their records are queued either way, so a draw that
+    // stays on the PM4 path still consumes its record (run 109: with FA_DIRECT=8 the menus' runs of more than 256
+    // non-indexed records were never consumed, the CP stopped finding records and the producer dropped).
+    const bool eligible = dc.inlineIndices.empty() && (dc.indexed || (g_direct & 16));
     if (!g_cur_init) {
         std::memcpy(g_cur + 0x2000, regs.r.data() + 0x2000, 0x400 * 4);
         std::memcpy(g_cur + 0x4000, regs.r.data() + 0x4000, 0x928 * 4);
@@ -621,10 +623,16 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         if (g_q[(at + 2) & kQMask] == dc.packetAddr) { match = at; break; }
         at += g_q[at & kQMask];
     }
-    if (match == ~0ull) { g_b_missing++; return false; }
+    if (match == ~0ull) {
+        g_b_missing++;
+        // Safety valve: if the backlog grows past half the ring, apply everything queued (applying in order always
+        // keeps the image consistent; only the lookups for those draws are lost).
+        if (w - r > kQWords / 2) match = ~0ull - 1;
+        else return false;
+    }
     // Apply every record up to and including the match (records the CP never draws still carry state).
     uint64_t hdr = 0;
-    while (r <= match) {
+    while (r <= match && r < w) {
         const uint32_t len = g_q[r & kQMask];
         for (uint32_t i = kRecHdr; i < len;) {
             const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
@@ -638,6 +646,8 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         r += len;
     }
     g_q_r.store(r, std::memory_order_release);
+    if (match == ~0ull - 1) { g_b_flushed++; return false; }
+    if (!eligible) return false;
     for (uint32_t reg : kCpRegs)
         if (g_cur[reg] != regs[reg]) { g_cur[reg] = regs[reg]; mark(reg); }
     auto hv = [&](uint32_t i) { return g_q[(hdr + i) & kQMask]; };
@@ -1031,10 +1041,10 @@ void direct_tap_frame_end() {
                          (unsigned long long)g_dd_draws, (unsigned long long)g_dd_missing, (unsigned long long)g_dd_refused, (unsigned long long)g_dd_dwords);
     }
     if ((g_direct & 8) && g_swaps % 300 == 0) {
-        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (non-indexed %llu, drawn direct %llu) (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), payload dwords %llu\n",
+        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (non-indexed %llu, drawn direct %llu) (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), backlog flushes %llu, payload dwords %llu\n",
                      (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
-                     (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_dwords);
+                     (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_dwords);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B check: draws %llu, image differs from CP %llu, args differ %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
                          (unsigned long long)g_b_cmp_draws, (unsigned long long)g_b_diff_draws, (unsigned long long)g_b_bad_args);
