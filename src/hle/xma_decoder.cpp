@@ -685,22 +685,24 @@ bool XmaDecoder::work_once() {
         c.kicked = false;
         if (kick_only_) c.enabled = false;
         uint8_t* g = hooks_.host(c.guest_ptr);
+        uint8_t orig[kContextSize];
+        std::memcpy(orig, g, kContextSize);
         XmaContextData d;
-        d.load(g);
+        d.load(orig);
         uint64_t frames_before = st_frames_.load(std::memory_order_relaxed);
         XmaContextData before = d;
         c.decode(d, hooks_, kicked || kick_only_);
         const bool decoded = st_frames_.load(std::memory_order_relaxed) != frames_before;
-        if (!kicked && !decoded) {
-            // Idle continuous pass: write back only what changed, so a pass that did nothing never
-            // overwrites the context under the game.
-            uint8_t img[kContextSize];
-            std::memcpy(img, g, kContextSize);
-            d.store(img);
-            if (std::memcmp(img, g, kContextSize) != 0) std::memcpy(g, img, kContextSize);
-            continue;
+        // Write back only the bits this pass changed. The game can update the context in guest
+        // memory while we decode (read offset, input buffers, valid flags); a whole-context store
+        // would put its old values back, and with continuous passes that happens all the time.
+        uint8_t img[kContextSize];
+        d.store(img);
+        for (uint32_t k = 0; k < kContextSize; ++k) {
+            uint8_t changed = uint8_t(orig[k] ^ img[k]);
+            if (changed) g[k] = uint8_t((g[k] & ~changed) | (img[k] & changed));
         }
-        d.store(g);
+        if (!kicked && !decoded) continue;  // idle continuous pass
         st_passes_.fetch_add(1, std::memory_order_relaxed);
         if (trace_ctx_ && kicked && !decoded && c.trace_count++ < 12) {
             // FA_XMA_DEBUG: a kicked context that decoded nothing; show why.
