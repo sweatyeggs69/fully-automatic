@@ -1,6 +1,10 @@
 #include "fa/gpu/command_processor.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "fa/gpu/pm4.hpp"
@@ -38,8 +42,71 @@ uint32_t CommandProcessor::ReadDword(uint32_t base, uint32_t sizeDwords, uint32_
     return mem_.Read32(base + (idx % sizeDwords) * 4);
 }
 
+void CommandProcessor::TraceFlushDraws() {
+    if (!tt_.draws && stats_.predicatedSkips == tt_.skips0) return;
+    std::fprintf(stderr, "[tiles] d%u draws %u, predicated skips %llu\n", tt_.depth, tt_.draws,
+                 (unsigned long long)(stats_.predicatedSkips - tt_.skips0));
+    tt_.draws = 0;
+    tt_.skips0 = stats_.predicatedSkips;
+}
+
+void CommandProcessor::TraceReg(uint32_t reg, uint32_t value) {
+    const char* name = nullptr;
+    switch (reg) {
+        case xe::PA_SC_WINDOW_OFFSET: name = "window offset"; break;
+        case xe::PA_SC_WINDOW_SCISSOR_TL: name = "window scissor tl"; break;
+        case xe::PA_SC_WINDOW_SCISSOR_BR: name = "window scissor br"; break;
+        case xe::PA_SC_SCREEN_SCISSOR_TL: name = "screen scissor tl"; break;
+        case xe::PA_SC_SCREEN_SCISSOR_BR: name = "screen scissor br"; break;
+        case xe::RB_SURFACE_INFO: name = "surface info"; break;
+        case xe::RB_COLOR_INFO: name = "color info"; break;
+        case xe::RB_DEPTH_INFO: name = "depth info"; break;
+        case xe::RB_COPY_DEST_BASE: name = "copy dest base"; break;
+        case xe::RB_COPY_DEST_PITCH: name = "copy dest pitch"; break;
+        case xe::RB_MODECONTROL: name = "mode control"; break;
+        default: return;
+    }
+    if (regs_[reg] == value) return;
+    TraceFlushDraws();
+    std::fprintf(stderr, "[tiles] d%u %s %08x\n", tt_.depth, name, value);
+}
+
+void CommandProcessor::TraceSwap() {
+    static const bool parsed = [this] {
+        if (const char* e = std::getenv("FA_TILE_TRACE")) {
+            tt_.first = std::strtoull(e, nullptr, 10);
+            if (const char* c = std::strchr(e, ',')) tt_.frames = std::max<uint64_t>(1, std::strtoull(c + 1, nullptr, 10));
+        }
+        return true;
+    }();
+    (void)parsed;
+    if (tt_.on) {
+        TraceFlushDraws();
+        std::fprintf(stderr, "[tiles] swap %llu\n", (unsigned long long)stats_.swaps);
+    }
+    // Or on demand: `touch ~/.cache/fullauto/tile_trace` traces the next two frames (checked every 30 swaps).
+    if (!tt_.on && stats_.swaps % 30 == 0) {
+        static const std::string trigger = [] {
+            const char* h = std::getenv("HOME");
+            return h ? std::string(h) + "/.cache/fullauto/tile_trace" : std::string();
+        }();
+        if (!trigger.empty() && std::remove(trigger.c_str()) == 0) {
+            tt_.first = stats_.swaps + 1;
+            tt_.frames = 2;
+        }
+    }
+    tt_.on = stats_.swaps + 1 >= tt_.first && stats_.swaps + 1 < tt_.first + tt_.frames;
+    if (tt_.on) {
+        tt_.draws = 0;
+        tt_.skips0 = stats_.predicatedSkips;
+        std::fprintf(stderr, "[tiles] frame after swap %llu: bin mask %016llx select %016llx\n", (unsigned long long)stats_.swaps,
+                     (unsigned long long)binMask_, (unsigned long long)binSelect_);
+    }
+}
+
 void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
     if (reg >= kRegisterCount) return;
+    if (tt_.on) TraceReg(reg, value);
     regs_[reg] = value;
     if (reg - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((reg - pm4::kAluConstBase) >> 6);
     // Scratch registers are mirrored to memory (SCRATCH_ADDR + 4 * i) when their SCRATCH_UMSK bit
@@ -87,6 +154,7 @@ CommandProcessor::Status CommandProcessor::Pump() {
 CommandProcessor::Result CommandProcessor::ExecutePacket(uint32_t& pos, uint32_t base, uint32_t sizeDwords,
                                                          uint32_t availDwords, int depth) {
     uint32_t header = ReadDword(base, sizeDwords, pos);
+    if (tt_.on && tt_.depth != uint32_t(depth)) { TraceFlushDraws(); tt_.depth = uint32_t(depth); }
     uint32_t total = 1;
     // Reused across packets: a fresh vector per packet was a heap allocation for every packet.
     std::vector<uint32_t>& d = payload_;
@@ -140,21 +208,27 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         // Tiled-rendering predication (see binMask_).
         case pm4::kSetBinMask:
             if (n >= 2) binMask_ = (uint64_t(d[0]) << 32) | d[1];
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin mask %016llx\n", depth, (unsigned long long)binMask_); }
             break;
         case pm4::kSetBinSelect:
             if (n >= 2) binSelect_ = (uint64_t(d[0]) << 32) | d[1];
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin select %016llx\n", depth, (unsigned long long)binSelect_); }
             break;
         case pm4::kSetBinMaskLo:
             if (n >= 1) binMask_ = (binMask_ & 0xFFFFFFFF00000000ull) | d[0];
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin mask lo -> %016llx\n", depth, (unsigned long long)binMask_); }
             break;
         case pm4::kSetBinMaskHi:
             if (n >= 1) binMask_ = (binMask_ & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin mask hi -> %016llx\n", depth, (unsigned long long)binMask_); }
             break;
         case pm4::kSetBinSelectLo:
             if (n >= 1) binSelect_ = (binSelect_ & 0xFFFFFFFF00000000ull) | d[0];
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin select lo -> %016llx\n", depth, (unsigned long long)binSelect_); }
             break;
         case pm4::kSetBinSelectHi:
             if (n >= 1) binSelect_ = (binSelect_ & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
+            if (tt_.on) { TraceFlushDraws(); std::fprintf(stderr, "[tiles] d%d bin select hi -> %016llx\n", depth, (unsigned long long)binSelect_); }
             break;
 
         case pm4::kImLoad: {
@@ -184,6 +258,10 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (n >= 2 && depth == 0 && !ib_.active) {
                 ib_ = {true, d[0] & 0x1FFFFFFF, d[1] & 0xFFFFF, 0};
                 if (g_indirect_buffer_observer) g_indirect_buffer_observer(ib_.base, ib_.size);
+                if (tt_.on) {
+                    TraceFlushDraws();
+                    std::fprintf(stderr, "[tiles] ib %08x, %u dwords\n", ib_.base, ib_.size);
+                }
             } else {
                 ++stats_.unknown;  // nested indirect buffers are not used by the game
             }
@@ -285,6 +363,13 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             }
             regs_[xe::VGT_DRAW_INITIATOR] = init;
             if ((regs_[xe::RB_MODECONTROL] & 7) == xe::kEdramCopy) {
+                if (tt_.on) {
+                    TraceFlushDraws();
+                    std::fprintf(stderr, "[tiles] d%d resolve: copy control %08x dest %08x pitch %08x info %08x, window offset %08x, surface %08x color %08x depth %08x\n",
+                                 depth, regs_[xe::RB_COPY_CONTROL], regs_[xe::RB_COPY_DEST_BASE], regs_[xe::RB_COPY_DEST_PITCH],
+                                 regs_[xe::RB_COPY_DEST_INFO], regs_[xe::PA_SC_WINDOW_OFFSET], regs_[xe::RB_SURFACE_INFO],
+                                 regs_[xe::RB_COLOR_INFO], regs_[xe::RB_DEPTH_INFO]);
+                }
                 backend_.Resolve(regs_);
                 ++stats_.resolves;
                 break;
@@ -299,12 +384,14 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (g_draw_observer) g_draw_observer(dc, regs_);
             backend_.Draw(dc, regs_);
             ++stats_.draws;
+            if (tt_.on) tt_.draws++;
             break;
         }
 
         case pm4::kXeSwap:  // d[0] = 'SWAP', d[1] = front buffer, d[2] = width, d[3] = height
             if (n >= 4) {
                 backend_.Swap(d[1], d[2], d[3], regs_);
+                TraceSwap();
                 ++stats_.swaps;
             }
             break;

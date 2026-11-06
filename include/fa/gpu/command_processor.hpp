@@ -66,6 +66,17 @@ private:
     // (bin_select & bin_mask) != 0. D3D replays a frame once per screen tile this way.
     uint64_t binMask_ = 0xFFFFFFFFull, binSelect_ = 0xFFFFFFFFull;
     void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
+    // FA_TILE_TRACE=<first swap>[,<frames>], or touching ~/.cache/fullauto/tile_trace: logs the frame's structure (indirect buffers, bin
+    // mask/select, tile window and target registers, draw runs, resolves) for tile replay work.
+    struct TileTrace {
+        uint64_t first = ~0ull, frames = 1;
+        bool on = false;
+        uint32_t draws = 0, depth = 0;
+        uint64_t skips0 = 0;
+    } tt_;
+    void TraceFlushDraws();
+    void TraceReg(uint32_t reg, uint32_t value);
+    void TraceSwap();
     Stats stats_;
     std::vector<uint32_t> payload_;  // scratch for the packet being executed
 };
