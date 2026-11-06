@@ -35,6 +35,7 @@ namespace {
 const unsigned g_direct = std::getenv("FA_DIRECT") ? unsigned(std::strtoul(std::getenv("FA_DIRECT"), nullptr, 0)) : 0u;
 bool g_tap_report = std::getenv("FA_TAP") != nullptr;
 bool g_on = g_tap_report || g_direct != 0;
+int g_feed_printed = 0;
 uint64_t g_feed_draws = 0, g_feed_missing = 0, g_feed_changed = 0, g_feed_dwords = 0;
 std::atomic<uint64_t> g_tap_calls{0}, g_tap_indices{0}, g_cp_draws{0}, g_cp_indices{0};
 std::atomic<uint64_t> g_tap_last_calls{0};
@@ -90,7 +91,15 @@ struct HashSets { std::unordered_set<uint64_t> vs, ps, tex; };
 // Exact parity by packet address: the tap records a snapshot of the shadow under the physical address of the
 // DRAW_INDX packet the game just wrote (the last 5 dwords before the device's write pointer); the CP looks it
 // up by DrawCall::packetAddr, which is also correct for tile replays and indirect buffers.
-struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords]; };
+// Render state register windows in the device shadow (from the dirty-state flush, notes/d3d-map.md): shadow offset,
+// first register, dword count (counts inferred from the distance to the next window; the last is a guess).
+struct StWin { uint32_t off, reg, n; };
+constexpr StWin kStWins[] = {{0x2CC0, 0x2000, 19}, {0x2D0C, 0x2100, 21}, {0x2D60, 0x2180, 5}, {0x2D74, 0x2200, 12},
+                             {0x2DA4, 0x2280, 21}, {0x2DF8, 0x2300, 38}, {0x2E90, 0x2380, 16}};
+constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;
+struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords]; };
+uint64_t g_st_mis[0x400], g_st_cmp = 0;
+int g_st_printed = 0;
 std::mutex g_snap_mu;
 uint64_t g_rec_k[25];  // recording-variant lookups by backwards offset in dwords (under g_snap_mu)
 std::unordered_map<uint32_t, Snap> g_snaps[3];
@@ -158,6 +167,8 @@ void snapshot_draw(const uint8_t* base, uint32_t dev) {
     for (uint32_t i = 0; i < kVsDwords; i++) s.vs[i] = __builtin_bswap32(v[i]);
     for (uint32_t i = 0; i < kPsDwords; i++) s.ps[i] = __builtin_bswap32(p[i]);
     for (uint32_t i = 0; i < kTexDwords; i++) s.tex[i] = __builtin_bswap32(t[i]);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(base + dev + kStBase);
+    for (uint32_t i = 0; i < kStDwords; i++) s.st[i] = __builtin_bswap32(q[i]);
     std::lock_guard<std::mutex> lk(g_snap_mu);
     g_snaps[g_snap_gen][pkt] = s;
 }
@@ -203,6 +214,18 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
     cmp("vs", sn->vs, kRegVs, kVsDwords, true, 0, dv);
     cmp("ps", sn->ps, kRegPs, kPsDwords, true, 256, dp);
     cmp("fetch", sn->tex, kRegTex, kTexDwords, false, 0, dt);
+    for (const StWin& w : kStWins)
+        for (uint32_t j = 0; j < w.n; j++) {
+            const uint32_t g = sn->st[(w.off - kStBase) / 4 + j], c = regs[w.reg + j];
+            g_st_cmp++;
+            if (g != c) {
+                g_st_mis[w.reg + j - 0x2000]++;
+                if (g_st_printed < 24) {
+                    g_st_printed++;
+                    std::fprintf(stderr, "[tap] state reg %04x: game %08x cp %08x (packet %08x)\n", w.reg + j, g, c, pkt);
+                }
+            }
+        }
     if (printed) g_ex_printed++;
     g_ex_diff_vs += dv != 0;
     g_ex_diff_ps += dp != 0;
@@ -226,6 +249,11 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
             if (touched(k * 256 + (i >> 2))) continue;
             uint32_t& dst = regs[rb[k] + i];
             if (dst != src[k][i]) {
+                if (g_feed_printed < 16) {
+                    g_feed_printed++;
+                    std::fprintf(stderr, "[direct] differs: %s const reg %04x pm4 %08x game %08x (packet %08x, vec4 %u)\n", k ? "ps" : "vs",
+                                 rb[k] + i, dst, src[k][i], dc.packetAddr, k * 256 + (i >> 2));
+                }
                 dst = src[k][i];
                 regs.aluDirty |= 1u << ((k * 1024 + i) >> 6);
                 g_feed_changed++;
@@ -234,7 +262,14 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
     }
     for (uint32_t i = 0; i < kTexDwords; i++) {
         uint32_t& dst = regs[kRegTex + i];
-        if (dst != sn->tex[i]) { dst = sn->tex[i]; g_feed_changed++; }
+        if (dst != sn->tex[i]) {
+            if (g_feed_printed < 16) {
+                g_feed_printed++;
+                std::fprintf(stderr, "[direct] differs: fetch reg %04x pm4 %08x game %08x (packet %08x)\n", kRegTex + i, dst, sn->tex[i], dc.packetAddr);
+            }
+            dst = sn->tex[i];
+            g_feed_changed++;
+        }
     }
     g_feed_dwords += 2048 + kTexDwords;
 }
@@ -461,6 +496,12 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   exact parity by packet address: CP draws with a game snapshot %llu, without %llu | identical state %llu | differ in vs %llu ps %llu fetch %llu\n",
                      (unsigned long long)g_ex_found, (unsigned long long)g_ex_missing, (unsigned long long)g_ex_equal,
                      (unsigned long long)g_ex_diff_vs, (unsigned long long)g_ex_diff_ps, (unsigned long long)g_ex_diff_tex);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_snap_mu);
+        std::fprintf(stderr, "[tap]   render-state windows: compared %llu dwords; registers that differ (reg:count of %llu draws):", (unsigned long long)g_st_cmp, (unsigned long long)g_ex_found);
+        for (uint32_t i = 0; i < 0x400; i++) if (g_st_mis[i]) std::fprintf(stderr, " %04x:%llu", 0x2000 + i, (unsigned long long)g_st_mis[i]);
+        std::fprintf(stderr, "\n");
     }
     {
         std::lock_guard<std::mutex> lk(g_snap_mu);
