@@ -503,6 +503,7 @@ std::atomic<uint64_t> g_q_w{0}, g_q_r{0};
 constexpr uint32_t kRecHdr = 13;
 uint32_t g_prev_g[kGDwords];  // game thread
 bool g_prev_valid = false;    // game thread
+bool g_prev_rec = false;      // game thread: the previous draw record was the recording variant
 uint64_t g_q_pushed = 0, g_q_dropped = 0, g_q_words_pushed = 0, g_q_nonidx = 0;  // game thread
 std::vector<uint32_t> g_rec_buf;                                // game thread
 
@@ -545,7 +546,12 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool inde
         rd_block(o, 0x2E90, 8); o += 8;
     }
     auto rd = [&](uint32_t addr) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + addr)); };
-    const bool full = !g_prev_valid;
+    // A replayed command buffer (run 129: every draw without a record runs inside an indirect buffer the game
+    // recorded with the predicated-tiling variant) restarts from the state at its first draw, so the first record of
+    // a recording carries the full state: its stored chain then fully defines every replayed draw (stage B replays).
+    const bool recv = (base[dev + 10432] & 4) != 0;
+    const bool full = !g_prev_valid || (recv && !g_prev_rec);
+    g_prev_rec = recv;
     std::vector<uint32_t>& r = g_rec_buf;
     r.clear();
     r.resize(kRecHdr);
@@ -714,6 +720,148 @@ int g_rp_printed = 0;
 
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
 
+// Replays (FA_DIRECT bit 7 = 128): the records the CP applied up to each recording-variant draw, kept by packet, are
+// applied again to a second image when the CP replays that packet without a record. g_rep_dirty, like g_blk_dirty
+// for g_cur, holds every block where g_rep may differ from g_sent.
+constexpr size_t kDirtyWords = (kBlocks + 63) / 64;
+uint32_t g_rep[kImg];
+uint64_t g_rep_dirty[kDirtyWords];
+bool g_in_replay = false;
+struct ReplaySeg { std::vector<uint32_t> words; uint32_t last; };  // records in order; offset of the matched one
+std::unordered_map<uint32_t, ReplaySeg> g_replay;
+uint64_t g_rpl_stored = 0, g_rpl_found = 0, g_rpl_missing = 0, g_rpl_drawn = 0, g_rpl_starts = 0, g_rpl_cmp = 0, g_rpl_diff = 0, g_rpl_diff_seg[16];
+int g_rpl_printed = 0;
+inline void mark_rep(uint32_t reg) { g_rep_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
+
+// Sends one draw to the backend from image img: the runs inside dirty blocks that differ from g_sent (everything when
+// g_sent is not valid). Blocks sent from img may now differ from the other image, so they join its dirty set.
+bool send_direct(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend, const uint32_t* img,
+                 uint64_t* dirty, uint64_t* other, const uint32_t* hdr) {
+    fa::gpu::DirectDraw rec;
+    rec.seq = g_dd_seq++;
+    rec.packetAddr = dc.packetAddr;
+    rec.primType = dc.primType;
+    rec.indexCount = dc.indexCount;
+    rec.indexAddr = dc.indexed ? dc.indexGuestAddr : 0;
+    rec.index32 = dc.index32;
+    rec.indexEndian = uint8_t(dc.indexEndian);
+    rec.vsObj = hdr[6]; rec.vsUcode = hdr[7]; rec.vsBytes = hdr[8];
+    rec.psObj = hdr[9]; rec.psUcode = hdr[10]; rec.psBytes = hdr[11];
+    rec.declObj = hdr[12];
+    rec.tileRows = regs.tileRows;
+    g_b_payload.clear();
+    auto emit = [&](uint32_t i, uint32_t j) {
+        fa::gpu::DirectRegRun run{i, j - i};
+        const size_t o = g_b_payload.size();
+        g_b_payload.resize(o + sizeof run + run.count * 4);
+        std::memcpy(g_b_payload.data() + o, &run, sizeof run);
+        std::memcpy(g_b_payload.data() + o + sizeof run, img + i, run.count * 4);
+        g_b_dwords += run.count;
+    };
+    if (!g_sent_valid) {
+        emit(0x2000, 0x2400);
+        emit(0x4000, kImg);
+    } else {
+        for (uint32_t wd = 0; wd < kDirtyWords; wd++) {
+            uint64_t m = dirty[wd];
+            while (m) {
+                const uint32_t b = wd * 64 + __builtin_ctzll(m);
+                m &= m - 1;
+                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
+                for (uint32_t i = lo; i < hi;) {
+                    if (img[i] == g_sent[i]) { i++; continue; }
+                    uint32_t j = i;
+                    while (j < hi && img[j] != g_sent[j]) j++;
+                    emit(i, j);
+                    i = j;
+                }
+            }
+        }
+    }
+    rec.payloadBytes = uint32_t(g_b_payload.size());
+    if (!backend.DrawDirect(rec, g_b_payload.data())) {
+        g_b_refused++;
+        g_sent_valid = false;
+        return false;
+    }
+    if (!g_sent_valid) {
+        std::memcpy(g_sent + 0x2000, img + 0x2000, 0x400 * 4);
+        std::memcpy(g_sent + 0x4000, img + 0x4000, (kImg - 0x4000) * 4);
+        g_sent_valid = true;
+        for (uint32_t wd = 0; wd < kDirtyWords; wd++) other[wd] = ~0ull;
+    } else {
+        for (uint32_t wd = 0; wd < kDirtyWords; wd++) {
+            uint64_t m = dirty[wd];
+            other[wd] |= m;
+            while (m) {
+                const uint32_t b = wd * 64 + __builtin_ctzll(m);
+                m &= m - 1;
+                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
+                std::memcpy(g_sent + lo, img + lo, (hi - lo) * 4);
+            }
+        }
+    }
+    std::memset(dirty, 0, kDirtyWords * 8);
+    return true;
+}
+
+// A CP draw without a record: if its packet's records were kept, replay them onto g_rep (starting from g_cur at the
+// first draw of a replay run), compare with the CP under FA_TAP=1, and with bit 128 draw from g_rep.
+bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend, bool eligible) {
+    if (!g_tap_report && !(g_direct & 128)) return false;
+    const auto it = g_replay.find(dc.packetAddr);
+    if (it == g_replay.end()) { g_rpl_missing++; return false; }
+    g_rpl_found++;
+    if (!g_in_replay) {
+        std::memcpy(g_rep + 0x2000, g_cur + 0x2000, 0x400 * 4);
+        std::memcpy(g_rep + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
+        std::memcpy(g_rep_dirty, g_blk_dirty, sizeof g_rep_dirty);
+        g_in_replay = true;
+        g_rpl_starts++;
+    }
+    const std::vector<uint32_t>& wv = it->second.words;
+    for (size_t at = 0; at < wv.size();) {
+        const uint32_t len = wv[at];
+        for (uint32_t i = kRecHdr; i < len;) {
+            const uint32_t first = wv[at + i], cnt = wv[at + i + 1];
+            std::memcpy(g_rep + first, wv.data() + at + i + 2, cnt * 4);
+            for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_rep_dirty[b >> 6] |= 1ull << (b & 63);
+            i += 2 + cnt;
+        }
+        at += len;
+    }
+    for (uint32_t reg : kCpRegs)
+        if (g_rep[reg] != regs[reg]) { g_rep[reg] = regs[reg]; mark_rep(reg); }
+    if (g_tap_report) {
+        g_rpl_cmp++;
+        bool any = false;
+        int si = 0;
+        for (const GSeg& sg : kGSegs) {
+            for (uint32_t i = 0; i < sg.n; i++) {
+                const uint32_t reg = sg.reg + i;
+                if (reg >= 0x4000 && reg < 0x4800 && touched((reg - 0x4000) >> 2)) continue;
+                if (g_rep[reg] != regs[reg]) {
+                    any = true;
+                    g_rpl_diff_seg[si]++;
+                    if (g_rpl_printed < 16) {
+                        g_rpl_printed++;
+                        std::fprintf(stderr, "[direct] replay image reg %04x: replay %08x cp %08x (packet %08x, ib %08x)\n", reg, g_rep[reg], regs[reg], dc.packetAddr, dc.ibBase);
+                    }
+                }
+            }
+            si++;
+        }
+        g_rpl_diff += any;
+    }
+    if (!(g_direct & 128) || !eligible) return false;
+    const uint32_t* hdr = wv.data() + it->second.last;
+    if (hdr[1] & 2) return false;  // a resolve record
+    if (!send_direct(dc, regs, backend, g_rep, g_rep_dirty, g_blk_dirty, hdr)) return false;
+    if (!dc.indexed) g_b_nonidx++;
+    g_rpl_drawn++;
+    return true;
+}
+
 bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
     // FA_DIRECT bit 4 (16) adds non-indexed draws (auto indices). Their records are queued either way, so a draw that
     // stays on the PM4 path still consumes its record (run 109: with FA_DIRECT=8 the menus' runs of more than 256
@@ -767,8 +915,10 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         // Safety valve: if the backlog grows past half the ring, apply everything queued (applying in order always
         // keeps the image consistent; only the lookups for those draws are lost).
         if (w - r > kQWords / 2) match = ~0ull - 1;
-        else return false;
+        else return replay_draw(dc, regs, backend, eligible);
     }
+    g_in_replay = false;
+    const uint64_t r0 = r;
     // Apply every record up to and including the match (records the CP never draws still carry state).
     uint64_t hdr = 0;
     while (r <= match && r < w) {
@@ -786,6 +936,15 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     }
     g_q_r.store(r, std::memory_order_release);
     if (match == ~0ull - 1) { g_b_flushed++; return false; }
+    if ((g_tap_report || (g_direct & 128)) && (g_q[(hdr + 1) & kQMask] & 8)) {
+        // Keep this draw's records for replays of its packet.
+        if (g_replay.size() > 32768) g_replay.clear();
+        ReplaySeg& sgm = g_replay[dc.packetAddr];
+        sgm.words.resize(r - r0);
+        for (uint64_t k = r0; k < r; k++) sgm.words[k - r0] = g_q[k & kQMask];
+        sgm.last = uint32_t(hdr - r0);
+        g_rpl_stored++;
+    }
     // A resolve record matched by a draw that is not a copy (no shader identities in it): leave it to the PM4 path.
     if (!eligible || (g_q[(hdr + 1) & kQMask] & 2)) return false;
     for (uint32_t reg : kCpRegs)
@@ -832,71 +991,10 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         }
         g_b_bad_args += hv(3) != dc.primType || hv(4) != dc.indexCount || (dc.indexed && (hv(5) & 0x1FFFFFFF) != (dc.indexGuestAddr & 0x1FFFFFFF));
     }
-    fa::gpu::DirectDraw rec;
-    rec.seq = g_dd_seq++;
-    rec.packetAddr = dc.packetAddr;
-    rec.primType = dc.primType;
-    rec.indexCount = dc.indexCount;
-    rec.indexAddr = dc.indexed ? dc.indexGuestAddr : 0;
-    rec.index32 = dc.index32;
-    rec.indexEndian = uint8_t(dc.indexEndian);
+    uint32_t hdrw[kRecHdr];
+    for (uint32_t i = 0; i < kRecHdr; i++) hdrw[i] = hv(i);
+    if (!send_direct(dc, regs, backend, g_cur, g_blk_dirty, g_rep_dirty, hdrw)) return false;
     if (!dc.indexed) g_b_nonidx++;
-    rec.vsObj = hv(6); rec.vsUcode = hv(7); rec.vsBytes = hv(8);
-    rec.psObj = hv(9); rec.psUcode = hv(10); rec.psBytes = hv(11);
-    rec.declObj = hv(12);
-    rec.tileRows = regs.tileRows;
-    // Payload: runs inside the dirty blocks that differ from what the backend has (everything after a refusal).
-    g_b_payload.clear();
-    auto emit = [&](uint32_t i, uint32_t j) {
-        fa::gpu::DirectRegRun run{i, j - i};
-        const size_t o = g_b_payload.size();
-        g_b_payload.resize(o + sizeof run + run.count * 4);
-        std::memcpy(g_b_payload.data() + o, &run, sizeof run);
-        std::memcpy(g_b_payload.data() + o + sizeof run, g_cur + i, run.count * 4);
-        g_b_dwords += run.count;
-    };
-    if (!g_sent_valid) {
-        emit(0x2000, 0x2400);
-        emit(0x4000, kImg);
-    } else {
-        for (uint32_t wd = 0; wd < sizeof g_blk_dirty / 8; wd++) {
-            uint64_t m = g_blk_dirty[wd];
-            while (m) {
-                const uint32_t b = wd * 64 + __builtin_ctzll(m);
-                m &= m - 1;
-                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
-                for (uint32_t i = lo; i < hi;) {
-                    if (g_cur[i] == g_sent[i]) { i++; continue; }
-                    uint32_t j = i;
-                    while (j < hi && g_cur[j] != g_sent[j]) j++;
-                    emit(i, j);
-                    i = j;
-                }
-            }
-        }
-    }
-    rec.payloadBytes = uint32_t(g_b_payload.size());
-    if (!backend.DrawDirect(rec, g_b_payload.data())) {
-        g_b_refused++;
-        g_sent_valid = false;
-        return false;
-    }
-    if (!g_sent_valid) {
-        std::memcpy(g_sent + 0x2000, g_cur + 0x2000, 0x400 * 4);
-        std::memcpy(g_sent + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
-        g_sent_valid = true;
-    } else {
-        for (uint32_t wd = 0; wd < sizeof g_blk_dirty / 8; wd++) {
-            uint64_t m = g_blk_dirty[wd];
-            while (m) {
-                const uint32_t b = wd * 64 + __builtin_ctzll(m);
-                m &= m - 1;
-                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
-                std::memcpy(g_sent + lo, g_cur + lo, (hi - lo) * 4);
-            }
-        }
-    }
-    std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
     if ((g_direct & 64) || g_tap_report) {
         if (g_b_drawn.size() > 65536) g_b_drawn.clear();
         g_b_drawn[dc.packetAddr] = {g_swaps_a.load(std::memory_order_relaxed), regs[0x2000], regs[0x2001], regs[0x2002], regs[0x2080], dc.ibBase, dc.tile,
@@ -1277,6 +1375,15 @@ void direct_tap_frame_end() {
             std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
                          (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
+        std::fprintf(stderr, "[direct] stage B replays: segments stored %llu (packets kept %zu), draws without a record with a segment %llu (replay runs %llu), without %llu, drawn from the replay %llu\n",
+                     (unsigned long long)g_rpl_stored, g_replay.size(), (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
+                     (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
+        if (g_tap_report) {
+            std::fprintf(stderr, "[direct] stage B replay check: compared %llu, image differs from CP %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
+                         (unsigned long long)g_rpl_cmp, (unsigned long long)g_rpl_diff);
+            for (size_t i = 0; i < sizeof kGSegs / sizeof kGSegs[0]; i++) std::fprintf(stderr, " %llu", (unsigned long long)g_rpl_diff_seg[i]);
+            std::fprintf(stderr, "\n");
+        }
         if (g_tap_report)
             std::fprintf(stderr, "[direct] draws without a record, where: in an indirect buffer %llu (never drawn: %llu), same buffer as before %llu, first draw was recording variant %llu | tile now -1:%llu 0:%llu 1:%llu 2+:%llu | tile at first draw -1:%llu 0:%llu 1:%llu 2+:%llu\n",
                          (unsigned long long)g_rp_in_ib, (unsigned long long)g_rp_never_in_ib, (unsigned long long)g_rp_same_ib, (unsigned long long)g_rp_first_rec,
