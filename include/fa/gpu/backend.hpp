@@ -93,6 +93,9 @@ public:
     // The command processor ran out of commands or is blocked waiting: a good moment to hand
     // recorded work to the GPU and apply finished writes.
     virtual void Idle() {}
+    // An interrupt follows: every write deferred with WriteWhenDone must be in guest memory before the
+    // game's interrupt handler runs (it reads the fences and scratch registers the stream wrote).
+    virtual void Drain() {}
     // Direct draw record: applies the payload to the backend's own register state and draws with it.
     // Returns false when the backend cannot draw records (the caller falls back to the command stream).
     virtual bool DrawDirect(const DirectDraw& draw, const uint8_t* payload) { (void)draw; (void)payload; return false; }

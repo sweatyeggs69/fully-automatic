@@ -351,6 +351,32 @@ int main() {
         std::printf("  fence written after %d idle polls, swap writeback (60,60) = %02x %02x %02x %02x\n", polls, p[0], p[1], p[2], p[3]);
     }
 
+    // An interrupt after a fence: the handler sees the fence in memory (with frames in flight the
+    // fence is deferred, so the command processor drains the backend before the handler runs).
+    {
+        const uint32_t fenceAddr = 0x284000;
+        mem.Write32(fenceAddr, 0);
+        uint32_t seen = 0;
+        int calls = 0;
+        cp.SetInterruptHandler([&](uint32_t) { seen = mem.Read32(fenceAddr); calls++; });
+        Stream q{mem, ring, ringBytes / 4, cp.ReadPtr()};
+        q.shader(0, xasm::ColorVS());
+        q.shader(1, xasm::ColorPS());
+        q.vfetch0(vb, 21);
+        q.draw(xe::kPrimTriangleList, 3);
+        q.put(T3(pm4::kEventWriteShd, 3));
+        q.put(0);
+        q.put(fenceAddr);
+        q.put(0x5678);
+        q.put(T3(pm4::kInterrupt, 1));
+        q.put(1);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        CHECK(calls == 1 && seen == 0x5678);
+        std::printf("  interrupt handler saw fence %08x\n", seen);
+        cp.SetInterruptHandler(nullptr);
+    }
+
     // Tile replay: a frame drawn in two 32-row tiles (predicated tiling, window offset per tile),
     // each resolved to its band of a 128x64 destination. With tile once (the default) the second frame
     // draws the first tile at full height and skips the second; the destination must match.
