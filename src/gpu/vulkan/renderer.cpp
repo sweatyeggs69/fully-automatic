@@ -3951,6 +3951,7 @@ struct VulkanRenderer::Impl {
         dc.psDwords = uint32_t(ps->ucode.size());
         dc.psHash = ps->hash;
         Draw(dc, directRegs);
+        if (next) next->Draw(dc, directRegs);  // the chained backend counts draws as it does for Draw
         return true;
     }
 
