@@ -374,12 +374,14 @@ struct XmaDecoder::Context {
         uint32_t space = cap - used;
         const uint32_t frame_bytes = kSamplesPerFrame * 2 * uint32_t(channels);
         if (used == 0 && primed) st_drained_.fetch_add(1, std::memory_order_relaxed);
-        // FA_XMA_GAP=1: never fill the ring completely, so a full ring never reads as read == write.
+        // Never fill the ring completely: a full ring reads as read == write, the same as an empty
+        // one, and the next pass after the game re-validates it would overwrite samples the game
+        // had not read yet (run 128: "full" 800 to 1900 per 10 s and a buzz). FA_XMA_GAP=0 fills it.
         static const bool keep_gap = [] {
             const char* e = std::getenv("FA_XMA_GAP");
-            return e && *e && *e != '0';
+            return !(e && *e == '0');
         }();
-        const uint32_t reserve = keep_gap ? frame_bytes : 0;
+        const uint32_t reserve = keep_gap && cap >= 2 * frame_bytes ? frame_bytes : 0;
 
         float pcm0[kSamplesPerFrame], pcm1[kSamplesPerFrame];
         float* pcm[2] = {pcm0, pcm1};
