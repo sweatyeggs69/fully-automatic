@@ -3916,6 +3916,7 @@ struct VulkanRenderer::Impl {
         e.hash = HashUcode(e.ucode.data(), n) ^ (uint64_t(type) << 63);  // the command processor's scheme
         e.frame = frame;
         stats.directShaderReads++;
+        prof::Add(prof::kDirectShaderReads, 1);
         return &e;
     }
 
@@ -3928,6 +3929,7 @@ struct VulkanRenderer::Impl {
             std::memcpy(&directRegs.r[run.first], payload + off, size_t(run.count) * 4);
             off += run.count * 4;
             stats.directRegs += run.count;
+            prof::Add(prof::kDirectRegs, run.count);
             // Float constant blocks of 64 dwords that changed (the renderer uploads only those).
             const uint32_t a0 = std::max(run.first, pm4::kAluConstBase), a1 = std::min(run.first + run.count, pm4::kAluConstBase + 2048u);
             for (uint32_t b = (a0 - pm4::kAluConstBase) >> 6; a0 < a1 && b <= (a1 - 1 - pm4::kAluConstBase) >> 6; b++) directRegs.aluDirty |= 1u << b;
@@ -3936,6 +3938,7 @@ struct VulkanRenderer::Impl {
         const DirectShader* vs = DirectUcode(d.vsUcode, d.vsBytes, 0);
         const DirectShader* ps = DirectUcode(d.psUcode, d.psBytes, 1);
         stats.directDraws++;
+        prof::Add(prof::kDirectDraws, 1);
         if (!vs || !ps) { stats.drawsSkipped++; return true; }
         DrawCall dc;
         dc.primType = d.primType;
