@@ -9,6 +9,10 @@ namespace fa::gpu {
 
 // Diagnostics: called with the guest address and dword count of every indirect buffer the ring points at.
 inline void (*g_indirect_buffer_observer)(uint32_t addr, uint32_t dwords) = nullptr;
+// Direct hooks (stage C3): when set, every register write stores an increasing sequence number per register, so the
+// hooks can tell whether the stream or a game record set a register last.
+inline uint64_t* g_reg_seq = nullptr;
+inline uint64_t g_reg_seq_now = 0;
 // Diagnostics: called for every draw (not resolves) just before the backend sees it.
 inline void (*g_draw_observer)(const DrawCall& draw, const RegisterFile& regs) = nullptr;
 // Direct hooks (runtime/src/direct_tap.cpp, FA_DIRECT): called right before the backend draws, may replace
