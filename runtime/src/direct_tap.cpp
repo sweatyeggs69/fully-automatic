@@ -40,6 +40,8 @@ std::atomic<uint64_t> g_dsh_null[2]{}, g_dsh_bad[2]{};
 std::unordered_set<uint32_t> g_dsh_objs[2], g_dsh_seen[2];
 std::unordered_set<uint64_t> g_dsh_code[2];
 int g_dsh_samples[2] = {0, 0};
+int g_dsh_hs = 0;
+std::unordered_set<uint32_t> g_dsh_hseen;
 std::atomic<uint64_t> g_sh_calls[2]{};
 std::unordered_set<uint32_t> g_sh_objs;
 std::unordered_set<uint64_t> g_sh_code;
@@ -269,7 +271,21 @@ static void tap_draw_shaders(const uint8_t* base, uint32_t dev) {
         const uint32_t obj = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev + kOffs[k]));
         if (!obj) { g_dsh_null[k].fetch_add(1, std::memory_order_relaxed); continue; }
         if (k == 1) {
-            // Slot 1 is not a shader object with the slot 0 layout (code pointer at +0x28 reads 0). Dump raw dwords only.
+            // Slot 1 is the pixel shader object: microcode pointer at +0x0C, byte size at +0x3C (82148100).
+            {
+                const uint32_t pcode = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x0C));
+                const uint32_t psize = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x3C));
+                const bool pok = psize && psize < 65536 && (psize & 3) == 0 && pcode >= 0x10000;
+                uint64_t ph = 1469598103934665603ull ^ psize;
+                if (pok) for (uint32_t i = 0; i < psize; i++) ph = (ph ^ base[pcode + i]) * 1099511628211ull;
+                else g_dsh_bad[1].fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lk(g_sh_mu);
+                g_dsh_code[1].insert(ph);
+                if (g_dsh_hs < 4 && g_dsh_hseen.insert(obj).second) {
+                    g_dsh_hs++;
+                    std::fprintf(stderr, "[tap] draw slot1 ps microcode: obj %08x code %08x size %u hash %016llx\n", obj, pcode, psize, (unsigned long long)ph);
+                }
+            }
             std::lock_guard<std::mutex> lk(g_sh_mu);
             g_dsh_objs[1].insert(obj);
             if (g_dsh_samples[1] < 4 && g_dsh_seen[1].insert(obj).second) {
