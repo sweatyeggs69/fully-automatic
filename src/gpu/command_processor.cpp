@@ -119,6 +119,7 @@ void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
         tileSurface_ = regs_[xe::RB_SURFACE_INFO];
     }
     regs_[reg] = value;
+    if (g_reg_seq) g_reg_seq[reg] = ++g_reg_seq_now;
     if (reg - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((reg - pm4::kAluConstBase) >> 6);
     // Scratch registers are mirrored to memory (SCRATCH_ADDR + 4 * i) when their SCRATCH_UMSK bit
     // is set. D3D's fences are written this way.
@@ -292,7 +293,10 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             uint32_t andMask = (d[0] & 0x80000000u) ? (d[1] < kRegisterCount ? regs_[d[1] & 0x1FFF] : 0) : d[1];
             uint32_t orMask = (d[0] & 0x40000000u) ? (d[2] < kRegisterCount ? regs_[d[2] & 0x1FFF] : 0) : d[2];
             uint32_t dst = d[0] & 0x1FFF;
-            if (dst < kRegisterCount) regs_[dst] = (regs_[dst] & andMask) | orMask;
+            if (dst < kRegisterCount) {
+                regs_[dst] = (regs_[dst] & andMask) | orMask;
+                if (g_reg_seq) g_reg_seq[dst] = ++g_reg_seq_now;
+            }
             if (dst - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((dst - pm4::kAluConstBase) >> 6);
             break;
         }

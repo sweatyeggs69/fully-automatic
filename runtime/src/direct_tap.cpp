@@ -709,6 +709,7 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
 // CP thread state for the queue path.
 constexpr uint32_t kImg = 0x4928, kBlocks = (kImg + 15) / 16;
 uint32_t g_cur[kImg], g_sent[kImg];
+uint64_t g_cur_seq[kImg];  // CP register sequence number when g_cur[reg] was last set (stage C3 fallbacks)
 uint64_t g_blk_dirty[(kBlocks + 63) / 64];
 bool g_cur_init = false, g_sent_valid = false;
 uint64_t g_b_flushed = 0, g_b_nonidx = 0, g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
@@ -937,6 +938,7 @@ uint64_t apply_state_head() {
         for (uint32_t i = kRecHdr; i < len;) {
             const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
             for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            if (fa::gpu::g_reg_seq) for (uint32_t k = 0; k < cnt; k++) g_cur_seq[first + k] = fa::gpu::g_reg_seq_now;
             for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
             i += 2 + cnt;
         }
@@ -1014,6 +1016,7 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         for (uint32_t i = kRecHdr; i < len;) {
             const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
             for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            if (fa::gpu::g_reg_seq) for (uint32_t k = 0; k < cnt; k++) g_cur_seq[first + k] = fa::gpu::g_reg_seq_now;
             for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
             i += 2 + cnt;
         }
@@ -1119,6 +1122,7 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
         for (uint32_t i = kRecHdr; i < len;) {
             const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
             for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            if (fa::gpu::g_reg_seq) for (uint32_t k = 0; k < cnt; k++) g_cur_seq[first + k] = fa::gpu::g_reg_seq_now;
             for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
             i += 2 + cnt;
         }
@@ -1171,15 +1175,25 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
 // the CP still draws or resolves itself (inline-index draws, draws without a record or chain, resolves without a
 // complete record) gets the record image overlaid on its registers instead of the CP's now stale ones.
 thread_local int t_flush_depth = 0, t_resolve_depth = 0, t_draw_depth = 0;
-inline bool c3_skip() { return (g_direct & 256) && t_flush_depth > 0 && t_resolve_depth == 0; }
+// Only flushes inside the draw hooks are skipped: those draws all have records. A flush outside them (run 137/138:
+// about one draw per menu frame no draw hook sees) still writes its state, so the CP draws that draw with the state
+// its own flush set, in stream order with the stream's other writes (state-only records applied at the CP draw
+// came after those writes and overwrote them: the menu stayed invisible in run 138).
+inline bool c3_skip() { return (g_direct & 256) && t_flush_depth > 0 && t_draw_depth > 0 && t_resolve_depth == 0; }
 inline bool c3_skip_outer() { return (g_direct & 256) && t_flush_depth == 0 && t_resolve_depth == 0; }
 uint64_t g_c3_skipped = 0, g_c3_draws = 0, g_c3_resolves = 0, g_c3_state_recs = 0, g_c3_state_applied = 0;  // skipped writer calls (game thread), CP fallbacks
 
-void overlay_image(fa::gpu::RegisterFile& rf, std::initializer_list<uint32_t> keep_cp, const fa::gpu::RegisterFile& regs) {
-    std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
-    std::memcpy(rf.r.data() + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
+// The image where a game record set a register after the stream last wrote it, the CP's value where the stream
+// wrote it later (run 138: the menu's CP-drawn draws lost their own directly written state, such as fetch constants,
+// when the whole image was laid over the CP's registers).
+void overlay_image(fa::gpu::RegisterFile& rf, const fa::gpu::RegisterFile& regs) {
+    const uint64_t* cs = fa::gpu::g_reg_seq;
+    auto lay = [&](uint32_t lo, uint32_t hi) {
+        for (uint32_t reg = lo; reg < hi; reg++) rf[reg] = (cs && cs[reg] > g_cur_seq[reg]) ? regs[reg] : g_cur[reg];
+    };
+    lay(0x2000, 0x2400);
+    lay(0x4000, kImg);
     for (uint32_t reg : kCpRegs) rf[reg] = regs[reg];
-    for (uint32_t reg : keep_cp) rf[reg] = regs[reg];
     rf.aluDirty = ~0u;
     rf.tileRows = regs.tileRows;
 }
@@ -1190,7 +1204,7 @@ bool direct_draw_c3(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& re
     if (g_last_nomatch) g_c3_state_applied += apply_state_head();
     static fa::gpu::RegisterFile rf;
     rf = regs;
-    overlay_image(rf, {}, regs);
+    overlay_image(rf, regs);
     backend.Draw(dc, rf);
     g_c3_draws++;
     return true;
@@ -1202,7 +1216,7 @@ bool direct_resolve_c3(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     // The resolve's own output (copy setup, RB_MODECONTROL, the rectangle's fetch constant) still reaches the CP.
     static fa::gpu::RegisterFile rf;
     rf = regs;
-    overlay_image(rf, {0x2208, 0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801}, regs);
+    overlay_image(rf, regs);
     backend.Resolve(rf);
     g_c3_resolves++;
     return true;
@@ -1421,20 +1435,9 @@ PPC_FUNC(sub_82148508) {
         apply_pending_locked(base);
         g_flushes++;
     }
-    const bool c3 = c3_skip_outer();
     t_flush_depth++;
     __imp__sub_82148508(ctx, base);
     t_flush_depth--;
-    // A flush outside the draw hooks (run 137: about one draw per menu frame that no draw hook sees, drawn by the CP)
-    // no longer reaches the CP's registers: queue its state as a record the CP applies before drawing such a draw.
-    if (c3 && (g_direct & 8) && t_draw_depth == 0) {
-        {
-            std::lock_guard<std::mutex> lk(g_set_mu);
-            apply_pending_locked(base);
-        }
-        push_record(base, ctx.r3.u32, DrawArgs{}, true, true);
-        g_c3_state_recs++;
-    }
 }
 
 // Stage C3 writers: skipped inside the flush (see c3_skip).
@@ -1511,6 +1514,7 @@ void direct_tap_frame_end() {
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
     if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
     if ((g_direct & 8) && !fa::gpu::g_direct_resolve) fa::gpu::g_direct_resolve = direct_resolve_c3;
+    if ((g_direct & 256) && !fa::gpu::g_reg_seq) fa::gpu::g_reg_seq = new uint64_t[fa::gpu::kRegisterCount]();
     if ((g_direct & 8) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw_c3;
     else if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
