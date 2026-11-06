@@ -21,6 +21,7 @@
 #include "fa/gpu/command_processor.hpp"
 #include "fa/gpu/xenos.hpp"
 #include "fa/rt/import.hpp"
+#include "fa/rt/memory.hpp"
 
 namespace fa::rt { uint64_t gpu_predicated_skips(); }
 
@@ -599,7 +600,8 @@ uint64_t g_blk_dirty[(kBlocks + 63) / 64];
 bool g_cur_init = false, g_sent_valid = false;
 uint64_t g_b_nonidx = 0, g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
 uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args = 0;
-int g_b_printed = 0;
+int g_b_printed = 0, g_b_sh_printed = 0;
+uint64_t g_b_bad_sh[2][2];  // [vs/ps][indexed/non-indexed]
 std::vector<uint8_t> g_b_payload;
 
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
@@ -661,6 +663,23 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
             si++;
         }
         g_b_diff_draws += any;
+        // Shader identity: the game's microcode (object pointers at draw time) against what the CP loaded.
+        for (int t = 0; t < 2; t++) {
+            const uint32_t addr = hv(t ? 10 : 7), bytes = hv(t ? 11 : 8);
+            const uint32_t* cpu = t ? dc.psUcode : dc.vsUcode;
+            const uint32_t cpn = t ? dc.psDwords : dc.vsDwords;
+            uint32_t g = addr < 0x20000000 ? addr + 0xA0000000u : addr >= 0xC0000000u ? (0xA0000000u | (addr & 0x1FFFFFFFu)) : addr;
+            bool same = cpu && bytes / 4 == cpn && bytes && fa::rt::g_mem.is_committed(g) && fa::rt::g_mem.is_committed(g + bytes - 1);
+            for (uint32_t i = 0; same && i < cpn; i++) same = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(fa::rt::host(g + i * 4))) == cpu[i];
+            if (!same) {
+                g_b_bad_sh[t][dc.indexed ? 0 : 1]++;
+                if (g_b_sh_printed < 8) {
+                    g_b_sh_printed++;
+                    std::fprintf(stderr, "[direct] queue %s shader differs (%s draw, packet %08x): game ucode %08x bytes %u, CP dwords %u first %08x\n", t ? "ps" : "vs",
+                                 dc.indexed ? "indexed" : "non-indexed", dc.packetAddr, addr, bytes, cpn, cpu && cpn ? cpu[0] : 0);
+                }
+            }
+        }
         g_b_bad_args += hv(3) != dc.primType || hv(4) != dc.indexCount || (dc.indexed && (hv(5) & 0x1FFFFFFF) != (dc.indexGuestAddr & 0x1FFFFFFF));
     }
     fa::gpu::DirectDraw rec;
@@ -1020,7 +1039,8 @@ void direct_tap_frame_end() {
             std::fprintf(stderr, "[direct] stage B check: draws %llu, image differs from CP %llu, args differ %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
                          (unsigned long long)g_b_cmp_draws, (unsigned long long)g_b_diff_draws, (unsigned long long)g_b_bad_args);
             for (size_t i = 0; i < sizeof kGSegs / sizeof kGSegs[0]; i++) std::fprintf(stderr, " %llu", (unsigned long long)g_b_diff_seg[i]);
-            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, " | shader differs: vs indexed %llu non-indexed %llu, ps indexed %llu non-indexed %llu\n",
+                         (unsigned long long)g_b_bad_sh[0][0], (unsigned long long)g_b_bad_sh[0][1], (unsigned long long)g_b_bad_sh[1][0], (unsigned long long)g_b_bad_sh[1][1]);
         }
     }
     if (!g_tap_report || g_swaps % 300) return;
