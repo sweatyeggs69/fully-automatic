@@ -601,6 +601,13 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool inde
 // read of the game's own output, not the CP) and queues them in order with the draw records. Key: the copy-mode draw
 // packet inside that output, which is what the CP resolves on.
 uint64_t g_rs_pushed = 0, g_rs_wrapped = 0, g_rs_nodraw = 0;  // game thread
+// Registers every copy writes in its own output: copy control, destination base, pitch and info, and the copy
+// rectangle's vertex fetch constant. A record missing any of them did not see the whole copy (run 121 packet 012cd3e0:
+// 2318..231b came from an older pass and 2319 read 0000ffff; packet 010ffe80: 4800/4801 from another draw), which
+// resolves the wrong surface or rectangle: the multicolour flash, gone with FA_DIRECT unset (run 124). The CP resolves
+// those.
+constexpr uint32_t kCopyRegs[] = {0x2318, 0x2319, 0x231A, 0x231B, 0x4800, 0x4801};
+uint64_t g_rs_incomplete = 0, g_rs_miss[6];  // game thread
 std::vector<std::pair<uint32_t, uint32_t>> g_rs_writes;       // game thread
 
 void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
@@ -652,9 +659,16 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
         }
     }
     if (key == 0xFFFFFFFFu) { g_rs_nodraw++; return; }
+    bool complete = destAt != 0;
+    for (size_t ci = 0; ci < sizeof kCopyRegs / sizeof kCopyRegs[0]; ci++) {
+        bool seen = false;
+        for (const auto& wr : g_rs_writes) if (wr.first == kCopyRegs[ci]) { seen = true; break; }
+        if (!seen) { g_rs_miss[ci]++; complete = false; }
+    }
+    if (!complete) g_rs_incomplete++;
     std::vector<uint32_t>& r = g_rec_buf;
     r.assign(kRecHdr, 0);
-    r[1] = 2;  // resolve
+    r[1] = complete ? 2 | 4 : 2;  // resolve; bit 2: the output held every copy register
     r[2] = key;
     r[3] = prim;
     r[4] = count;
@@ -886,7 +900,7 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
 
 // CP resolve (copy-mode draw): consume records up to the resolve record of this packet; with FA_TAP=1 compare the
 // image with the CP's registers the resolve reads; with FA_DIRECT bit 5 (32) resolve from the image.
-uint64_t g_rb_notcopy = 0, g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[32];
+uint64_t g_rb_incomplete = 0, g_rb_notcopy = 0, g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[32];
 int g_rb_printed = 0;
 constexpr uint32_t kResolveRegs[] = {0x2000, 0x2001, 0x2002, 0x2080, 0x2081, 0x2082, 0x2205, 0x2208, 0x2302,
                                      0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801};
@@ -940,6 +954,7 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
     // A record that does not describe a copy cannot be this resolve (run 116: 12 of 160,557 resolves had
     // RB_MODECONTROL 4 in the record against 6 in the CP, with other state from a different pass): leave it to the CP.
     if ((g_cur[0x2208] & 7) != 6) { g_rb_notcopy++; return false; }
+    if (!(g_q[(match + 1) & kQMask] & 4)) { g_rb_incomplete++; return false; }
     static fa::gpu::RegisterFile rf;
     rf = regs;  // registers no record covers yet keep the CP's values
     std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
@@ -1245,9 +1260,11 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
                      (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_repeats, (unsigned long long)g_b_dwords);
-        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, record not a copy %llu, resolved from the record %llu\n",
+        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, record not a copy %llu, record incomplete %llu, resolved from the record %llu | incomplete records %llu (missing 2318:%llu 2319:%llu 231a:%llu 231b:%llu 4800:%llu 4801:%llu)\n",
                      (unsigned long long)g_rs_pushed, (unsigned long long)g_rs_wrapped, (unsigned long long)g_rs_nodraw,
-                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_notcopy, (unsigned long long)g_rb_direct);
+                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_notcopy, (unsigned long long)g_rb_incomplete, (unsigned long long)g_rb_direct,
+                     (unsigned long long)g_rs_incomplete, (unsigned long long)g_rs_miss[0], (unsigned long long)g_rs_miss[1], (unsigned long long)g_rs_miss[2],
+                     (unsigned long long)g_rs_miss[3], (unsigned long long)g_rs_miss[4], (unsigned long long)g_rs_miss[5]);
         if (g_tap_report)
             std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
