@@ -92,11 +92,12 @@ struct HashSets { std::unordered_set<uint64_t> vs, ps, tex; };
 // DRAW_INDX packet the game just wrote (the last 5 dwords before the device's write pointer); the CP looks it
 // up by DrawCall::packetAddr, which is also correct for tile replays and indirect buffers.
 // Render state register windows in the device shadow (from the dirty-state flush, notes/d3d-map.md): shadow offset,
-// first register, dword count (counts inferred from the distance to the next window; the last is a guess).
+// first register, dword count. Run 95: with these sizes every register matched the CP except 0x2208 (RB_MODECONTROL,
+// also written straight into the stream by 82147D18 and resolves), 0x2011 and 0x2388 (rare); those keep their PM4 value.
 struct StWin { uint32_t off, reg, n; };
-constexpr StWin kStWins[] = {{0x2CC0, 0x2000, 19}, {0x2D0C, 0x2100, 21}, {0x2D60, 0x2180, 5}, {0x2D74, 0x2200, 12},
-                             {0x2DA4, 0x2280, 21}, {0x2DF8, 0x2300, 38}, {0x2E90, 0x2380, 16}};
-constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;
+constexpr StWin kStWins[] = {{0x2CC0, 0x2000, 18}, {0x2D0C, 0x2100, 21}, {0x2D60, 0x2180, 5}, {0x2D74, 0x2200, 12},
+                             {0x2DA4, 0x2280, 21}, {0x2DF8, 0x2300, 38}, {0x2E90, 0x2380, 9}};
+constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;  // covers all windows
 struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords]; };
 uint64_t g_st_mis[0x400], g_st_cmp = 0;
 int g_st_printed = 0;
@@ -237,41 +238,61 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
 // FA_DIRECT bit 0: the command processor takes the draw's constants from the game's device shadow. Per-object
 // vec4s the game writes straight into the command stream (g_touched) are not in the shadow and keep their PM4 value.
 void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
-    if (!(g_direct & 1) || !dc.indexed) return;
+    if (!(g_direct & 3) || !dc.indexed) return;
     std::lock_guard<std::mutex> lk(g_snap_mu);
     const Snap* sn = lookup_snap_locked(dc.packetAddr);
     g_feed_draws++;
     if (!sn) { g_feed_missing++; return; }
-    const uint32_t rb[2] = {kRegVs, kRegPs};
-    const uint32_t* src[2] = {sn->vs, sn->ps};
-    for (int k = 0; k < 2; k++) {
-        for (uint32_t i = 0; i < 1024; i++) {
-            if (touched(k * 256 + (i >> 2))) continue;
-            uint32_t& dst = regs[rb[k] + i];
-            if (dst != src[k][i]) {
+    if (g_direct & 1) {
+        const uint32_t rb[2] = {kRegVs, kRegPs};
+        const uint32_t* src[2] = {sn->vs, sn->ps};
+        for (int k = 0; k < 2; k++) {
+            for (uint32_t i = 0; i < 1024; i++) {
+                if (touched(k * 256 + (i >> 2))) continue;
+                uint32_t& dst = regs[rb[k] + i];
+                if (dst != src[k][i]) {
+                    if (g_feed_printed < 16) {
+                        g_feed_printed++;
+                        std::fprintf(stderr, "[direct] differs: %s const reg %04x pm4 %08x game %08x (packet %08x, vec4 %u)\n", k ? "ps" : "vs",
+                                     rb[k] + i, dst, src[k][i], dc.packetAddr, k * 256 + (i >> 2));
+                    }
+                    dst = src[k][i];
+                    regs.aluDirty |= 1u << ((k * 1024 + i) >> 6);
+                    g_feed_changed++;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < kTexDwords; i++) {
+            uint32_t& dst = regs[kRegTex + i];
+            if (dst != sn->tex[i]) {
                 if (g_feed_printed < 16) {
                     g_feed_printed++;
-                    std::fprintf(stderr, "[direct] differs: %s const reg %04x pm4 %08x game %08x (packet %08x, vec4 %u)\n", k ? "ps" : "vs",
-                                 rb[k] + i, dst, src[k][i], dc.packetAddr, k * 256 + (i >> 2));
+                    std::fprintf(stderr, "[direct] differs: fetch reg %04x pm4 %08x game %08x (packet %08x)\n", kRegTex + i, dst, sn->tex[i], dc.packetAddr);
                 }
-                dst = src[k][i];
-                regs.aluDirty |= 1u << ((k * 1024 + i) >> 6);
+                dst = sn->tex[i];
                 g_feed_changed++;
             }
         }
     }
-    for (uint32_t i = 0; i < kTexDwords; i++) {
-        uint32_t& dst = regs[kRegTex + i];
-        if (dst != sn->tex[i]) {
-            if (g_feed_printed < 16) {
-                g_feed_printed++;
-                std::fprintf(stderr, "[direct] differs: fetch reg %04x pm4 %08x game %08x (packet %08x)\n", kRegTex + i, dst, sn->tex[i], dc.packetAddr);
-            }
-            dst = sn->tex[i];
-            g_feed_changed++;
-        }
-    }
     g_feed_dwords += 2048 + kTexDwords;
+    if (g_direct & 2) {
+        // FA_DIRECT bit 1: render-state register windows from the shadow, except the ones the game also writes directly.
+        for (const StWin& w : kStWins)
+            for (uint32_t j = 0; j < w.n; j++) {
+                const uint32_t reg = w.reg + j;
+                if (reg == 0x2208 || reg == 0x2011 || reg == 0x2388) continue;
+                uint32_t& dst = regs[reg];
+                const uint32_t v = sn->st[(w.off - kStBase) / 4 + j];
+                if (dst != v) {
+                    if (g_feed_printed < 16) {
+                        g_feed_printed++;
+                        std::fprintf(stderr, "[direct] differs: state reg %04x pm4 %08x game %08x (packet %08x)\n", reg, dst, v, dc.packetAddr);
+                    }
+                    dst = v;
+                    g_feed_changed++;
+                }
+            }
+    }
 }
 
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
@@ -449,7 +470,7 @@ namespace fa::rt {
 void direct_tap_frame_end() {
     if (!g_on) return;
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
-    if ((g_direct & 1) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
+    if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(g_par_mu);
