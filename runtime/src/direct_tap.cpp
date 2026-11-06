@@ -111,7 +111,7 @@ uint32_t g_mirror[2048];               // under g_set_mu
 uint64_t g_mirror_valid[8];            // vec4 bits ever written by a block (under g_set_mu)
 DrawArgs g_cur_args{};
 uint64_t g_cur_own[4];                 // vec4s written by blocks issued since the previous draw (draw thread)
-uint64_t g_own_cmp = 0, g_own_diff = 0;                 // set by the draw hook for snapshot_draw (game draw thread)
+uint64_t g_own_cmp = 0, g_own_diff = 0, g_rule_cmp = 0, g_rule_diff = 0;                 // set by the draw hook for snapshot_draw (game draw thread)
 uint64_t g_rec_cmp = 0, g_rec_bad_prim = 0, g_rec_bad_count = 0, g_rec_bad_addr = 0, g_mir_cmp = 0, g_mir_diff = 0;
 int g_rec_printed = 0, g_mir_printed = 0;
 uint64_t g_mir_vec[256];
@@ -251,6 +251,13 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs, const fa::gp
             for (uint32_t j = 0; j < 4; j++) same &= sn->mir[v * 4 + j] == regs[0x4000 + v * 4 + j];
             const bool own = sn->own[v >> 6] >> (v & 63) & 1;
             if (own) { g_own_cmp++; g_own_diff += !same; }
+            else {
+                // Record rule for vec4s this draw's blocks did not write: take the shadow value.
+                bool sh = true;
+                for (uint32_t j = 0; j < 4; j++) sh &= sn->vs[v * 4 + j] == regs[0x4000 + v * 4 + j];
+                g_rule_cmp++;
+                g_rule_diff += !sh;
+            }
             if (!same) {
                 g_mir_diff++;
                 g_mir_vec[v]++;
@@ -618,6 +625,7 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_rec_cmp, (unsigned long long)g_rec_bad_prim, (unsigned long long)g_rec_bad_count, (unsigned long long)g_rec_bad_addr,
                      (unsigned long long)g_mir_cmp, (unsigned long long)g_mir_diff);
         std::fprintf(stderr, "[tap]   vec4s written by the draw's own blocks: compared %llu, differ %llu\n", (unsigned long long)g_own_cmp, (unsigned long long)g_own_diff);
+        std::fprintf(stderr, "[tap]   touched vec4s not written by the draw's own blocks, shadow value vs CP: compared %llu, differ %llu\n", (unsigned long long)g_rule_cmp, (unsigned long long)g_rule_diff);
         std::fprintf(stderr, "[tap]   mirror differences by vec4:");
         for (uint32_t v = 0; v < 256; v++) if (g_mir_vec[v]) std::fprintf(stderr, " %u:%llu", v, (unsigned long long)g_mir_vec[v]);
         std::fprintf(stderr, "\n");
