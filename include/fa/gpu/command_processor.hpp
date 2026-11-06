@@ -68,8 +68,8 @@ private:
     uint64_t binMask_ = 0xFFFFFFFFull, binSelect_ = 0xFFFFFFFFull;
     void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
     // Tile replay. D3D's predicated tiling replays the frame once per screen tile (bin select bits
-    // 2t and 2t + 1 of the high word select tile t, for its two passes). With FA_TILE_ONCE=1 the
-    // first tile is drawn at full frame height and the draws and resolves of the other tiles are
+    // 2t and 2t + 1 of the high word select tile t, for its two passes). By default the
+    // first tile is drawn at full frame height (FA_TILE_ONCE=0 replays all tiles) and the draws and resolves of the other tiles are
     // dropped; every other packet (registers, fences, waits) still runs. The tile height is learnt
     // from the second tile's scissor, so the first tiled frame is drawn the normal way.
     int TileOf() const {

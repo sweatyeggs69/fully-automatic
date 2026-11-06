@@ -113,7 +113,9 @@ int main() {
     }
     std::printf("gpu_render_test: device %s\n", r.DeviceName().c_str());
 
+    setenv("FA_TILE_ONCE", "0", 1);  // the main command processor replays every tile
     CommandProcessor cp(mem, r);
+    unsetenv("FA_TILE_ONCE");
     const uint32_t ring = 0x1000, ringBytes = 0x10000;
     cp.SetRingBuffer(ring, ringBytes);
     Stream s{mem, ring, ringBytes / 4};
@@ -350,7 +352,7 @@ int main() {
     }
 
     // Tile replay: a frame drawn in two 32-row tiles (predicated tiling, window offset per tile),
-    // each resolved to its band of a 128x64 destination. With FA_TILE_ONCE=1 the second frame
+    // each resolved to its band of a 128x64 destination. With tile once (the default) the second frame
     // draws the first tile at full height and skips the second; the destination must match.
     {
         RegisterFile none;
@@ -428,9 +430,7 @@ int main() {
         r.Flush();
         check("tiles", destT[0]);
         // Tile once: the first frame learns the tile height, the second skips the second tile.
-        setenv("FA_TILE_ONCE", "1", 1);
-        CommandProcessor cpT(mem, r);
-        unsetenv("FA_TILE_ONCE");
+        CommandProcessor cpT(mem, r);  // default: tile once
         const uint32_t ring2 = 0x380000;
         cpT.SetRingBuffer(ring2, ringBytes);
         Stream q2{mem, ring2, ringBytes / 4};

@@ -32,7 +32,7 @@ bool Compare(uint32_t fn, uint32_t value, uint32_t ref) {
 
 CommandProcessor::CommandProcessor(GuestMemory& mem, Backend& backend) : mem_(mem), backend_(backend) {
     const char* e = std::getenv("FA_TILE_ONCE");
-    tileOnce_ = e && e[0] == '1';
+    tileOnce_ = !(e && e[0] == '0');  // FA_TILE_ONCE=0 replays every tile
 }
 
 void CommandProcessor::SetRingBuffer(uint32_t baseGuestAddr, uint32_t sizeBytes) {
@@ -415,7 +415,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                 TraceSwap();
                 sawTile0_ = false;
                 ++stats_.swaps;
-                if (tileOnce_ && stats_.swaps % 300 == 0) {
+                if (tileOnce_ && stats_.swaps % 300 == 0 && stats_.tileSkips != tileSkips0_) {
                     std::fprintf(stderr, "[tile] %llu swaps: %llu tile draws/resolves skipped (%.0f per frame since last)\n",
                                  (unsigned long long)stats_.swaps, (unsigned long long)stats_.tileSkips,
                                  double(stats_.tileSkips - tileSkips0_) / 300.0);
