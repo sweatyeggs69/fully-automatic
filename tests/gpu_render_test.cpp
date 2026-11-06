@@ -300,6 +300,24 @@ int main() {
         texDraw();
         CHECK(st.textureUploads == up0 + 1);
         if (on) CHECK(st.textureWwClean == clean0 + 1);
+        // A resolve over the texture's memory in the same frame: the next draw must not reuse the
+        // texture checked earlier this frame (InvalidateTextures finds it by its memory chunk).
+        {
+            const uint64_t up1 = st.textureUploads;
+            q.vfetch0(rectVb, 6);
+            q.reg(xe::RB_COPY_CONTROL, 0);
+            q.reg(xe::RB_COPY_DEST_BASE, tex);
+            q.reg(xe::RB_COPY_DEST_PITCH, (64u << 16) | 128);
+            q.reg(xe::RB_COPY_DEST_INFO, (kFmt8_8_8_8 << 7) | kEndian8in32);
+            q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+            q.draw(xe::kPrimRectangleList, 3);
+            q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+            texDraw();
+            const bool again = st.textureUploads == up1 + 1;
+            if (!again) std::printf("FAIL texture under a resolve: uploads %llu -> %llu\n", (unsigned long long)up1,
+                                    (unsigned long long)st.textureUploads.load());
+            CHECK(again);
+        }
         std::printf("  write watch %s: unchanged texture %s, written texture uploaded again %s\n", on ? "on" : "off",
                     st.textureWwClean > clean0 ? "skipped" : "hashed", st.textureUploads == up0 + 1 ? "yes" : "NO");
     }
@@ -311,7 +329,7 @@ int main() {
         RegisterFile none;
         const uint32_t fenceAddr = 0x280000, dest3 = 0x2C0000;
         mem.Write32(fenceAddr, 0);
-        Stream q{mem, ring, ringBytes / 4, s.w};
+        Stream q{mem, ring, ringBytes / 4, cp.ReadPtr()};
         q.shader(0, xasm::ColorVS());
         q.shader(1, xasm::ColorPS());
         q.reg(xe::PA_CL_VTE_CNTL, 0);

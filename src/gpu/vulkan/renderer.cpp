@@ -401,6 +401,7 @@ struct Texture {
     uint64_t lastFullGen = 0;  // frame of the last full hash
     uint32_t stable = 0;       // consecutive checked frames with unchanged content
     uint32_t guestBase = 0, guestSize = 0;
+    uint32_t idxLo = 0, idxHi = 0;  // the 1 MB chunks it is listed under in texChunks, [idxLo, idxHi)
     uint64_t wwToken = 0;  // write watch token of the bytes last checked (0 = not watched)
     bool ok = false;
 };
@@ -594,10 +595,37 @@ struct VulkanRenderer::Impl {
             if (snapsToo) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; continue; }
             if (const uint8_t* gp = mem.HostPtr(e.base, e.size)) SnapSample(gp, e.size, e.samples);
         }
-        for (auto& [k, t] : textures) {
-            const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
-            if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+        // Only the textures listed under the chunks this range touches (scanning every cached texture took
+        // 1 to 2.7 ms per frame over the race's 79 resolve writes).
+        const uint32_t c0 = uint32_t(lo >> kTexChunkShift), c1 = uint32_t(std::min<uint64_t>((hi + kTexChunkMask) >> kTexChunkShift, kTexChunks));
+        for (uint32_t c = c0; c < c1; c++)
+            for (uint64_t key : texChunks[c]) {
+                auto it = textures.find(key);
+                if (it == textures.end()) continue;
+                Texture& t = it->second;
+                const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
+                if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+            }
+    }
+    // Textures by the 1 MB chunks of guest physical memory they cover, for InvalidateTextures.
+    static constexpr uint32_t kTexChunkShift = 20, kTexChunkMask = (1u << kTexChunkShift) - 1, kTexChunks = 0x20000000u >> kTexChunkShift;
+    std::vector<std::vector<uint64_t>> texChunks = std::vector<std::vector<uint64_t>>(kTexChunks);
+    void TexUnlist(uint64_t key, Texture& t) {
+        for (uint32_t c = t.idxLo; c < t.idxHi; c++) {
+            auto& v = texChunks[c];
+            for (size_t i = 0; i < v.size(); i++)
+                if (v[i] == key) { v[i] = v.back(); v.pop_back(); break; }
         }
+        t.idxLo = t.idxHi = 0;
+    }
+    void TexList(uint64_t key, Texture& t) {
+        const uint64_t lo = t.guestBase & 0x1FFFFFFFu, hi = lo + t.guestSize;
+        const uint32_t c0 = uint32_t(lo >> kTexChunkShift), c1 = uint32_t(std::min<uint64_t>((hi + kTexChunkMask) >> kTexChunkShift, kTexChunks));
+        if (c0 == t.idxLo && c1 == t.idxHi) return;
+        TexUnlist(key, t);
+        for (uint32_t c = c0; c < c1; c++) texChunks[c].push_back(key);
+        t.idxLo = c0;
+        t.idxHi = c1;
     }
 
     // ---- resolved surfaces kept on the GPU ---------------------------------------------------------
@@ -2695,6 +2723,7 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
+        TexList(key, tex);
         if (kBatches > 1 && InFlightWrites(t.base, size)) {
             prof::Add(prof::kFlushTex, 1);
             prof::Scope pw_(prof::kResolveWait);
@@ -4439,6 +4468,7 @@ struct VulkanRenderer::Impl {
                 total -= ImageBytes(it->second.image);
                 garbageImages.push_back(it->second.image);
             }
+            TexUnlist(k, it->second);
             textures.erase(it);
             dropped++;
         }
