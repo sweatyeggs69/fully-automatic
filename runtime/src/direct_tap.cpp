@@ -36,6 +36,10 @@ std::atomic<uint64_t> g_tap2_calls{0}, g_cp_auto_draws{0};
 std::mutex g_sh_mu;
 std::atomic<uint64_t> g_sh_link_calls{0};
 int g_sh_samples = 0;
+std::atomic<uint64_t> g_dsh_null[2]{}, g_dsh_bad[2]{};
+std::unordered_set<uint32_t> g_dsh_objs[2], g_dsh_seen[2];
+std::unordered_set<uint64_t> g_dsh_code[2];
+int g_dsh_samples[2] = {0, 0};
 std::atomic<uint64_t> g_sh_calls[2]{};
 std::unordered_set<uint32_t> g_sh_objs;
 std::unordered_set<uint64_t> g_sh_code;
@@ -258,6 +262,28 @@ static void tap_shader_obj(const uint8_t* base, uint32_t obj, int which) {
     }
 }
 
+// Draw-time shader identity: objects at device+0x3294 and device+0x3290 (see notes/d3d-map.md).
+static void tap_draw_shaders(const uint8_t* base, uint32_t dev) {
+    static const uint32_t kOffs[2] = {0x3294, 0x3290};
+    for (int k = 0; k < 2; k++) {
+        const uint32_t obj = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev + kOffs[k]));
+        if (!obj) { g_dsh_null[k].fetch_add(1, std::memory_order_relaxed); continue; }
+        const uint32_t code = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x28));
+        const uint32_t size = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x258));
+        const bool ok = size && size < 65536 && (size & 3) == 0;
+        uint64_t h = 1469598103934665603ull ^ size;
+        if (ok) for (uint32_t i = 0; i < size; i++) h = (h ^ base[code + i]) * 1099511628211ull;
+        else g_dsh_bad[k].fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_sh_mu);
+        g_dsh_objs[k].insert(obj);
+        g_dsh_code[k].insert(h);
+        if (g_dsh_samples[k] < 4 && g_dsh_seen[k].insert(obj).second) {
+            g_dsh_samples[k]++;
+            std::fprintf(stderr, "[tap] draw shader sample: slot %d obj %08x code %08x size %u hash %016llx\n", k, obj, code, size, (unsigned long long)h);
+        }
+    }
+}
+
 PPC_FUNC(sub_82147BF8) {
     if (g_on) g_sh_calls[ctx.r4.u32 != 0].fetch_add(1, std::memory_order_relaxed);
     __imp__sub_82147BF8(ctx, base);
@@ -287,6 +313,7 @@ PPC_FUNC(sub_82315500) {
     __imp__sub_82315500(ctx, base);
     if (g_on) {
         snapshot_draw(base, dev);
+        tap_draw_shaders(base, dev);
         uint64_t h[3];
         game_hash(base, dev, h);
         std::lock_guard<std::mutex> lk(g_par_mu);
@@ -353,6 +380,13 @@ void direct_tap_frame_end() {
         std::lock_guard<std::mutex> lk(g_sh_mu);
         std::fprintf(stderr, "[tap]   shader links %llu, 82147BF8 binds flag0 %llu flag1 %llu | distinct shader objects %zu, distinct microcode hashes %zu\n",
                      (unsigned long long)g_sh_link_calls.load(), (unsigned long long)g_sh_calls[0].load(), (unsigned long long)g_sh_calls[1].load(), g_sh_objs.size(), g_sh_code.size());
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sh_mu);
+        for (int k = 0; k < 2; k++)
+            std::fprintf(stderr, "[tap]   draw shader slot %d (device+0x%x): null %llu, implausible size %llu, distinct objects %zu, distinct microcode hashes %zu\n",
+                         k, k ? 0x3290 : 0x3294, (unsigned long long)g_dsh_null[k].load(), (unsigned long long)g_dsh_bad[k].load(),
+                         g_dsh_objs[k].size(), g_dsh_code[k].size());
     }
     std::fprintf(stderr, "[tap]   repeats with identical window/target state %llu, with different state %llu | CP predicatedSkips %llu\n",
                  (unsigned long long)g_rep_same_sig, (unsigned long long)g_rep_diff_sig,
