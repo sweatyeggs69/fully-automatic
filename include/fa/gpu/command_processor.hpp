@@ -78,6 +78,7 @@ private:
     }
     bool tileOnce_ = false, sawTile0_ = false;
     uint32_t tileRows_ = 0, tileSurface_ = 0;
+    uint64_t tileSkips0_ = 0;
     // FA_TILE_TRACE=<first swap>[,<frames>], or touching ~/.cache/fullauto/tile_trace: logs the frame's structure (indirect buffers, bin
     // mask/select, tile window and target registers, draw runs, resolves) for tile replay work.
     struct TileTrace {

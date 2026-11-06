@@ -112,6 +112,9 @@ void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
     if (tt_.on) TraceReg(reg, value);
     // The second tile's scissor starts where the first tile ends.
     if (reg == xe::PA_SC_WINDOW_SCISSOR_TL && TileOf() == 1 && ((value >> 16) & 0x3FFF)) {
+        if (tileOnce_ && !tileRows_)
+            std::fprintf(stderr, "[tile] once: %u-row tiles on surface %08x, later tiles skipped\n", (value >> 16) & 0x3FFF,
+                         regs_[xe::RB_SURFACE_INFO]);
         tileRows_ = (value >> 16) & 0x3FFF;
         tileSurface_ = regs_[xe::RB_SURFACE_INFO];
     }
@@ -412,6 +415,12 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                 TraceSwap();
                 sawTile0_ = false;
                 ++stats_.swaps;
+                if (tileOnce_ && stats_.swaps % 300 == 0) {
+                    std::fprintf(stderr, "[tile] %llu swaps: %llu tile draws/resolves skipped (%.0f per frame since last)\n",
+                                 (unsigned long long)stats_.swaps, (unsigned long long)stats_.tileSkips,
+                                 double(stats_.tileSkips - tileSkips0_) / 300.0);
+                    tileSkips0_ = stats_.tileSkips;
+                }
             }
             break;
 
