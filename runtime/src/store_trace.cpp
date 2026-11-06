@@ -1,5 +1,6 @@
 // Guest store trace: which recompiled functions write the GPU command stream? See store_trace.h.
 #include <dlfcn.h>
+#include <signal.h>
 #include <execinfo.h>
 
 #include <algorithm>
@@ -40,11 +41,14 @@ std::vector<Range> g_ranges;
 std::unordered_map<Key, Agg, KeyHash> g_agg;
 int g_swap = 0, g_first = -1, g_frames = 1;
 bool g_cfg_done = false;
+volatile sig_atomic_t g_usr2 = 0;
+void on_usr2(int) { g_usr2 = 1; }
 
 void configure() {
     g_cfg_done = true;
     const char* e = std::getenv("FA_STORE_TRACE");
     if (!e || !*e) return;
+    signal(SIGUSR2, on_usr2);  // kill -USR2 <pid> arms a capture at the next swap, whatever the swap count
     g_first = std::atoi(e);
     if (const char* c = std::strchr(e, ',')) g_frames = std::max(1, std::atoi(c + 1));
 }
@@ -138,8 +142,13 @@ void store_trace_frame_end() {
     if (!g_cfg_done) configure();
     if (g_first < 0) return;
     const int n = ++g_swap;
+    if (g_usr2) {
+        g_usr2 = 0;
+        g_first = n;  // restart the window here
+    }
     if (n == g_first) {
         std::fprintf(stderr, "[store-trace] armed at swap %d (%zu ranges)\n", n, g_ranges.size());
+        { std::lock_guard<std::mutex> lk(g_mu); g_agg.clear(); }
         fa_st_armed = 1;
     } else if (n == g_first + g_frames) {
         fa_st_armed = 0;
