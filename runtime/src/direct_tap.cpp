@@ -23,7 +23,8 @@
 
 namespace fa::rt { uint64_t gpu_predicated_skips(); }
 
-PPC_FUNC_IMPL(__imp__sub_82315500);  // generated as extern "C"
+PPC_FUNC_IMPL(__imp__sub_82315500);
+PPC_FUNC_IMPL(__imp__sub_82148508);  // generated as extern "C"
 PPC_FUNC_IMPL(__imp__sub_823152C0);
 PPC_FUNC_IMPL(__imp__sub_82147BF8);
 PPC_FUNC_IMPL(__imp__sub_82147370);
@@ -113,7 +114,7 @@ DrawArgs g_cur_args{};
 uint64_t g_cur_own[4];                 // vec4s written by blocks issued since the previous draw (draw thread)
 uint64_t g_bl_cmp = 0, g_bl_diff[40];
 int g_bl_printed = 0, g_win_printed = 0;
-uint64_t g_own_cmp = 0, g_own_diff = 0, g_rule_cmp = 0, g_rule_diff = 0;                 // set by the draw hook for snapshot_draw (game draw thread)
+uint64_t g_own_cmp = 0, g_own_diff = 0, g_rule_cmp = 0, g_rule_diff = 0, g_flushes = 0;                 // set by the draw hook for snapshot_draw (game draw thread)
 uint64_t g_rec_cmp = 0, g_rec_bad_prim = 0, g_rec_bad_count = 0, g_rec_bad_addr = 0, g_mir_cmp = 0, g_mir_diff = 0;
 int g_rec_printed = 0, g_mir_printed = 0;
 uint64_t g_mir_vec[256];
@@ -268,7 +269,7 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs, const fa::gp
             const bool own = sn->own[v >> 6] >> (v & 63) & 1;
             if (own) { g_own_cmp++; g_own_diff += !same; }
             else {
-                // Record rule for vec4s this draw's blocks did not write: take the shadow value.
+                // Not written by this draw's blocks: the shadow value, for the record of comparison.
                 bool sh = true;
                 for (uint32_t j = 0; j < 4; j++) sh &= sn->vs[v * 4 + j] == regs[0x4000 + v * 4 + j];
                 g_rule_cmp++;
@@ -412,8 +413,8 @@ bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
         const Snap* sn = lookup_snap_locked(dc.packetAddr);
         if (!sn) { g_dd_missing++; return false; }
         for (uint32_t v = 0; v < 256; v++) {
-            const bool tch = touched(v), own = sn->own[v >> 6] >> (v & 63) & 1;
-            for (uint32_t j = 0; j < 4; j++) img[kRegVs + v * 4 + j] = (tch && own) ? sn->mir[v * 4 + j] : sn->vs[v * 4 + j];
+            const bool tch = touched(v);
+            for (uint32_t j = 0; j < 4; j++) img[kRegVs + v * 4 + j] = tch ? sn->mir[v * 4 + j] : sn->vs[v * 4 + j];
         }
         for (uint32_t i = 0; i < kPsDwords; i++) if (!touched(256 + (i >> 2))) img[kRegPs + i] = sn->ps[i];
         for (uint32_t i = 0; i < kTexDwords; i++) img[kRegTex + i] = sn->tex[i];
@@ -623,6 +624,36 @@ PPC_FUNC(sub_823152C0) {
     __imp__sub_823152C0(ctx, base);
 }
 
+// Applies the per-object constant blocks issued so far to the mirror, in stream order (caller holds g_set_mu).
+void apply_pending_locked(const uint8_t* base) {
+    for (const PendingBlock& b : g_pending) {
+        for (uint32_t v = b.first; v < b.first + b.count && v < 256; v++) g_cur_own[v >> 6] |= 1ull << (v & 63);
+        for (uint32_t i = 0; i < b.count * 4 && b.first * 4 + i < 2048; i++)
+            g_mirror[b.first * 4 + i] = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + b.payload + i * 4));
+        for (uint32_t v = b.first; v < b.first + b.count && v < 512; v++) g_mirror_valid[v >> 6] |= 1ull << (v & 63);
+    }
+    g_pending.clear();
+}
+
+// Dirty-state flush (82148508): the blocks issued before it are in the stream first, then the flush writes every
+// VS float constant group whose dirty bit is set (device+0x10, MSB first, 4 vec4 per bit) from the shadow. The mirror
+// follows the same order, so it holds what the GPU's constant registers hold.
+PPC_FUNC(sub_82148508) {
+    if (g_on) {
+        const uint32_t dev = ctx.r3.u32;
+        const uint64_t dirty = __builtin_bswap64(*reinterpret_cast<const uint64_t*>(base + dev + 0x10));
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        apply_pending_locked(base);
+        g_flushes++;
+        for (uint32_t k = 0; k < 64; k++) {
+            if (!(dirty >> (63 - k) & 1)) continue;
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(base + dev + kOffVs) + k * 16;
+            for (uint32_t i = 0; i < 16; i++) g_mirror[k * 16 + i] = __builtin_bswap32(src[i]);
+        }
+    }
+    __imp__sub_82148508(ctx, base);
+}
+
 PPC_FUNC(sub_82315500) {
     if (g_on) {
         // r3 device, r4 primType, r6 startIndex, r7 indexCount (reads of the registers the function itself uses).
@@ -635,14 +666,7 @@ PPC_FUNC(sub_82315500) {
     if (g_on) {
         {
             std::lock_guard<std::mutex> lk(g_set_mu);
-            std::memset(g_cur_own, 0, sizeof g_cur_own);
-            for (const PendingBlock& b : g_pending) {
-                for (uint32_t v = b.first; v < b.first + b.count && v < 256; v++) g_cur_own[v >> 6] |= 1ull << (v & 63);
-                for (uint32_t i = 0; i < b.count * 4 && b.first * 4 + i < 2048; i++)
-                    g_mirror[b.first * 4 + i] = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + b.payload + i * 4));
-                for (uint32_t v = b.first; v < b.first + b.count && v < 512; v++) g_mirror_valid[v >> 6] |= 1ull << (v & 63);
-            }
-            g_pending.clear();
+            apply_pending_locked(base);
         }
         g_cur_args = args0;
         const uint32_t ib = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev + 0x30F4));
@@ -651,6 +675,7 @@ PPC_FUNC(sub_82315500) {
             g_cur_args.ibBase = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ib + 0xC));
         }
         snapshot_draw(base, dev);
+        std::memset(g_cur_own, 0, sizeof g_cur_own);
         if (g_tap_report) {
             tap_draw_shaders(base, dev);
             uint64_t h[3];
@@ -726,7 +751,7 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_rec_cmp, (unsigned long long)g_rec_bad_prim, (unsigned long long)g_rec_bad_count, (unsigned long long)g_rec_bad_addr,
                      (unsigned long long)g_mir_cmp, (unsigned long long)g_mir_diff);
         std::fprintf(stderr, "[tap]   vec4s written by the draw's own blocks: compared %llu, differ %llu\n", (unsigned long long)g_own_cmp, (unsigned long long)g_own_diff);
-        std::fprintf(stderr, "[tap]   touched vec4s not written by the draw's own blocks, shadow value vs CP: compared %llu, differ %llu\n", (unsigned long long)g_rule_cmp, (unsigned long long)g_rule_diff);
+        std::fprintf(stderr, "[tap]   touched vec4s not written by the draw's own blocks, shadow value vs CP: compared %llu, differ %llu | flushes seen %llu (mirror now follows flushes)\n", (unsigned long long)g_rule_cmp, (unsigned long long)g_rule_diff, (unsigned long long)g_flushes);
         std::fprintf(stderr, "[tap]   bool/loop constants (shadow +0x2780 vs regs 0x4900..0x4927): compared %llu, differ by reg:", (unsigned long long)g_bl_cmp);
         for (uint32_t i = 0; i < 40; i++) if (g_bl_diff[i]) std::fprintf(stderr, " %04x:%llu", 0x4900 + i, (unsigned long long)g_bl_diff[i]);
         std::fprintf(stderr, "\n");
