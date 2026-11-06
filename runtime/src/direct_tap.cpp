@@ -23,6 +23,7 @@ namespace fa::rt { uint64_t gpu_predicated_skips(); }
 
 PPC_FUNC_IMPL(__imp__sub_82315500);  // generated as extern "C"
 PPC_FUNC_IMPL(__imp__sub_823152C0);
+PPC_FUNC_IMPL(__imp__sub_823162F8);
 
 namespace {
 bool g_on = std::getenv("FA_TAP") != nullptr;
@@ -53,6 +54,16 @@ uint64_t g_frames_hist = 0;
 constexpr uint32_t kOffVs = 0x780, kOffPs = 0x1780, kOffTex = 0x480;
 constexpr uint32_t kVsDwords = 1024, kPsDwords = 1024, kTexDwords = 192;
 constexpr uint32_t kRegVs = 0x4000, kRegPs = 0x4400, kRegTex = 0x4800;
+// Per-object constants are written straight into the command stream: 0x823162F8(device, ?, firstVec4,
+// vec4Count) reserves ring space, writes the SET_CONSTANT header and returns the payload pointer; callers
+// (821B9208, 821B8FA8) then fill it with 821B8510. Those vec4s bypass the device shadow, so they are left out
+// of the constants hashes below (and counted here).
+std::atomic<uint64_t> g_touched[8];  // bit per ALU vec4 (0..511)
+std::mutex g_set_mu;
+std::unordered_map<uint64_t, uint64_t> g_sets;  // (first << 32 | count) -> calls
+
+inline bool touched(uint32_t vec4) { return g_touched[vec4 >> 6].load(std::memory_order_relaxed) >> (vec4 & 63) & 1; }
+
 struct HashSets { std::unordered_set<uint64_t> vs, ps, tex; };
 std::mutex g_par_mu;
 HashSets g_gen[3];
@@ -66,7 +77,10 @@ void game_hash(const uint8_t* base, uint32_t dev, uint64_t out[3]) {
     for (int k = 0; k < 3; k++) {
         uint64_t h = 1469598103934665603ull;
         const uint32_t* p = reinterpret_cast<const uint32_t*>(base + dev + offs[k]);
-        for (uint32_t i = 0; i < cnt[k]; i++) h = fnv(h, __builtin_bswap32(p[i]));
+        for (uint32_t i = 0; i < cnt[k]; i++) {
+            if (k < 2 && touched(k * 256 + (i >> 2))) continue;
+            h = fnv(h, __builtin_bswap32(p[i]));
+        }
         out[k] = h;
     }
 }
@@ -76,7 +90,10 @@ void cp_parity(const fa::gpu::RegisterFile& regs) {
     uint64_t h[3];
     for (int k = 0; k < 3; k++) {
         uint64_t x = 1469598103934665603ull;
-        for (uint32_t i = 0; i < cnt[k]; i++) x = fnv(x, regs[rb[k] + i]);
+        for (uint32_t i = 0; i < cnt[k]; i++) {
+            if (k < 2 && touched(k * 256 + (i >> 2))) continue;
+            x = fnv(x, regs[rb[k] + i]);
+        }
         h[k] = x;
     }
     std::lock_guard<std::mutex> lk(g_par_mu);
@@ -133,6 +150,16 @@ void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) 
 }
 }  // namespace
 
+PPC_FUNC(sub_823162F8) {
+    if (g_on) {
+        const uint32_t first = ctx.r5.u32, count = ctx.r6.u32;
+        for (uint32_t v = first; v < first + count && v < 512; v++) g_touched[v >> 6].fetch_or(1ull << (v & 63), std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        g_sets[(uint64_t(first) << 32) | count]++;
+    }
+    __imp__sub_823162F8(ctx, base);
+}
+
 PPC_FUNC(sub_823152C0) {
     if (g_on) g_tap2_calls.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_823152C0(ctx, base);
@@ -181,6 +208,16 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   state parity: CP draws %llu | vs consts match %llu | ps consts match %llu | fetch consts match %llu | all three %llu\n",
                      (unsigned long long)g_par_total, (unsigned long long)g_par_vs, (unsigned long long)g_par_ps,
                      (unsigned long long)g_par_tex, (unsigned long long)g_par_all);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        std::fprintf(stderr, "[tap]   direct SET_CONSTANT blocks (first vec4:count x calls):");
+        int shown = 0;
+        for (auto& [k, n] : g_sets) {
+            if (shown++ >= 12) break;
+            std::fprintf(stderr, " %u:%u x%llu", unsigned(k >> 32), unsigned(k & 0xFFFFFFFF), (unsigned long long)n);
+        }
+        std::fprintf(stderr, "\n");
     }
     std::fprintf(stderr, "[tap]   repeats with identical window/target state %llu, with different state %llu | CP predicatedSkips %llu\n",
                  (unsigned long long)g_rep_same_sig, (unsigned long long)g_rep_diff_sig,
