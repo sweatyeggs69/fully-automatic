@@ -336,7 +336,8 @@ static bool load_xma(const char* path, std::vector<uint8_t>& out) {
 // Plays a stream through the emulated hardware the way a game's XAudio does:
 // two rolling input buffers of a few packets each, a small output ring, and a
 // consumer that drains the ring and re-validates it.
-static void test_xma_hardware(const char* sample) {
+// kick_every_pass false: kick once, then rely on the context staying enabled.
+static void test_xma_hardware(const char* sample, bool kick_every_pass) {
     std::vector<uint8_t> stream;
     if (!load_xma(sample, stream)) {
         std::fprintf(stderr, "cannot read XMA sample %s\n", sample);
@@ -392,7 +393,7 @@ static void test_xma_hardware(const char* sample) {
     for (int iter = 0; iter < 200000; ++iter) {
         // Kick through the register page, as inline XDK code would.
         uint32_t kick = 1u;  // little-endian register value, as the game's byte-reversed store leaves it
-        std::memcpy(g.base + XmaDecoder::kRegisterBase + XmaDecoder::kRegKick, &kick, 4);
+        if (kick_every_pass || iter == 0) std::memcpy(g.base + XmaDecoder::kRegisterBase + XmaDecoder::kRegKick, &kick, 4);
         xma.work_once();
         d.load(g.base + ctx);
         // Drain everything between read and write offsets.
@@ -430,7 +431,10 @@ int main(int argc, char** argv) {
     test_context_packing();
     test_downmix();
     test_audio_dump(argv[2]);
-    if (const char* s = std::getenv("FA_XMA_SAMPLE")) test_xma_hardware(s);
+    if (const char* s = std::getenv("FA_XMA_SAMPLE")) {
+        test_xma_hardware(s, true);
+        test_xma_hardware(s, false);
+    }
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;
