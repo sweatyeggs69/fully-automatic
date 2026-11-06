@@ -41,6 +41,7 @@ uint32_t CommandProcessor::ReadDword(uint32_t base, uint32_t sizeDwords, uint32_
 void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
     if (reg >= kRegisterCount) return;
     regs_[reg] = value;
+    if (reg - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((reg - pm4::kAluConstBase) >> 6);
     // Scratch registers are mirrored to memory (SCRATCH_ADDR + 4 * i) when their SCRATCH_UMSK bit
     // is set. D3D's fences are written this way.
     if (reg >= pm4::kScratchReg0 && reg < pm4::kScratchReg0 + 8) {
@@ -199,6 +200,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             uint32_t orMask = (d[0] & 0x40000000u) ? (d[2] < kRegisterCount ? regs_[d[2] & 0x1FFF] : 0) : d[2];
             uint32_t dst = d[0] & 0x1FFF;
             if (dst < kRegisterCount) regs_[dst] = (regs_[dst] & andMask) | orMask;
+            if (dst - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((dst - pm4::kAluConstBase) >> 6);
             break;
         }
 

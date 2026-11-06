@@ -1490,6 +1490,7 @@ struct VulkanRenderer::Impl {
         vbExt.clear();
         unbCache.clear();
         lastConstsOff = ~0ull;
+        cblkHave = 0;
         for (auto& im : garbageImages) DestroyImage(im);
         garbageImages.clear();
         for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
@@ -1665,13 +1666,19 @@ struct VulkanRenderer::Impl {
     // Streaming vertex memory (the game's per-frame vertex ring, run 73: one shader's fetches at
     // ever-advancing addresses) is rewritten by the game before our GPU runs the draw, because fences
     // are signalled when the commands are recorded, not when the GPU finishes. Those regions keep
-    // the copy at record time. A 1 MB region counts as streaming once more than FA_VB_STREAM (24)
+    // the copy at record time. With FA_VB_STREAM=N, a 1 MB region counts as streaming once more than N
     // fetch bases in one frame advance by small steps past the previous one; it stays so for 600
     // frames after the last frame that qualified.
+    // Every rewritten range FA_VB_CHECK found (runs 73, 74: menus and race, three shaders) was fetch
+    // constant 95, the slot the game streams its per-frame vertex data through, so that slot keeps
+    // the copy at record time and everything else is read directly. FA_VB_COPY_SLOT=-1 reads it
+    // directly too, another number picks another slot.
+    static inline const int vbCopySlot = [] { const char* e = std::getenv("FA_VB_COPY_SLOT"); return e ? std::atoi(e) : 95; }();
     struct StreamRegion { uint64_t frame = ~0ull; uint32_t lastBase = 0; uint32_t advances = 0; uint64_t until = 0; };
     std::unordered_map<uint32_t, StreamRegion> streamRegions;
     bool StreamingRegion(uint32_t pa) {
-        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 24u; }();
+        // Off by default: the 1 MB heuristic flagged most vertex memory (run 75) and missed 0x02800000.
+        static const uint32_t limit = [] { const char* e = std::getenv("FA_VB_STREAM"); return e ? uint32_t(std::atoi(e)) : 0u; }();
         if (!limit) return false;
         StreamRegion& r = streamRegions[pa >> 20];
         if (r.frame != frame) { r.frame = frame; r.advances = 0; }
@@ -2942,7 +2949,13 @@ struct VulkanRenderer::Impl {
         const uint32_t vsN = fullConsts ? 256 : std::min<uint32_t>(vs->info.constMax, 256), psN = fullConsts ? 256 : std::min<uint32_t>(ps->info.constMax, 256);
         // Compared against the ring copy itself (host cached), so no second copy is kept.
         const uint8_t* lastRing = lastConstsOff != ~0ull ? static_cast<const uint8_t*>(ring.map) + lastConstsOff : nullptr;
-        if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
+        if (ConstBlocksOn()) {
+            // Shaders read constants by block through sys.cblk; binding 0 stays bound but unused.
+            constsOff = 0;
+            blkVsN = vsN;
+            blkPsN = psN;
+            UploadConstBlocks(regs);
+        } else if (lastRing && vsN <= lastVsN && psN <= lastPsN &&
             !std::memcmp(lastRing, consts, vsN * 16) &&
             !std::memcmp(lastRing + 4096, consts + 1024, psN * 16)) {
             constsOff = lastConstsOff;
@@ -2957,11 +2970,13 @@ struct VulkanRenderer::Impl {
             lastConstsOff = constsOff;
         }
         VkDeviceSize boolOff = RingAlloc(160, uboAlign, flushed);
-        if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
+        if (flushed && ConstBlocksOn()) { cblkHave = 0; UploadConstBlocks(regs); }
+        else if (flushed) { constsOff = RingAlloc(8192, uboAlign, flushed); std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192); lastVsN = lastPsN = 256; lastConstsOff = constsOff; }
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
 
         XeSystemConstants sys{};
         std::memcpy(sys.texXf, texXf, sizeof texXf);
+        std::memcpy(sys.cblk, cblk, sizeof cblk);
         const uint32_t vte = regs[xe::PA_CL_VTE_CNTL];
         const float vs_[3] = {xe::AsFloat(regs[xe::PA_CL_VPORT_XSCALE]), xe::AsFloat(regs[xe::PA_CL_VPORT_YSCALE]),
                               xe::AsFloat(regs[xe::PA_CL_VPORT_ZSCALE])};
@@ -3017,7 +3032,9 @@ struct VulkanRenderer::Impl {
             // whole fetch range is used and the draw's largest index is not needed.
             auto tryDirect = [&](uint32_t n) {
                 const uint32_t pa = GuestPhys(vf.address);
-                if (uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) || !mem.HostPtr(vf.address, n * 4)) return false;
+                if (int(s) == vbCopySlot || uint64_t(pa) + uint64_t(n) * 4 > guestSize || StreamingRegion(pa) ||
+                    !mem.HostPtr(vf.address, n * 4))
+                    return false;
                 sys.vf[s][0] = pa / 4;
                 sys.vf[s][1] = vf.endian;
                 sys.vf[s][2] = n;
@@ -3122,6 +3139,7 @@ struct VulkanRenderer::Impl {
         sub.emplace(prof::kUpIdx);
         VkDeviceSize sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
         if (flushed) { RecoverConsts(consts, constsOff, boolOff, regs, uboAlign); ReuploadVbs(sys, vs, regs); sysOff = RingAlloc(sizeof sys, uboAlign, flushed); }
+        std::memcpy(sys.cblk, cblk, sizeof cblk);
         std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
         const VkDeviceSize idxBytes = fi.mode == 3 ? 0 : fi.mode == 1 ? VkDeviceSize(nIdx) * 2 : VkDeviceSize(nIdx) * 4;
         VkDeviceSize idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
@@ -3130,6 +3148,7 @@ struct VulkanRenderer::Impl {
             RecoverConsts(consts, constsOff, boolOff, regs, uboAlign);
             ReuploadVbs(sys, vs, regs);
             sysOff = RingAlloc(sizeof sys, uboAlign, flushed);
+            std::memcpy(sys.cblk, cblk, sizeof cblk);
             std::memcpy(static_cast<uint8_t*>(ring.map) + sysOff, &sys, sizeof sys);
             idxOff = idxBytes ? RingAlloc(idxBytes, 16, flushed) : 0;
         }
@@ -3502,13 +3521,46 @@ struct VulkanRenderer::Impl {
                      sys.flags[1], sys.flags[2]);
     }
 
+    // Float constants by block (see ConstBlocksOn): the blocks the two shaders can read are uploaded
+    // when they were written since their last upload in this batch, or have no copy in it yet.
+    // cblk[b] is the vec4 index of block b's latest ring copy.
+    uint32_t cblk[32] = {};
+    uint32_t cblkHave = 0;  // blocks with a copy in the current batch's ring
+    uint32_t blkVsN = 256, blkPsN = 256;
+    void UploadConstBlocks(const RegisterFile& regs) {
+        const uint32_t vsB = (blkVsN + 15) / 16, psB = (blkPsN + 15) / 16;
+        const uint32_t used = (vsB >= 16 ? 0xFFFFu : (1u << vsB) - 1) | ((psB >= 16 ? 0xFFFFu : (1u << psB) - 1) << 16);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            uint32_t need = used & (~cblkHave | regs.aluDirty);
+            bool flushed = false;
+            while (need) {
+                const uint32_t b = uint32_t(__builtin_ctz(need));
+                need &= need - 1;
+                VkDeviceSize at = RingAlloc(256, 16, flushed);
+                if (flushed) break;
+                std::memcpy(static_cast<uint8_t*>(ring.map) + at, &regs.r[pm4::kAluConstBase + b * 64], 256);
+                cblk[b] = uint32_t(at / 16);
+                cblkHave |= 1u << b;
+                regs.aluDirty &= ~(1u << b);
+                prof::Add(prof::kConstBlocks, 1);
+            }
+            if (!flushed) return;
+            cblkHave = 0;  // the ring was reset: every block needs a new copy
+        }
+    }
     void RecoverConsts(const uint32_t* consts, VkDeviceSize& constsOff, VkDeviceSize& boolOff, const RegisterFile& regs,
                        VkDeviceSize uboAlign) {
         bool f;
-        constsOff = RingAlloc(8192, uboAlign, f);
-        std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
-        lastVsN = lastPsN = 256;
-        lastConstsOff = constsOff;
+        if (ConstBlocksOn()) {
+            constsOff = 0;
+            cblkHave = 0;
+            UploadConstBlocks(regs);
+        } else {
+            constsOff = RingAlloc(8192, uboAlign, f);
+            std::memcpy(static_cast<uint8_t*>(ring.map) + constsOff, consts, 8192);
+            lastVsN = lastPsN = 256;
+            lastConstsOff = constsOff;
+        }
         boolOff = RingAlloc(160, uboAlign, f);
         std::memcpy(static_cast<uint8_t*>(ring.map) + boolOff, &regs.r[pm4::kBoolConstBase], 160);
     }
@@ -3788,43 +3840,60 @@ struct VulkanRenderer::Impl {
         uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
+        auto xf = [&](uint32_t v) {
+            if (convert) {
+                if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
+                    v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
+                        (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
+                } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
+                    v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
+                        (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
+                }
+            }
+            if (d.swapRB) {
+                if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
+            }
+            switch (x8) {
+                case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+                case 3: v = __builtin_bswap32(v); break;
+                case 2: v = (v << 16) | (v >> 16); break;
+                default: break;
+            }
+            return v;
+        };
+        // In the Xenos tiling, 4 horizontally adjacent 4-byte blocks (2 for 8-byte blocks) starting at a
+        // multiple of the run length are contiguous in memory, so one tiled offset serves the whole run.
+        const uint32_t run = bpp == 4 ? 4 : bpp == 8 ? 2 : 1;
         rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
         for (uint32_t y = ya; y < yb; y++) {
             const uint32_t ty = dy + y;
             if (ty >= height) break;
             const uint8_t* row = rb + size_t(y) * w * bpp;
-            for (uint32_t x = 0; x < w; x++) {
+            for (uint32_t x = 0; x < w;) {
                 const uint32_t tx = dx + x;
                 if (tx >= pitch) break;
                 const uint32_t off = TiledBlockOffset(tx, ty, pitch, bpp);
-                if (off + bpp > destBytes) continue;
+                uint32_t n = 1;
+                if (run > 1 && !(tx & (run - 1)) && x + run <= w && tx + run <= pitch) n = run;
+                if (off + n * bpp > destBytes) {
+                    if (n == 1) { x++; continue; }
+                    n = 1;  // let the single-pixel path check each pixel
+                    if (off + bpp > destBytes) { x++; continue; }
+                }
                 if (bpp == 4) {
-                    uint32_t v;
-                    std::memcpy(&v, row + x * 4, 4);
-                    if (convert) {
-                        if (src1010) {  // R10 G10 B10 A2 -> R8 G8 B8 A8
-                            v = ((((v & 0x3FF) * 255 + 511) / 1023)) | (((((v >> 10) & 0x3FF) * 255 + 511) / 1023) << 8) |
-                                (((((v >> 20) & 0x3FF) * 255 + 511) / 1023) << 16) | ((v >> 30) * 85u) << 24;
-                        } else {        // R8 G8 B8 A8 -> R10 G10 B10 A2
-                            v = ((((v & 0xFF) * 1023 + 127) / 255)) | (((((v >> 8) & 0xFF) * 1023 + 127) / 255) << 10) |
-                                (((((v >> 16) & 0xFF) * 1023 + 127) / 255) << 20) | ((((v >> 24) * 3 + 127) / 255) << 30);
-                        }
+                    for (uint32_t k = 0; k < n; k++) {
+                        uint32_t v;
+                        std::memcpy(&v, row + (x + k) * 4, 4);
+                        v = xf(v);
+                        std::memcpy(dst + off + k * 4, &v, 4);
                     }
-                    if (d.swapRB) {
-                        if (is8888) v = (v & 0xFF00FF00u) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
-                        else v = (v & 0xC00FFC00u) | ((v & 0x3FF) << 20) | ((v >> 20) & 0x3FF);
-                    }
-                    switch (x8) {
-                        case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
-                        case 3: v = __builtin_bswap32(v); break;
-                        case 2: v = (v << 16) | (v >> 16); break;
-                        default: break;
-                    }
-                    std::memcpy(dst + off, &v, 4);
                 } else {
                     const uint8_t* p = row + size_t(x) * bpp;
-                    for (uint32_t k = 0; k < bpp; k++) dst[(off + k) ^ x8] = p[k];
+                    if (!x8) std::memcpy(dst + off, p, size_t(n) * bpp);
+                    else for (uint32_t k = 0; k < n * bpp; k++) dst[(off + k) ^ x8] = p[k];
                 }
+                x += n;
             }
         }
         });

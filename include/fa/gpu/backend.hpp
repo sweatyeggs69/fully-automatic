@@ -13,6 +13,9 @@ constexpr uint32_t kRegisterCount = 0x5003;
 
 struct RegisterFile {
     std::array<uint32_t, kRegisterCount> r{};
+    // Float constant blocks (64 dwords = 16 vec4 each, 32 blocks) written since the renderer last
+    // uploaded them. Set by the command processor, cleared by the renderer as it uploads.
+    mutable uint32_t aluDirty = ~0u;
     uint32_t& operator[](uint32_t i) { return r[i]; }
     uint32_t operator[](uint32_t i) const { return r[i]; }
 };
