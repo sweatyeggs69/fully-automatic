@@ -70,6 +70,7 @@ struct HashSets { std::unordered_set<uint64_t> vs, ps, tex; };
 // up by DrawCall::packetAddr, which is also correct for tile replays and indirect buffers.
 struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords]; };
 std::mutex g_snap_mu;
+uint64_t g_rec_k[25];  // recording-variant lookups by backwards offset in dwords (under g_snap_mu)
 std::unordered_map<uint32_t, Snap> g_snaps[3];
 int g_snap_gen = 0;
 uint64_t g_ex_found = 0, g_ex_equal = 0, g_ex_missing = 0, g_ex_diff_vs = 0, g_ex_diff_ps = 0, g_ex_diff_tex = 0;
@@ -123,8 +124,11 @@ void cp_parity(const fa::gpu::RegisterFile& regs) {
 
 void snapshot_draw(const uint8_t* base, uint32_t dev) {
     const uint32_t wptr = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev));
-    if (base[dev + 10432] & 4) return;  // predicated-tiling recording variant writes the packet elsewhere
-    const uint32_t pkt = (wptr - 16) & 0x1FFFFFFF;
+    // The predicated-tiling recording variant emits a 17 dword predicated sequence ending at wptr. Its exact
+    // packet address for the CP is not known yet, so it is stored under the end pointer with bit 31 set and
+    // looked up with a small backwards offset search that also fills a histogram.
+    const bool rec = (base[dev + 10432] & 4) != 0;
+    const uint32_t pkt = rec ? ((wptr & 0x1FFFFFFF) | 0x80000000u) : ((wptr - 16) & 0x1FFFFFFF);
     Snap s;
     const uint32_t* v = reinterpret_cast<const uint32_t*>(base + dev + kOffVs);
     const uint32_t* p = reinterpret_cast<const uint32_t*>(base + dev + kOffPs);
@@ -142,6 +146,15 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
     for (int k = 0; k < 3 && !sn; k++) {
         auto it = g_snaps[(g_snap_gen + 3 - k) % 3].find(pkt);
         if (it != g_snaps[(g_snap_gen + 3 - k) % 3].end()) sn = &it->second;
+    }
+    if (!sn) {
+        for (uint32_t k = 1; k <= 24 && !sn; k++) {
+            const uint32_t key = ((pkt + 4 * k) & 0x1FFFFFFF) | 0x80000000u;
+            for (int g = 0; g < 3 && !sn; g++) {
+                auto it = g_snaps[(g_snap_gen + 3 - g) % 3].find(key);
+                if (it != g_snaps[(g_snap_gen + 3 - g) % 3].end()) { sn = &it->second; g_rec_k[k]++; }
+            }
+        }
     }
     if (!sn) { g_ex_missing++; return; }
     g_ex_found++;
@@ -288,6 +301,12 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   exact parity by packet address: CP draws with a game snapshot %llu, without %llu | identical state %llu | differ in vs %llu ps %llu fetch %llu\n",
                      (unsigned long long)g_ex_found, (unsigned long long)g_ex_missing, (unsigned long long)g_ex_equal,
                      (unsigned long long)g_ex_diff_vs, (unsigned long long)g_ex_diff_ps, (unsigned long long)g_ex_diff_tex);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_snap_mu);
+        std::fprintf(stderr, "[tap]   recording-variant match offsets (dwords back from end, count):");
+        for (uint32_t k = 1; k <= 24; k++) if (g_rec_k[k]) std::fprintf(stderr, " %u:%llu", k, (unsigned long long)g_rec_k[k]);
+        std::fprintf(stderr, "\n");
     }
     std::fprintf(stderr, "[tap]   repeats with identical window/target state %llu, with different state %llu | CP predicatedSkips %llu\n",
                  (unsigned long long)g_rep_same_sig, (unsigned long long)g_rep_diff_sig,
