@@ -21,7 +21,7 @@ set(THIRDPARTY_ROOT ${FA_XENONRECOMP}/thirdparty)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/fa_hle.cmake)
 
 file(GLOB FA_RT_SOURCES CONFIGURE_DEPENDS
-    src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/profiler.cpp src/memguard.cpp src/kernel/*.cpp
+    src/memory.cpp src/kernel.cpp src/crash.cpp src/timebase.cpp src/profiler.cpp src/memguard.cpp src/store_trace.cpp src/kernel/*.cpp
     src/gpu/*.cpp src/audio/*.cpp src/input/*.cpp src/vfs/*.cpp)
 # The GPU command processor lives in the top-level src/gpu.
 list(APPEND FA_RT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../src/gpu/command_processor.cpp
@@ -112,8 +112,14 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
     set(FA_PPC_OPT "-O2;-march=x86-64-v3" CACHE STRING "Compiler flags for the recompiled ppc/ sources")
     # force_mftb.h turns the recompiled mftb (__rdtsc()) into a call that returns the 50 MHz guest timebase.
     set(FA_FORCE_MFTB ${CMAKE_CURRENT_SOURCE_DIR}/include/fa/rt/force_mftb.h)
-    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "${FA_PPC_OPT};-fno-strict-aliasing;-ffp-contract=off;-include;${FA_FORCE_MFTB}"
-                                OBJECT_DEPENDS ${FA_FORCE_MFTB})
+    # Diagnostic: -DFA_STORE_TRACE=ON wraps the guest store macros (see store_trace.h).
+    option(FA_STORE_TRACE "Trace which guest functions write GPU command buffers (diag)" OFF)
+    set(FA_PPC_EXTRA_INCLUDE "")
+    if(FA_STORE_TRACE)
+        set(FA_PPC_EXTRA_INCLUDE -include ${CMAKE_CURRENT_SOURCE_DIR}/include/fa/rt/store_trace.h)
+    endif()
+    set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "${FA_PPC_OPT};-fno-strict-aliasing;-ffp-contract=off;-include;${FA_FORCE_MFTB};${FA_PPC_EXTRA_INCLUDE}"
+                                OBJECT_DEPENDS "${FA_FORCE_MFTB};${CMAKE_CURRENT_SOURCE_DIR}/include/fa/rt/store_trace.h")
 else()
     message(STATUS "No ${FA_PPC_DIR}/ppc_config.h: skipping the fullauto target (run XenonRecomp first)")
 endif()

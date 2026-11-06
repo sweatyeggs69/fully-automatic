@@ -7,6 +7,7 @@
 #   tools/fa-build.sh <branch|commit> # e.g. claude/project-thread-xyz or a sha
 #   tools/fa-build.sh --here          # build the current checkout as is (local edits allowed, marked -dirty)
 #   tools/fa-build.sh --regen ...     # force a ppc/ regeneration
+#   FA_STORE_TRACE_BUILD=ON tools/fa-build.sh   # diag build that can trace GPU command buffer writers
 #
 # Needs private/default.xex (from: build/faiso game.iso extract default.xex private/default.xex).
 # Inputs that decide whether ppc/ is current: private/default.xex, config/fullauto.toml,
@@ -110,7 +111,7 @@ fi
 
 # ---- 4. fullauto ----------------------------------------------------------------------------------
 cmake -S runtime -B runtime/out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-    -DFA_BUILD_COMMIT="$COMMIT" -DFA_BUILD_PPC="$INPUT_HASH" >/dev/null
+    -DFA_BUILD_COMMIT="$COMMIT" -DFA_BUILD_PPC="$INPUT_HASH" -DFA_STORE_TRACE="${FA_STORE_TRACE_BUILD:-OFF}" >/dev/null
 say "building fullauto"
 cmake --build runtime/out --target fullauto
 say "done: runtime/out/fullauto, commit $COMMIT, ppc $INPUT_HASH"
