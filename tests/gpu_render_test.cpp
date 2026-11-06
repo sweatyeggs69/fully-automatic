@@ -610,6 +610,36 @@ int main() {
             if (!white || !untouched) std::printf("FAIL generic resolve: copied part white %d, left part untouched %d\n", white, untouched);
             CHECK(white && untouched);
         }
+        // Frames in flight: last frame's generic resolve lands while this frame already resolved the same
+        // memory again (a snapshot). The late write must not invalidate the newer snapshot (it was skipped and
+        // never written back: runs 130 and 131 showed garbage everywhere), so the memory ends up red.
+        {
+            const uint32_t destH = 0x3A0000, scratch = 0x380000, halfRect = 0x109000;
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destH + i * 4, 0);
+            RegisterFile rg = rc;
+            rg[pm4::kFetchConstBase] = halfRect | 3;
+            rg[xe::RB_COPY_CONTROL] = 0;
+            rg[xe::RB_COPY_DEST_BASE] = destH;
+            rg[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rg);  // generic: the white right half
+            r.Swap(0, 0, 0, rg);
+            RegisterFile rs = rc;
+            rs[xe::RB_COLOR_CLEAR] = rs[xe::RB_COLOR_CLEAR_LO] = 0xFF0000FFu;  // red
+            rs[xe::RB_COPY_CONTROL] = 1u << 8;  // copy, then clear
+            rs[xe::RB_COPY_DEST_BASE] = scratch;
+            rs[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rs);
+            rs[xe::RB_COPY_CONTROL] = 0;
+            rs[xe::RB_COPY_DEST_BASE] = destH;
+            r.Resolve(rs);  // snapshot: all red
+            r.Flush();
+            for (uint32_t x : {4u, 100u}) {
+                Pixel(mem, destH, 128, 64, x, 4, px);
+                const bool red = px[0] == 255 && px[1] == 0 && px[2] == 0;
+                if (!red) std::printf("FAIL late generic write (%u,4) = %02x %02x %02x %02x\n", x, px[0], px[1], px[2], px[3]);
+                CHECK(red);
+            }
+        }
         std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
                     (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());
     }

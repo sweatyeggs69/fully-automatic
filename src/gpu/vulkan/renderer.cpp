@@ -580,13 +580,20 @@ struct VulkanRenderer::Impl {
 
     // A resolve wrote [base, base + size): textures overlapping it are rechecked on next use.
     // Other textures keep their check from earlier in the frame (the CPU writes them between frames).
-    void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
+    // `snapsToo` false: a write landing late (frames in flight, from a finished batch) that was recorded before
+    // the snapshots resolved since; those already invalidated what was older when they were stored, and are newer
+    // than this write, so they stay valid (and pending) and land over it at their own flush. Their guest memory
+    // samples are taken again: this write is ours, not the CPU's, and must not read as "samples changed".
+    void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0, bool snapsToo = true) {
         prof::Scope pi_(prof::kInval);
         texEpoch++;
         WwTouch(base, size);  // the host writes this memory now or at the next flush
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
-        for (auto& [k, e] : snaps)
-            if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
+        for (auto& [k, e] : snaps) {
+            if (!e.valid || uint64_t(e.base) >= hi || lo >= uint64_t(e.base) + e.size) continue;
+            if (snapsToo) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; continue; }
+            if (const uint8_t* gp = mem.HostPtr(e.base, e.size)) SnapSample(gp, e.size, e.samples);
+        }
         for (auto& [k, t] : textures) {
             const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
             if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
@@ -955,7 +962,7 @@ struct VulkanRenderer::Impl {
                 prof::Scope pg_(prof::kRcGen);
                 for (const PendingGeneric& g : gens) {
                     prof::Add(prof::kWbGenKB, g.destBytes / 1024);
-                    FinishGeneric(g, rb + genOff + g.off);
+                    FinishGeneric(g, rb + genOff + g.off, true);
                 }
             }
             for (const Job& j : jobs) {
@@ -971,10 +978,10 @@ struct VulkanRenderer::Impl {
                     wrote = ResolveRaw(j.dest, j.fmt, false, 0, 0, j.w, j.filled, rb + j.off, destBytes);
                 }
                 if (wrote) {
-                    InvalidateTextures(j.dest.base, destBytes, 766);
+                    InvalidateTextures(j.dest.base, destBytes, 766, false);
                 } else if (SnapClass(j.dest.format) == 5) {
                     PendingGeneric g{j.dest, j.fmt, false, j.srcRt, 0, 0, j.w, j.filled, destBytes, VkFormatBytes(j.fmt), 0};
-                    FinishGeneric(g, rb + j.off);
+                    FinishGeneric(g, rb + j.off, true);
                     wrote = true;
                 }
                 if (!e) continue;
@@ -1000,10 +1007,10 @@ struct VulkanRenderer::Impl {
         const uint8_t* rbase = static_cast<const uint8_t*>(readback.map);
         for (const PendingGeneric& j : jobs) FinishGeneric(j, rbase + j.off);
     }
-    void FinishGeneric(const PendingGeneric& j, const uint8_t* rb) {
+    void FinishGeneric(const PendingGeneric& j, const uint8_t* rb, bool late = false) {
         const ResolveDest& d = j.d;
         if (ResolveRaw(d, j.fmt, j.isDepth, j.x0, j.y0, j.w, j.h, rb, j.destBytes)) {
-            InvalidateTextures(d.base, j.destBytes, 787);
+            InvalidateTextures(d.base, j.destBytes, 787, !late);
             return;
         }
         const uint32_t w = j.w, h = j.h, bpp = j.bpp;
@@ -1043,7 +1050,7 @@ struct VulkanRenderer::Impl {
             for (uint32_t i = 0; i + 4 <= j.destBytes; i += 4)
                 mem.Write32(d.base + i, (uint32_t(tmp[i]) << 24) | (uint32_t(tmp[i + 1]) << 16) | (uint32_t(tmp[i + 2]) << 8) | tmp[i + 3]);
         }
-        InvalidateTextures(d.base, j.destBytes, 827);
+        InvalidateTextures(d.base, j.destBytes, 827, !late);
     }
 
     // View of a still valid snapshot that matches this texture fetch, or null.
