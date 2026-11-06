@@ -692,8 +692,10 @@ uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args =
 int g_b_printed = 0, g_b_sh_printed = 0;
 uint64_t g_b_bad_sh[2][2];  // [vs/ps][indexed/non-indexed]
 std::vector<uint8_t> g_b_payload;
-std::unordered_map<uint32_t, int> g_b_drawn;  // packet -> swap it was drawn direct (CP thread)
-uint64_t g_b_repeats = 0;
+struct DrawnInfo { int swap; uint32_t surface, color, depth, window; };
+std::unordered_map<uint32_t, DrawnInfo> g_b_drawn;  // packet -> when and where it was drawn direct (CP thread)
+uint64_t g_b_repeats = 0, g_rp_never = 0, g_rp_seen = 0, g_rp_same_surface = 0, g_rp_same_window = 0, g_rp_same_swap = 0;
+int g_rp_printed = 0;
 
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
 
@@ -721,7 +723,25 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         // frame there is nothing left to draw.
         if ((g_direct & 64) && eligible) {
             const auto it = g_b_drawn.find(dc.packetAddr);
-            if (it != g_b_drawn.end() && it->second + 1 >= g_swaps_a.load(std::memory_order_relaxed)) { g_b_repeats++; return true; }
+            if (it != g_b_drawn.end() && it->second.swap + 1 >= g_swaps_a.load(std::memory_order_relaxed)) { g_b_repeats++; return true; }
+        }
+        if (g_tap_report && eligible) {
+            // What the draws without a record are (run 118: skipping them as tile replays lost menu backgrounds and
+            // most of the car-select car): same packet drawn before, and with which target and tile window.
+            const auto it = g_b_drawn.find(dc.packetAddr);
+            if (it == g_b_drawn.end()) g_rp_never++;
+            else {
+                g_rp_seen++;
+                const DrawnInfo& di = it->second;
+                g_rp_same_surface += di.surface == regs[0x2000] && di.color == regs[0x2001] && di.depth == regs[0x2002];
+                g_rp_same_window += di.window == regs[0x2080];
+                g_rp_same_swap += di.swap == g_swaps_a.load(std::memory_order_relaxed);
+                if (g_rp_printed < 12) {
+                    g_rp_printed++;
+                    std::fprintf(stderr, "[direct] no record, packet %08x drawn before at swap %d: surface %08x->%08x color %08x->%08x depth %08x->%08x window %08x->%08x\n",
+                                 dc.packetAddr, di.swap, di.surface, regs[0x2000], di.color, regs[0x2001], di.depth, regs[0x2002], di.window, regs[0x2080]);
+                }
+            }
         }
         // Safety valve: if the backlog grows past half the ring, apply everything queued (applying in order always
         // keeps the image consistent; only the lookups for those draws are lost).
@@ -856,9 +876,9 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         }
     }
     std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
-    if (g_direct & 64) {
+    if ((g_direct & 64) || g_tap_report) {
         if (g_b_drawn.size() > 65536) g_b_drawn.clear();
-        g_b_drawn[dc.packetAddr] = g_swaps_a.load(std::memory_order_relaxed);
+        g_b_drawn[dc.packetAddr] = {g_swaps_a.load(std::memory_order_relaxed), regs[0x2000], regs[0x2001], regs[0x2002], regs[0x2080]};
     }
     g_b_draws++;
     return true;
@@ -1228,6 +1248,10 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, record not a copy %llu, resolved from the record %llu\n",
                      (unsigned long long)g_rs_pushed, (unsigned long long)g_rs_wrapped, (unsigned long long)g_rs_nodraw,
                      (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_notcopy, (unsigned long long)g_rb_direct);
+        if (g_tap_report)
+            std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
+                         (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
+                         (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B resolve check: compared %llu, image differs %llu | by reg:", (unsigned long long)g_rb_cmp, (unsigned long long)g_rb_diff);
             for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++)
