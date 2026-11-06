@@ -86,6 +86,7 @@ CommandProcessor::Status CommandProcessor::Pump() {
 CommandProcessor::Result CommandProcessor::ExecutePacket(uint32_t& pos, uint32_t base, uint32_t sizeDwords,
                                                          uint32_t availDwords, int depth) {
     uint32_t header = ReadDword(base, sizeDwords, pos);
+    curPacket_ = (base + pos * 4) & 0x1FFFFFFF;
     uint32_t total = 1;
     // Reused across packets: a fresh vector per packet was a heap allocation for every packet.
     std::vector<uint32_t>& d = payload_;
@@ -266,6 +267,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (n <= first) break;
             uint32_t init = d[first];
             DrawCall dc;
+            dc.packetAddr = curPacket_;
             dc.primType = init & 0x3F;
             uint32_t source = (init >> 6) & 3;  // 0 = DMA, 1 = immediate, 2 = auto index
             dc.index32 = (init >> 11) & 1;
