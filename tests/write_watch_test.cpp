@@ -35,6 +35,7 @@ int main() {
         return 0;
     }
     ww.SetSkipCold(true);  // cover the opt-in quiet-memory rule too
+    ww.SetRegionQueries(false);  // one query per check first; the region queries have their own section
 
     mprotect(b, 1u << 20, PROT_READ | PROT_WRITE);  // committed after Init, as allocations are
 
@@ -97,6 +98,22 @@ int main() {
     ww.Harvest();
     b[0x1400000 - 4096 + 9] = 6;  // view b is known to write here now: seen right away
     CHECK(!ww.Clean(0x1400000, 0x1000, t3d));
+    // Region queries: the first check after a Harvest asks about the whole 2 MB region and keeps the
+    // answer, so a later write there is seen at the next Harvest.
+    ww.SetRegionQueries(true);
+    ww.Watch(0x200000, 0x2000);
+    ww.Harvest();
+    a[0x200000 + 4] = 1;  // makes the pages hot
+    ww.Harvest();
+    uint64_t tr = ww.Watch(0x200000, 0x2000);
+    ww.Harvest();
+    a[0x201000 + 4] = 2;  // written since the Harvest
+    CHECK(!ww.Clean(0x200000, 0x2000, tr));
+    CHECK(ww.Clean(0x200000, 0x1000, tr));
+    a[0x200000 + 8] = 3;  // after the region was asked about
+    CHECK(ww.Clean(0x200000, 0x1000, tr));
+    ww.Harvest();
+    CHECK(!ww.Clean(0x200000, 0x1000, tr));
     // Unwatched memory is never clean.
     CHECK(!ww.Clean(0x900000, 0x1000, ww.Watch(0, 0)));
     // Touch marks host writes.

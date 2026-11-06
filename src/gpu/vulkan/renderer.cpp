@@ -401,6 +401,7 @@ struct Texture {
     uint64_t lastFullGen = 0;  // frame of the last full hash
     uint32_t stable = 0;       // consecutive checked frames with unchanged content
     uint32_t guestBase = 0, guestSize = 0;
+    uint32_t idxLo = 0, idxHi = 0;  // the 1 MB chunks it is listed under in texChunks, [idxLo, idxHi)
     uint64_t wwToken = 0;  // write watch token of the bytes last checked (0 = not watched)
     bool ok = false;
 };
@@ -594,10 +595,37 @@ struct VulkanRenderer::Impl {
             if (snapsToo) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; continue; }
             if (const uint8_t* gp = mem.HostPtr(e.base, e.size)) SnapSample(gp, e.size, e.samples);
         }
-        for (auto& [k, t] : textures) {
-            const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
-            if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+        // Only the textures listed under the chunks this range touches (scanning every cached texture took
+        // 1 to 2.7 ms per frame over the race's 79 resolve writes).
+        const uint32_t c0 = uint32_t(lo >> kTexChunkShift), c1 = uint32_t(std::min<uint64_t>((hi + kTexChunkMask) >> kTexChunkShift, kTexChunks));
+        for (uint32_t c = c0; c < c1; c++)
+            for (uint64_t key : texChunks[c]) {
+                auto it = textures.find(key);
+                if (it == textures.end()) continue;
+                Texture& t = it->second;
+                const uint64_t tlo = t.guestBase & 0x1FFFFFFFu, thi = tlo + t.guestSize;
+                if (tlo < hi && lo < thi) t.validatedGen = ~0ull;
+            }
+    }
+    // Textures by the 1 MB chunks of guest physical memory they cover, for InvalidateTextures.
+    static constexpr uint32_t kTexChunkShift = 20, kTexChunkMask = (1u << kTexChunkShift) - 1, kTexChunks = 0x20000000u >> kTexChunkShift;
+    std::vector<std::vector<uint64_t>> texChunks = std::vector<std::vector<uint64_t>>(kTexChunks);
+    void TexUnlist(uint64_t key, Texture& t) {
+        for (uint32_t c = t.idxLo; c < t.idxHi; c++) {
+            auto& v = texChunks[c];
+            for (size_t i = 0; i < v.size(); i++)
+                if (v[i] == key) { v[i] = v.back(); v.pop_back(); break; }
         }
+        t.idxLo = t.idxHi = 0;
+    }
+    void TexList(uint64_t key, Texture& t) {
+        const uint64_t lo = t.guestBase & 0x1FFFFFFFu, hi = lo + t.guestSize;
+        const uint32_t c0 = uint32_t(lo >> kTexChunkShift), c1 = uint32_t(std::min<uint64_t>((hi + kTexChunkMask) >> kTexChunkShift, kTexChunks));
+        if (c0 == t.idxLo && c1 == t.idxHi) return;
+        TexUnlist(key, t);
+        for (uint32_t c = c0; c < c1; c++) texChunks[c].push_back(key);
+        t.idxLo = c0;
+        t.idxHi = c1;
     }
 
     // ---- resolved surfaces kept on the GPU ---------------------------------------------------------
@@ -1033,7 +1061,7 @@ struct VulkanRenderer::Impl {
                     for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
             }
         };
-        uint8_t* dst = mem.HostPtrWrite(d.base, j.destBytes);
+        uint8_t* dst = WbPtr(d.base, j.destBytes);
         if (dst) {
             rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
                 for (size_t i = size_t(ya) * w; i < size_t(yb) * w; i++) toFloat(i);
@@ -1942,8 +1970,36 @@ struct VulkanRenderer::Impl {
         { const char* av = std::getenv("FA_WW_ALLVIEWS"); ww.SetQueryAllViews(av && av[0] == '1'); }
         // FA_WW_COLD=1: no kernel query for memory not written in the last 120 frames (opt-in, see run 119).
         { const char* wc = std::getenv("FA_WW_COLD"); ww.SetSkipCold(wc && wc[0] == '1'); }
+        // FA_WW_REGIONQ=1: one kernel query per 2 MB region and view per frame instead of one per texture check
+        // and view (opt-in until a run shows no stale textures: like FA_WW_COLD it sees some writes a frame later).
+        { const char* rq = std::getenv("FA_WW_REGIONQ"); ww.SetRegionQueries(rq && rq[0] == '1'); }
         stats.writeWatch = 1;
-        std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
+        // Resolve writebacks go through a mapping of their own that is not write protected: through the watched
+        // views every first write to a page takes a fault (about 3 ms per 18 MB, the race writes about that much
+        // per frame), and the renderer marks that memory written itself (WwTouch). FA_WB_ALIAS=0 turns it off.
+        const char* wa = std::getenv("FA_WB_ALIAS");
+        const int fd = mem.PhysicalFd();
+        if (!(wa && wa[0] == '0') && fd >= 0) {
+            void* m = mmap(nullptr, mem.PhysicalSize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED) {
+                wbAlias = static_cast<uint8_t*>(m);
+                wbViews.assign(pv, pv + n);
+            }
+        }
+        std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "",
+                     wbAlias ? ", writebacks unwatched" : "");
+    }
+    uint8_t* wbAlias = nullptr;
+    std::vector<GuestMemory::PhysicalView> wbViews;
+    // Where a resolve writes guest memory: HostPtrWrite's checks, then the same bytes through wbAlias.
+    uint8_t* WbPtr(uint32_t a, uint32_t n) {
+        uint8_t* p = mem.HostPtrWrite(a, n);
+        if (!p || !wbAlias) return p;
+        for (const auto& v : wbViews) {
+            const uint8_t* b = static_cast<const uint8_t*>(v.base);
+            if (p >= b && uint64_t(p - b) + n <= v.size) return wbAlias + v.physOffset + (p - b);
+        }
+        return p;
     }
     // Physical address of a guest address the renderer reads (HostPtr's mapping), or -1.
     static int64_t WwPhys(uint32_t a) { return a < 0x20000000u ? int64_t(a) : a >= 0xA0000000u ? int64_t(a & 0x1FFFFFFFu) : -1; }
@@ -2349,6 +2405,7 @@ struct VulkanRenderer::Impl {
     }
 
     ~Impl() {
+        if (wbAlias) munmap(wbAlias, mem.PhysicalSize());
         if (dev) {
             vkDeviceWaitIdle(dev);
             for (Batch& b : batches) {
@@ -2669,6 +2726,7 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
+        TexList(key, tex);
         if (kBatches > 1 && InFlightWrites(t.base, size)) {
             prof::Add(prof::kFlushTex, 1);
             prof::Scope pw_(prof::kResolveWait);
@@ -4185,7 +4243,7 @@ struct VulkanRenderer::Impl {
                             for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
                     }
                 };
-                uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+                uint8_t* dst = WbPtr(d.base, destBytes);
                 if (dst) {
                     // Bands of rows in parallel: each converts its rows and writes their texels.
                     rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
@@ -4255,7 +4313,7 @@ struct VulkanRenderer::Impl {
             default: return false;
         }
         if (x8 >= bpp) return false;
-        uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+        uint8_t* dst = WbPtr(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
         auto xf = [&](uint32_t v) {
@@ -4413,6 +4471,7 @@ struct VulkanRenderer::Impl {
                 total -= ImageBytes(it->second.image);
                 garbageImages.push_back(it->second.image);
             }
+            TexUnlist(k, it->second);
             textures.erase(it);
             dropped++;
         }
