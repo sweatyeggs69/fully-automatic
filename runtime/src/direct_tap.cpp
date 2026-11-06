@@ -28,7 +28,14 @@ PPC_FUNC_IMPL(__imp__sub_82147370);
 PPC_FUNC_IMPL(__imp__sub_823162F8);
 
 namespace {
-bool g_on = std::getenv("FA_TAP") != nullptr;
+// FA_TAP=1 turns on the observe-only taps and parity report. FA_DIRECT is a bit mask of hooked families
+// that replace the PM4 source: bit 0 (1) = draw state constants (vertex and pixel float constants and fetch
+// constants come from the game's device shadow instead of the register file the PM4 writes built).
+// FA_DIRECT implies the snapshot hooks but not the report.
+const unsigned g_direct = std::getenv("FA_DIRECT") ? unsigned(std::strtoul(std::getenv("FA_DIRECT"), nullptr, 0)) : 0u;
+bool g_tap_report = std::getenv("FA_TAP") != nullptr;
+bool g_on = g_tap_report || g_direct != 0;
+uint64_t g_feed_draws = 0, g_feed_missing = 0, g_feed_changed = 0, g_feed_dwords = 0;
 std::atomic<uint64_t> g_tap_calls{0}, g_tap_indices{0}, g_cp_draws{0}, g_cp_indices{0};
 std::atomic<uint64_t> g_tap_last_calls{0};
 std::atomic<uint64_t> g_tap2_calls{0}, g_cp_auto_draws{0};
@@ -155,8 +162,8 @@ void snapshot_draw(const uint8_t* base, uint32_t dev) {
     g_snaps[g_snap_gen][pkt] = s;
 }
 
-void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
-    std::lock_guard<std::mutex> lk(g_snap_mu);
+// Finds the snapshot of the game draw that wrote the packet at pkt (caller holds g_snap_mu).
+const Snap* lookup_snap_locked(uint32_t pkt) {
     const Snap* sn = nullptr;
     for (int k = 0; k < 3 && !sn; k++) {
         auto it = g_snaps[(g_snap_gen + 3 - k) % 3].find(pkt);
@@ -171,6 +178,12 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
             }
         }
     }
+    return sn;
+}
+
+void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
+    std::lock_guard<std::mutex> lk(g_snap_mu);
+    const Snap* sn = lookup_snap_locked(pkt);
     if (!sn) { g_ex_missing++; return; }
     g_ex_found++;
     int dv = 0, dp = 0, dt = 0;
@@ -195,6 +208,35 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
     g_ex_diff_ps += dp != 0;
     g_ex_diff_tex += dt != 0;
     if (!dv && !dp && !dt) g_ex_equal++;
+}
+
+
+// FA_DIRECT bit 0: the command processor takes the draw's constants from the game's device shadow. Per-object
+// vec4s the game writes straight into the command stream (g_touched) are not in the shadow and keep their PM4 value.
+void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
+    if (!(g_direct & 1) || !dc.indexed) return;
+    std::lock_guard<std::mutex> lk(g_snap_mu);
+    const Snap* sn = lookup_snap_locked(dc.packetAddr);
+    g_feed_draws++;
+    if (!sn) { g_feed_missing++; return; }
+    const uint32_t rb[2] = {kRegVs, kRegPs};
+    const uint32_t* src[2] = {sn->vs, sn->ps};
+    for (int k = 0; k < 2; k++) {
+        for (uint32_t i = 0; i < 1024; i++) {
+            if (touched(k * 256 + (i >> 2))) continue;
+            uint32_t& dst = regs[rb[k] + i];
+            if (dst != src[k][i]) {
+                dst = src[k][i];
+                regs.aluDirty |= 1u << ((k * 1024 + i) >> 6);
+                g_feed_changed++;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < kTexDwords; i++) {
+        uint32_t& dst = regs[kRegTex + i];
+        if (dst != sn->tex[i]) { dst = sn->tex[i]; g_feed_changed++; }
+    }
+    g_feed_dwords += 2048 + kTexDwords;
 }
 
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
@@ -355,13 +397,15 @@ PPC_FUNC(sub_82315500) {
     __imp__sub_82315500(ctx, base);
     if (g_on) {
         snapshot_draw(base, dev);
-        tap_draw_shaders(base, dev);
-        uint64_t h[3];
-        game_hash(base, dev, h);
-        std::lock_guard<std::mutex> lk(g_par_mu);
-        g_gen[g_gen_idx].vs.insert(h[0]);
-        g_gen[g_gen_idx].ps.insert(h[1]);
-        g_gen[g_gen_idx].tex.insert(h[2]);
+        if (g_tap_report) {
+            tap_draw_shaders(base, dev);
+            uint64_t h[3];
+            game_hash(base, dev, h);
+            std::lock_guard<std::mutex> lk(g_par_mu);
+            g_gen[g_gen_idx].vs.insert(h[0]);
+            g_gen[g_gen_idx].ps.insert(h[1]);
+            g_gen[g_gen_idx].tex.insert(h[2]);
+        }
     }
 }
 
@@ -369,7 +413,8 @@ namespace fa::rt {
 // Called at every VdSwap.
 void direct_tap_frame_end() {
     if (!g_on) return;
-    if (!fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
+    if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
+    if ((g_direct & 1) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(g_par_mu);
@@ -381,7 +426,12 @@ void direct_tap_frame_end() {
         g_snap_gen = (g_snap_gen + 1) % 3;
         g_snaps[g_snap_gen].clear();
     }
-    if (g_swaps % 300) return;
+    if (g_direct && g_swaps % 300 == 0) {
+        std::lock_guard<std::mutex> lk(g_snap_mu);
+        std::fprintf(stderr, "[direct] swap %d: FA_DIRECT=%u fed draws %llu, no snapshot %llu, dwords replaced where the PM4 value differed %llu\n",
+                     g_swaps, g_direct, (unsigned long long)g_feed_draws, (unsigned long long)g_feed_missing, (unsigned long long)g_feed_changed);
+    }
+    if (!g_tap_report || g_swaps % 300) return;
     const uint64_t tc = g_tap_calls.load(), ti = g_tap_indices.load(), cd = g_cp_draws.load(), ci = g_cp_indices.load();
     std::fprintf(stderr, "[tap] swap %d: game DrawIndexed calls %llu indices %llu | CP indexed draws %llu indices %llu | index diff %lld\n",
                  g_swaps, (unsigned long long)tc, (unsigned long long)ti, (unsigned long long)cd, (unsigned long long)ci,
