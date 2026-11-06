@@ -316,6 +316,7 @@ struct XmaDecoder::Context {
     uint32_t guest_ptr = 0;
     bool allocated = false;
     bool enabled = false;
+    bool kicked = false;  // enabled by a kick since the last pass
     std::mutex mu;
     FrameDecoder dec;
     Carry carry;
@@ -347,12 +348,16 @@ struct XmaDecoder::Context {
         return false;
     }
 
-    void decode(XmaContextData& d, const GuestHooks& hooks) {
+    // kicked: this pass follows a kick. Continuous passes (the context stays enabled, as on the
+    // hardware) leave a context with no input alone: the game may be between setting the output
+    // valid and setting the next input valid.
+    void decode(XmaContextData& d, const GuestHooks& hooks, bool kicked) {
         if (!d.output_buffer_valid) {
-            st_no_output_.fetch_add(1, std::memory_order_relaxed);
+            if (kicked) st_no_output_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) {
+            if (!kicked) return;
             st_dry_.fetch_add(1, std::memory_order_relaxed);
             d.output_buffer_valid = 0;
             return;
@@ -575,6 +580,7 @@ void XmaDecoder::enable_context(uint32_t ptr) {
             std::fprintf(stderr, "[xma] kick #%llu ctx %d allocated=%d\n", (unsigned long long)nk, i,
                          int(contexts_[size_t(i)]->allocated));
         contexts_[size_t(i)]->enabled = true;
+        contexts_[size_t(i)]->kicked = true;
     }
     {
         std::lock_guard lk(wake_mu_);
@@ -675,16 +681,28 @@ bool XmaDecoder::work_once() {
         Context& c = *cp;
         std::lock_guard cl(c.mu);
         if (!c.allocated || !c.enabled) continue;
-        c.enabled = false;
+        const bool kicked = c.kicked;
+        c.kicked = false;
+        if (kick_only_) c.enabled = false;
         uint8_t* g = hooks_.host(c.guest_ptr);
         XmaContextData d;
         d.load(g);
         uint64_t frames_before = st_frames_.load(std::memory_order_relaxed);
         XmaContextData before = d;
-        c.decode(d, hooks_);
+        c.decode(d, hooks_, kicked || kick_only_);
+        const bool decoded = st_frames_.load(std::memory_order_relaxed) != frames_before;
+        if (!kicked && !decoded) {
+            // Idle continuous pass: write back only what changed, so a pass that did nothing never
+            // overwrites the context under the game.
+            uint8_t img[kContextSize];
+            std::memcpy(img, g, kContextSize);
+            d.store(img);
+            if (std::memcmp(img, g, kContextSize) != 0) std::memcpy(g, img, kContextSize);
+            continue;
+        }
         d.store(g);
         st_passes_.fetch_add(1, std::memory_order_relaxed);
-        if (trace_ctx_ && st_frames_.load(std::memory_order_relaxed) == frames_before && c.trace_count++ < 12) {
+        if (trace_ctx_ && kicked && !decoded && c.trace_count++ < 12) {
             // FA_XMA_DEBUG: a kicked context that decoded nothing; show why.
             std::fprintf(stderr,
                 "[xma] ctx %d kicked, no frame: in0 valid=%u ptr=%08x pk=%u | in1 valid=%u ptr=%08x pk=%u | "

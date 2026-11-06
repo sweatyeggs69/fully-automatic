@@ -275,6 +275,12 @@ private:
     bool wake_ = false;
     std::atomic<uint64_t> st_kicks_{0}, st_passes_{0}, st_loops_{0};
     bool trace_ctx_ = std::getenv("FA_XMA_DEBUG") != nullptr;  // log kicked contexts that decode nothing
+    // The hardware keeps decoding an enabled context until the game locks it; FA_XMA_KICK_ONLY=1
+    // restores the old model (one pass per kick, then the context is disabled).
+    bool kick_only_ = [] {
+        const char* e = std::getenv("FA_XMA_KICK_ONLY");
+        return e && *e && *e != '0';
+    }();
     // Bumped by the per-context decode loop (Context is a nested class).
     static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_, st_drained_, st_dry_, st_full_,
         st_no_output_;
