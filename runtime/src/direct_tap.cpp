@@ -7,6 +7,7 @@
 //                 DRAW_INDX packet (notes/d3d-map.md). Counted against the command processor's
 //                 indexed draws; the totals must match (draws over 65535 indices are split, so
 //                 compare index totals, not call counts).
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -472,6 +473,260 @@ bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     return true;
 }
 
+// ---- FA_DIRECT bit 3 (stage B): draw record queue ----------------------------------------------------
+// Stage A copied a full 13.5 KB snapshot per draw into a map on the game thread and rebuilt and diffed the whole
+// register image per draw on the CP thread (run 103: race 15 to 18 fps against 23 to 25). Here the game thread
+// diffs the game's state against its previous record and pushes only the changed dwords into a single-producer
+// single-consumer ring, in draw order. The CP thread applies records in order to its image of the game state
+// until it reaches the record whose packet matches the draw, so its image is exactly the game state at that draw,
+// and sends the backend only the 16-dword blocks those records touched.
+//
+// Game state image G: VS constants (mirror rule), PS constants, fetch, bool/loop and the render-state windows
+// without the three registers the game writes straight into the stream (those come from the CP).
+struct GSeg { uint32_t reg, n; };
+constexpr GSeg kGSegs[] = {{0x4000, 1024}, {0x4400, 1024}, {0x4800, 192}, {0x4900, 40},
+                           {0x2000, 17}, {0x2100, 21}, {0x2180, 5}, {0x2200, 8}, {0x2209, 3},
+                           {0x2280, 21}, {0x2300, 38}, {0x2380, 8}};
+constexpr uint32_t kGDwords = 1024 + 1024 + 192 + 40 + 17 + 21 + 5 + 8 + 3 + 21 + 38 + 8;
+// Registers the record does not hold but the renderer reads: window offset and scissor (not in the shadow) and the
+// directly written 0x2011, 0x2208 (RB_MODECONTROL), 0x2388. The CP image takes them from the CP's register file.
+constexpr uint32_t kCpRegs[] = {0x2080, 0x2081, 0x2082, 0x2011, 0x2208, 0x2388};
+
+constexpr uint32_t kQWords = 1u << 22, kQMask = kQWords - 1;  // 16 MB ring
+std::vector<uint32_t> g_q(kQWords);
+std::atomic<uint64_t> g_q_w{0}, g_q_r{0};
+// Record: [0] words, [1] flags (bit 0: full state), [2] packet key, [3] prim, [4] index count, [5] index address,
+// [6..12] vsObj vsUcode vsBytes psObj psUcode psBytes declObj, then runs [first reg][count][values...].
+constexpr uint32_t kRecHdr = 13;
+uint32_t g_prev_g[kGDwords];  // game thread
+bool g_prev_valid = false;    // game thread
+uint64_t g_q_pushed = 0, g_q_dropped = 0, g_q_words_pushed = 0;  // game thread
+std::vector<uint32_t> g_rec_buf;                                // game thread
+
+uint32_t draw_key(const uint8_t* base, uint32_t dev) {
+    const uint32_t wptr = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev));
+    // Recording variant (predicated tiling): the draw packet sits 48 bytes before the write pointer (run 104: every
+    // lookup matched at 12 dwords back); normal draws 16 bytes before.
+    const bool rec = (base[dev + 10432] & 4) != 0;
+    return (wptr - (rec ? 48 : 16)) & 0x1FFFFFFF;
+}
+
+void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a) {
+    uint32_t g[kGDwords];
+    {
+        auto rd_block = [&](uint32_t* dst, uint32_t off, uint32_t n) {
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(base + dev + off);
+            for (uint32_t i = 0; i < n; i++) dst[i] = __builtin_bswap32(src[i]);
+        };
+        uint32_t* o = g;
+        rd_block(o, kOffVs, 1024);
+        {
+            std::lock_guard<std::mutex> lk(g_set_mu);
+            for (uint32_t v = 0; v < 256; v++)
+                if (touched(v)) std::memcpy(o + v * 4, g_mirror + v * 4, 16);
+        }
+        o += 1024;
+        rd_block(o, kOffPs, 1024); o += 1024;
+        rd_block(o, kOffTex, 192); o += 192;
+        rd_block(o, 0x2780, 40); o += 40;
+        rd_block(o, 0x2CC0, 17); o += 17;
+        rd_block(o, 0x2D0C, 21); o += 21;
+        rd_block(o, 0x2D60, 5); o += 5;
+        rd_block(o, 0x2D74, 8); o += 8;
+        rd_block(o, 0x2D74 + 9 * 4, 3); o += 3;
+        rd_block(o, 0x2DA4, 21); o += 21;
+        rd_block(o, 0x2DF8, 38); o += 38;
+        rd_block(o, 0x2E90, 8); o += 8;
+    }
+    auto rd = [&](uint32_t addr) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + addr)); };
+    const bool full = !g_prev_valid;
+    std::vector<uint32_t>& r = g_rec_buf;
+    r.clear();
+    r.resize(kRecHdr);
+    r[1] = full ? 1 : 0;
+    r[2] = draw_key(base, dev);
+    r[3] = a.prim;
+    r[4] = a.count;
+    r[5] = a.ibBase ? a.ibBase + a.start * 2 : 0;
+    r[6] = rd(dev + 0x3294);
+    r[7] = r[6] ? rd(r[6] + 0x28) : 0;
+    r[8] = r[6] ? rd(r[6] + 0x258) : 0;
+    r[9] = rd(dev + 0x3290);
+    r[10] = r[9] ? rd(r[9] + 0x0C) : 0;
+    r[11] = r[9] ? rd(r[9] + 0x3C) : 0;
+    r[12] = rd(dev + 0x2C90);
+    uint32_t gi = 0;
+    for (const GSeg& sg : kGSegs) {
+        for (uint32_t i = 0; i < sg.n;) {
+            // Skip equal 4-dword groups quickly; most of the image is unchanged between draws.
+            if (!full && g[gi + i] == g_prev_g[gi + i]) {
+                if ((i & 3) == 0 && i + 4 <= sg.n && std::memcmp(g + gi + i, g_prev_g + gi + i, 16) == 0) { i += 4; continue; }
+                i++;
+                continue;
+            }
+            uint32_t j = i;
+            while (j < sg.n && (full || g[gi + j] != g_prev_g[gi + j])) j++;
+            r.push_back(sg.reg + i);
+            r.push_back(j - i);
+            r.insert(r.end(), g + gi + i, g + gi + j);
+            i = j;
+        }
+        gi += sg.n;
+    }
+    r[0] = uint32_t(r.size());
+    const uint64_t w = g_q_w.load(std::memory_order_relaxed), rr = g_q_r.load(std::memory_order_acquire);
+    if (w + r.size() - rr > kQWords) {
+        // The CP is too far behind: drop, and send the full state with the next record that fits.
+        g_q_dropped++;
+        g_prev_valid = false;
+        return;
+    }
+    for (size_t i = 0; i < r.size(); i++) g_q[(w + i) & kQMask] = r[i];
+    g_q_w.store(w + r.size(), std::memory_order_release);
+    std::memcpy(g_prev_g, g, sizeof g);
+    g_prev_valid = true;
+    g_q_pushed++;
+    g_q_words_pushed += r.size();
+}
+
+// CP thread state for the queue path.
+constexpr uint32_t kImg = 0x4928, kBlocks = (kImg + 15) / 16;
+uint32_t g_cur[kImg], g_sent[kImg];
+uint64_t g_blk_dirty[(kBlocks + 63) / 64];
+bool g_cur_init = false, g_sent_valid = false;
+uint64_t g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
+uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args = 0;
+int g_b_printed = 0;
+std::vector<uint8_t> g_b_payload;
+
+inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
+
+bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    if (!dc.indexed || !dc.inlineIndices.empty()) return false;
+    if (!g_cur_init) {
+        std::memcpy(g_cur + 0x2000, regs.r.data() + 0x2000, 0x400 * 4);
+        std::memcpy(g_cur + 0x4000, regs.r.data() + 0x4000, 0x928 * 4);
+        g_cur_init = true;
+    }
+    // Find the record for this packet among the next records, in order.
+    const uint64_t w = g_q_w.load(std::memory_order_acquire);
+    uint64_t r = g_q_r.load(std::memory_order_relaxed), at = r, match = ~0ull;
+    for (int n = 0; n < 256 && at < w; n++) {
+        if (g_q[(at + 2) & kQMask] == dc.packetAddr) { match = at; break; }
+        at += g_q[at & kQMask];
+    }
+    if (match == ~0ull) { g_b_missing++; return false; }
+    // Apply every record up to and including the match (records the CP never draws still carry state).
+    uint64_t hdr = 0;
+    while (r <= match) {
+        const uint32_t len = g_q[r & kQMask];
+        for (uint32_t i = kRecHdr; i < len;) {
+            const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
+            for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
+            i += 2 + cnt;
+        }
+        if (r != match) g_b_skipped++;
+        g_b_recs++;
+        hdr = r;
+        r += len;
+    }
+    g_q_r.store(r, std::memory_order_release);
+    for (uint32_t reg : kCpRegs)
+        if (g_cur[reg] != regs[reg]) { g_cur[reg] = regs[reg]; mark(reg); }
+    auto hv = [&](uint32_t i) { return g_q[(hdr + i) & kQMask]; };
+    if (g_tap_report) {
+        // Check the image against the CP's register file over everything the record holds, except the vec4s the
+        // per-object blocks write (the mirror rule; checked by the stage A tap).
+        g_b_cmp_draws++;
+        bool any = false;
+        int si = 0;
+        for (const GSeg& sg : kGSegs) {
+            for (uint32_t i = 0; i < sg.n; i++) {
+                const uint32_t reg = sg.reg + i;
+                if (reg >= 0x4000 && reg < 0x4800 && touched((reg - 0x4000) >> 2)) continue;
+                if (g_cur[reg] != regs[reg]) {
+                    any = true;
+                    g_b_diff_seg[si]++;
+                    if (g_b_printed < 12) {
+                        g_b_printed++;
+                        std::fprintf(stderr, "[direct] queue image reg %04x: game %08x cp %08x (packet %08x)\n", reg, g_cur[reg], regs[reg], dc.packetAddr);
+                    }
+                }
+            }
+            si++;
+        }
+        g_b_diff_draws += any;
+        g_b_bad_args += hv(3) != dc.primType || hv(4) != dc.indexCount || (hv(5) & 0x1FFFFFFF) != (dc.indexGuestAddr & 0x1FFFFFFF);
+    }
+    fa::gpu::DirectDraw rec;
+    rec.seq = g_dd_seq++;
+    rec.packetAddr = dc.packetAddr;
+    rec.primType = dc.primType;
+    rec.indexCount = dc.indexCount;
+    rec.indexAddr = dc.indexGuestAddr;
+    rec.index32 = dc.index32;
+    rec.indexEndian = uint8_t(dc.indexEndian);
+    rec.vsObj = hv(6); rec.vsUcode = hv(7); rec.vsBytes = hv(8);
+    rec.psObj = hv(9); rec.psUcode = hv(10); rec.psBytes = hv(11);
+    rec.declObj = hv(12);
+    rec.tileRows = regs.tileRows;
+    // Payload: runs inside the dirty blocks that differ from what the backend has (everything after a refusal).
+    g_b_payload.clear();
+    auto emit = [&](uint32_t i, uint32_t j) {
+        fa::gpu::DirectRegRun run{i, j - i};
+        const size_t o = g_b_payload.size();
+        g_b_payload.resize(o + sizeof run + run.count * 4);
+        std::memcpy(g_b_payload.data() + o, &run, sizeof run);
+        std::memcpy(g_b_payload.data() + o + sizeof run, g_cur + i, run.count * 4);
+        g_b_dwords += run.count;
+    };
+    if (!g_sent_valid) {
+        emit(0x2000, 0x2400);
+        emit(0x4000, kImg);
+    } else {
+        for (uint32_t wd = 0; wd < sizeof g_blk_dirty / 8; wd++) {
+            uint64_t m = g_blk_dirty[wd];
+            while (m) {
+                const uint32_t b = wd * 64 + __builtin_ctzll(m);
+                m &= m - 1;
+                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
+                for (uint32_t i = lo; i < hi;) {
+                    if (g_cur[i] == g_sent[i]) { i++; continue; }
+                    uint32_t j = i;
+                    while (j < hi && g_cur[j] != g_sent[j]) j++;
+                    emit(i, j);
+                    i = j;
+                }
+            }
+        }
+    }
+    rec.payloadBytes = uint32_t(g_b_payload.size());
+    if (!backend.DrawDirect(rec, g_b_payload.data())) {
+        g_b_refused++;
+        g_sent_valid = false;
+        return false;
+    }
+    if (!g_sent_valid) {
+        std::memcpy(g_sent + 0x2000, g_cur + 0x2000, 0x400 * 4);
+        std::memcpy(g_sent + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
+        g_sent_valid = true;
+    } else {
+        for (uint32_t wd = 0; wd < sizeof g_blk_dirty / 8; wd++) {
+            uint64_t m = g_blk_dirty[wd];
+            while (m) {
+                const uint32_t b = wd * 64 + __builtin_ctzll(m);
+                m &= m - 1;
+                const uint32_t lo = b * 16, hi = std::min(lo + 16, kImg);
+                std::memcpy(g_sent + lo, g_cur + lo, (hi - lo) * 4);
+            }
+        }
+    }
+    std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
+    g_b_draws++;
+    return true;
+}
+
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
     cp_parity(regs);
     exact_compare(dc.packetAddr, regs, &dc);
@@ -693,7 +948,9 @@ PPC_FUNC(sub_82315500) {
             g_cur_args.ibFlags = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ib));
             g_cur_args.ibBase = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ib + 0xC));
         }
-        snapshot_draw(base, dev);
+        // Stage A snapshots are only needed by the stage A path and the tap.
+        if ((g_direct & 7) || g_tap_report) snapshot_draw(base, dev);
+        if (g_direct & 8) push_record(base, dev, g_cur_args);
         std::memset(g_cur_own, 0, sizeof g_cur_own);
         if (g_tap_report) {
             tap_draw_shaders(base, dev);
@@ -713,7 +970,8 @@ void direct_tap_frame_end() {
     if (!g_on) return;
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
     if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
-    if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
+    if ((g_direct & 8) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw_queue;
+    else if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(g_par_mu);
@@ -732,6 +990,18 @@ void direct_tap_frame_end() {
         if (g_direct & 4)
             std::fprintf(stderr, "[direct] stage A: draws through DrawDirect %llu, no record %llu, refused by backend %llu, payload dwords %llu\n",
                          (unsigned long long)g_dd_draws, (unsigned long long)g_dd_missing, (unsigned long long)g_dd_refused, (unsigned long long)g_dd_dwords);
+    }
+    if ((g_direct & 8) && g_swaps % 300 == 0) {
+        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), payload dwords %llu\n",
+                     (unsigned long long)g_q_pushed, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
+                     (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
+                     (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_dwords);
+        if (g_tap_report) {
+            std::fprintf(stderr, "[direct] stage B check: draws %llu, image differs from CP %llu, args differ %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
+                         (unsigned long long)g_b_cmp_draws, (unsigned long long)g_b_diff_draws, (unsigned long long)g_b_bad_args);
+            for (size_t i = 0; i < sizeof kGSegs / sizeof kGSegs[0]; i++) std::fprintf(stderr, " %llu", (unsigned long long)g_b_diff_seg[i]);
+            std::fprintf(stderr, "\n");
+        }
     }
     if (!g_tap_report || g_swaps % 300) return;
     const uint64_t tc = g_tap_calls.load(), ti = g_tap_indices.load(), cd = g_cp_draws.load(), ci = g_cp_indices.load();
