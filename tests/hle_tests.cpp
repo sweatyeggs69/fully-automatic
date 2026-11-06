@@ -232,6 +232,26 @@ static void test_downmix() {
     AudioSystem::downmix_frame(in.data(), out.data());
     CHECK(std::fabs(out[0] - (0.25f + 0.70710678f * 0.5f)) < 1e-5f);
     CHECK(std::fabs(out[1] - (-0.25f + 0.70710678f * 0.5f)) < 1e-5f);
+
+    // Past full scale: soft limited, never above 1, still ordered, and counted.
+    for (int i = 0; i < 256; ++i) {
+        in[i] = 0.9f + 0.002f * float(i);   // FL rising from 0.9 to about 1.41
+        in[256 + i] = -1.5f;                // FR well past -1
+        in[512 + i] = 0.0f;
+    }
+    int expect = 256;  // every FR sample
+    for (int i = 0; i < 256; ++i) expect += in[i] > 1.0f;
+    int limited = AudioSystem::downmix_frame(in.data(), out.data());
+    CHECK(out[0] > 0.8f && out[0] < 0.9f);
+    bool ordered = true, bounded = true;
+    for (int i = 0; i < 256; ++i) {
+        if (std::fabs(out[2 * i]) > 1.0f || std::fabs(out[2 * i + 1]) > 1.0f) bounded = false;
+        if (i && out[2 * i] < out[2 * i - 2]) ordered = false;
+    }
+    CHECK(bounded);
+    CHECK(ordered);
+    CHECK(out[1] < -0.99f);
+    CHECK(limited == expect && expect > 400);
 }
 
 // FA_AUDIO_DUMP path: submitted frames land in a valid float WAV and in the stats.
@@ -316,7 +336,8 @@ static bool load_xma(const char* path, std::vector<uint8_t>& out) {
 // Plays a stream through the emulated hardware the way a game's XAudio does:
 // two rolling input buffers of a few packets each, a small output ring, and a
 // consumer that drains the ring and re-validates it.
-static void test_xma_hardware(const char* sample) {
+// kick_every_pass false: kick once, then rely on the context staying enabled.
+static void test_xma_hardware(const char* sample, bool kick_every_pass) {
     std::vector<uint8_t> stream;
     if (!load_xma(sample, stream)) {
         std::fprintf(stderr, "cannot read XMA sample %s\n", sample);
@@ -372,7 +393,7 @@ static void test_xma_hardware(const char* sample) {
     for (int iter = 0; iter < 200000; ++iter) {
         // Kick through the register page, as inline XDK code would.
         uint32_t kick = 1u;  // little-endian register value, as the game's byte-reversed store leaves it
-        std::memcpy(g.base + XmaDecoder::kRegisterBase + XmaDecoder::kRegKick, &kick, 4);
+        if (kick_every_pass || iter == 0) std::memcpy(g.base + XmaDecoder::kRegisterBase + XmaDecoder::kRegKick, &kick, 4);
         xma.work_once();
         d.load(g.base + ctx);
         // Drain everything between read and write offsets.
@@ -410,7 +431,10 @@ int main(int argc, char** argv) {
     test_context_packing();
     test_downmix();
     test_audio_dump(argv[2]);
-    if (const char* s = std::getenv("FA_XMA_SAMPLE")) test_xma_hardware(s);
+    if (const char* s = std::getenv("FA_XMA_SAMPLE")) {
+        test_xma_hardware(s, true);
+        test_xma_hardware(s, false);
+    }
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

@@ -77,8 +77,9 @@ public:
     bool has_device() const { return device_ != 0; }
 
     // 5.1 -> stereo downmix of one frame (planar host floats in, interleaved
-    // stereo out). Exposed for tests.
-    static void downmix_frame(const float* planar6, float* stereo_out);
+    // stereo out), with a soft limiter above 0.8. Returns how many output
+    // samples went past full scale before limiting. Exposed for tests.
+    static int downmix_frame(const float* planar6, float* stereo_out);
 
     static constexpr int kMaxQueuedFrames = 8;    // ~43 ms
 
@@ -94,6 +95,7 @@ public:
         uint64_t level_samples = 0;     // samples in sum_sq
         uint64_t silent_frames = 0;     // submitted frames that were all zero
         uint64_t clipped_samples = 0;   // device samples past +-1 after summing clients
+        uint64_t limited_samples = 0;   // downmixed samples past +-1 that the soft limiter bent back
         double max_gap_ms = 0;          // longest wait between device callbacks since the last take_stats()
         int min_queued = 1 << 30;       // fewest stereo samples queued at a device callback since the last take_stats()
     };
@@ -250,6 +252,10 @@ public:
         uint64_t frames = 0;         // XMA frames decoded
         uint64_t bad_frames = 0;     // invalid frame lengths skipped
         uint64_t decode_errors = 0;  // frames FFmpeg rejected
+        uint64_t drained = 0;        // passes that found a primed output ring empty (the reader caught up: a gap)
+        uint64_t dry = 0;            // passes that ran out of valid input buffers
+        uint64_t full = 0;           // passes that filled the output ring (read == write, output marked invalid)
+        uint64_t no_output = 0;      // kicked passes with the output buffer not valid
         int allocated = 0;           // contexts currently allocated
     };
     Stats stats();
@@ -269,8 +275,15 @@ private:
     bool wake_ = false;
     std::atomic<uint64_t> st_kicks_{0}, st_passes_{0}, st_loops_{0};
     bool trace_ctx_ = std::getenv("FA_XMA_DEBUG") != nullptr;  // log kicked contexts that decode nothing
+    // The hardware keeps decoding an enabled context until the game locks it; FA_XMA_KICK_ONLY=1
+    // restores the old model (one pass per kick, then the context is disabled).
+    bool kick_only_ = [] {
+        const char* e = std::getenv("FA_XMA_KICK_ONLY");
+        return e && *e && *e != '0';
+    }();
     // Bumped by the per-context decode loop (Context is a nested class).
-    static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_;
+    static std::atomic<uint64_t> st_frames_, st_bad_frames_, st_decode_errors_, st_drained_, st_dry_, st_full_,
+        st_no_output_;
 };
 
 }  // namespace fa::hle

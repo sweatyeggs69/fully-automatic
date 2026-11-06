@@ -316,15 +316,18 @@ struct XmaDecoder::Context {
     uint32_t guest_ptr = 0;
     bool allocated = false;
     bool enabled = false;
+    bool kicked = false;  // enabled by a kick since the last pass
     std::mutex mu;
     FrameDecoder dec;
     Carry carry;
     bool carry_crossed = false;
+    bool primed = false;  // wrote output since the last reset (an empty ring after this means the reader caught up)
     int trace_count = 0;
 
     void reset_stream() {
         carry.reset();
         carry_crossed = false;
+        primed = false;
         dec.flush();
     }
 
@@ -345,9 +348,17 @@ struct XmaDecoder::Context {
         return false;
     }
 
-    void decode(XmaContextData& d, const GuestHooks& hooks) {
-        if (!d.output_buffer_valid) return;
+    // kicked: this pass follows a kick. Continuous passes (the context stays enabled, as on the
+    // hardware) leave a context with no input alone: the game may be between setting the output
+    // valid and setting the next input valid.
+    void decode(XmaContextData& d, const GuestHooks& hooks, bool kicked) {
+        if (!d.output_buffer_valid) {
+            if (kicked) st_no_output_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) {
+            if (!kicked) return;
+            st_dry_.fetch_add(1, std::memory_order_relaxed);
             d.output_buffer_valid = 0;
             return;
         }
@@ -362,14 +373,26 @@ struct XmaDecoder::Context {
         uint32_t used = wr >= rd ? wr - rd : cap - rd + wr;
         uint32_t space = cap - used;
         const uint32_t frame_bytes = kSamplesPerFrame * 2 * uint32_t(channels);
+        if (used == 0 && primed) st_drained_.fetch_add(1, std::memory_order_relaxed);
+        // Never fill the ring completely: a full ring reads as read == write, the same as an empty
+        // one, and the next pass after the game re-validates it would overwrite samples the game
+        // had not read yet (run 128: "full" 800 to 1900 per 10 s and a buzz). FA_XMA_GAP=0 fills it.
+        static const bool keep_gap = [] {
+            const char* e = std::getenv("FA_XMA_GAP");
+            return !(e && *e == '0');
+        }();
+        const uint32_t reserve = keep_gap && cap >= 2 * frame_bytes ? frame_bytes : 0;
 
         float pcm0[kSamplesPerFrame], pcm1[kSamplesPerFrame];
         float* pcm[2] = {pcm0, pcm1};
         uint8_t be[kSamplesPerFrame * 4];
 
         int guard = 0;
-        while (space >= frame_bytes && guard++ < 256) {
-            if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) break;
+        while (space >= frame_bytes + reserve && guard++ < 256) {
+            if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) {
+                st_dry_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
             bool cur_valid = d.current_buffer ? d.input_buffer_1_valid : d.input_buffer_0_valid;
             if (!cur_valid) {  // the game refilled the other buffer only
                 d.current_buffer ^= 1;
@@ -437,6 +460,7 @@ struct XmaDecoder::Context {
             for (uint32_t i = 0; i < frame_bytes; ++i) out[(wr + i) % cap] = be[i];
             wr = (wr + frame_bytes) % cap;
             space -= frame_bytes;
+            primed = true;
             d.output_buffer_write_offset = wr / kBytesPerBlock;
 
             uint32_t next;
@@ -448,13 +472,17 @@ struct XmaDecoder::Context {
         }
         // A full ring reads as read == write; mark it invalid until the game
         // consumes some output and validates it again.
-        if (wr == rd) d.output_buffer_valid = 0;
+        if (wr == rd) {
+            st_full_.fetch_add(1, std::memory_order_relaxed);
+            d.output_buffer_valid = 0;
+        }
     }
 };
 
 // ------------------------------------------------------------ decoder
 
-std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0};
+std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0},
+    XmaDecoder::st_drained_{0}, XmaDecoder::st_dry_{0}, XmaDecoder::st_full_{0}, XmaDecoder::st_no_output_{0};
 
 XmaDecoder::XmaDecoder() = default;
 
@@ -466,6 +494,10 @@ XmaDecoder::Stats XmaDecoder::stats() {
     s.frames = st_frames_.load(std::memory_order_relaxed);
     s.bad_frames = st_bad_frames_.load(std::memory_order_relaxed);
     s.decode_errors = st_decode_errors_.load(std::memory_order_relaxed);
+    s.drained = st_drained_.load(std::memory_order_relaxed);
+    s.dry = st_dry_.load(std::memory_order_relaxed);
+    s.full = st_full_.load(std::memory_order_relaxed);
+    s.no_output = st_no_output_.load(std::memory_order_relaxed);
     std::lock_guard lk(alloc_mu_);
     for (auto& c : contexts_) s.allocated += c->allocated ? 1 : 0;
     return s;
@@ -550,6 +582,7 @@ void XmaDecoder::enable_context(uint32_t ptr) {
             std::fprintf(stderr, "[xma] kick #%llu ctx %d allocated=%d\n", (unsigned long long)nk, i,
                          int(contexts_[size_t(i)]->allocated));
         contexts_[size_t(i)]->enabled = true;
+        contexts_[size_t(i)]->kicked = true;
     }
     {
         std::lock_guard lk(wake_mu_);
@@ -650,16 +683,30 @@ bool XmaDecoder::work_once() {
         Context& c = *cp;
         std::lock_guard cl(c.mu);
         if (!c.allocated || !c.enabled) continue;
-        c.enabled = false;
+        const bool kicked = c.kicked;
+        c.kicked = false;
+        if (kick_only_) c.enabled = false;
         uint8_t* g = hooks_.host(c.guest_ptr);
+        uint8_t orig[kContextSize];
+        std::memcpy(orig, g, kContextSize);
         XmaContextData d;
-        d.load(g);
+        d.load(orig);
         uint64_t frames_before = st_frames_.load(std::memory_order_relaxed);
         XmaContextData before = d;
-        c.decode(d, hooks_);
-        d.store(g);
+        c.decode(d, hooks_, kicked || kick_only_);
+        const bool decoded = st_frames_.load(std::memory_order_relaxed) != frames_before;
+        // Write back only the bits this pass changed. The game can update the context in guest
+        // memory while we decode (read offset, input buffers, valid flags); a whole-context store
+        // would put its old values back, and with continuous passes that happens all the time.
+        uint8_t img[kContextSize];
+        d.store(img);
+        for (uint32_t k = 0; k < kContextSize; ++k) {
+            uint8_t changed = uint8_t(orig[k] ^ img[k]);
+            if (changed) g[k] = uint8_t((g[k] & ~changed) | (img[k] & changed));
+        }
+        if (!kicked && !decoded) continue;  // idle continuous pass
         st_passes_.fetch_add(1, std::memory_order_relaxed);
-        if (trace_ctx_ && st_frames_.load(std::memory_order_relaxed) == frames_before && c.trace_count++ < 12) {
+        if (trace_ctx_ && kicked && !decoded && c.trace_count++ < 12) {
             // FA_XMA_DEBUG: a kicked context that decoded nothing; show why.
             std::fprintf(stderr,
                 "[xma] ctx %d kicked, no frame: in0 valid=%u ptr=%08x pk=%u | in1 valid=%u ptr=%08x pk=%u | "

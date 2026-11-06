@@ -30,18 +30,24 @@ void audio_stats_reporter(int secs) {
         double rms = a.level_samples ? std::sqrt(a.sum_sq / double(a.level_samples)) : 0.0;
         std::fprintf(stderr,
                      "[audio] callbacks %.0f/s, frames %.0f/s (%.0f/s needed), silent %llu, dropped %llu, "
-                     "underrun %.1f%%, peak %.1f dBFS, rms %.1f dBFS | xma: %d contexts, kicks %.0f/s, "
+                     "underrun %.1f%%, peak %.1f dBFS, rms %.1f dBFS, limited %llu | xma: %d contexts, kicks %.0f/s, "
                      "frames %.0f/s, bad %llu, errors %llu, passes %.0f/s, worker loops %.0f/s | "
                      "device: clipped %llu, max callback gap %.1f ms, min queued %d samples\n",
                      double(a.callbacks - prev.callbacks) / dt, double(a.frames - prev.frames) / dt,
                      double(AudioSystem::kSampleRate) / AudioSystem::kFrameSamples,
                      (unsigned long long)(a.silent_frames - prev.silent_frames),
-                     (unsigned long long)(a.dropped - prev.dropped), under, db(a.peak), db(rms), x.allocated,
+                     (unsigned long long)(a.dropped - prev.dropped), under, db(a.peak), db(rms),
+                     (unsigned long long)(a.limited_samples - prev.limited_samples), x.allocated,
                      double(x.kicks - xprev.kicks) / dt, double(x.frames - xprev.frames) / dt,
                      (unsigned long long)(x.bad_frames - xprev.bad_frames),
                      (unsigned long long)(x.decode_errors - xprev.decode_errors), double(x.passes - xprev.passes) / dt,
                      double(x.loops - xprev.loops) / dt, (unsigned long long)(a.clipped_samples - prev.clipped_samples),
                      a.max_gap_ms, a.min_queued == (1 << 30) ? -1 : a.min_queued);
+        // Output rings: "drained" passes found a ring the game had read empty (an audible gap for
+        // that voice unless it was ending), "dry" ran out of input, "full" filled the ring.
+        std::fprintf(stderr, "[audio] xma rings: drained %llu, dry %llu, full %llu, no output %llu\n",
+                     (unsigned long long)(x.drained - xprev.drained), (unsigned long long)(x.dry - xprev.dry),
+                     (unsigned long long)(x.full - xprev.full), (unsigned long long)(x.no_output - xprev.no_output));
         std::fflush(stderr);
         prev = a;
         xprev = x;
