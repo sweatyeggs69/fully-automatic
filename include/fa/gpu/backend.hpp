@@ -43,6 +43,34 @@ struct DrawCall {
     uint64_t psHash = 0;
 };
 
+// Direct draw record (direct graphics hooks, notes/direct-draw-record-spec.md): one draw as the game
+// issued it through D3D, read from the game's device shadow instead of decoded from PM4.
+// Register state travels as a payload of register runs holding only what changed since the
+// previous record (constants, fetch constants, bool/loop constants and render state are all
+// registers: kAluConstBase.., kFetchConstBase.., kBoolConstBase.., 0x2000..). The first record of a
+// frame carries everything. The payload lives in the producer's frame arena until the backend has
+// finished the GPU work that used it.
+struct DirectRegRun {
+    uint32_t first;  // register index
+    uint32_t count;  // dwords of values (host order) that follow this header
+};
+struct DirectDraw {
+    uint32_t seq = 0;          // draw order within the frame
+    uint32_t packetAddr = 0;   // matching DRAW_INDX packet while the command processor still runs (0 = none)
+    uint32_t primType = 0;     // Xenos VGT primitive type
+    uint32_t indexCount = 0;
+    uint32_t indexAddr = 0;    // guest address of the first index; 0 = auto indices
+    uint8_t index32 = 0, indexEndian = 0;
+    // Identities: the game's shader and vertex declaration objects, and where the microcode is.
+    uint32_t vsObj = 0, vsUcode = 0, vsBytes = 0;
+    uint32_t psObj = 0, psUcode = 0, psBytes = 0;
+    uint32_t declObj = 0;
+    // The game's own dirty masks for this draw (informational: the payload is authoritative).
+    uint64_t vsConstDirty = 0, psConstDirty = 0;
+    uint32_t fetchDirty = 0, stateDirty = 0;
+    uint32_t payloadBytes = 0;  // bytes of DirectRegRun headers and values
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -64,6 +92,9 @@ public:
     // The command processor ran out of commands or is blocked waiting: a good moment to hand
     // recorded work to the GPU and apply finished writes.
     virtual void Idle() {}
+    // Direct draw record: applies the payload to the backend's own register state and draws with it.
+    // Returns false when the backend cannot draw records (the caller falls back to the command stream).
+    virtual bool DrawDirect(const DirectDraw& draw, const uint8_t* payload) { (void)draw; (void)payload; return false; }
 };
 
 }  // namespace fa::gpu

@@ -3895,6 +3895,65 @@ struct VulkanRenderer::Impl {
         return VkRect2D{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
     }
 
+    // ---- direct draw records --------------------------------------------------------------------
+    // Register state built from the records' payloads (the command processor's register file is
+    // not used for these draws).
+    RegisterFile directRegs = [] { RegisterFile r; r[xe::RB_MODECONTROL] = xe::kEdramColorDepth; return r; }();
+    // Shader microcode read from guest memory, per (address, size, stage). Valid while write watch
+    // says its pages are unchanged; without write watch, for the rest of the frame it was read in.
+    struct DirectShader { std::vector<uint32_t> ucode; uint64_t hash = 0, wwToken = 0, frame = ~0ull; };
+    std::unordered_map<uint64_t, DirectShader> directShaders;
+
+    const DirectShader* DirectUcode(uint32_t addr, uint32_t bytes, uint32_t type) {
+        if (!addr || !bytes || (bytes & 3) || bytes > 0x40000) return nullptr;
+        DirectShader& e = directShaders[(uint64_t(addr) << 32) ^ (uint64_t(bytes) << 1) ^ type];
+        const uint32_t n = bytes / 4;
+        if (e.ucode.size() == n && (e.frame == frame || (e.wwToken && WwClean(addr, bytes, e.wwToken)))) return &e;
+        if (!mem.HostPtr(addr, bytes)) return nullptr;
+        e.wwToken = WwWatch(addr, bytes);  // before reading: a write during the read makes it stale
+        e.ucode.resize(n);
+        for (uint32_t i = 0; i < n; i++) e.ucode[i] = mem.Read32(addr + i * 4);
+        e.hash = HashUcode(e.ucode.data(), n) ^ (uint64_t(type) << 63);  // the command processor's scheme
+        e.frame = frame;
+        stats.directShaderReads++;
+        return &e;
+    }
+
+    bool DrawDirect(const DirectDraw& d, const uint8_t* payload) {
+        for (uint32_t off = 0; off + sizeof(DirectRegRun) <= d.payloadBytes;) {
+            DirectRegRun run;
+            std::memcpy(&run, payload + off, sizeof run);
+            off += sizeof run;
+            if (uint64_t(run.count) * 4 > d.payloadBytes - off || uint64_t(run.first) + run.count > kRegisterCount) break;  // malformed: stop
+            std::memcpy(&directRegs.r[run.first], payload + off, size_t(run.count) * 4);
+            off += run.count * 4;
+            stats.directRegs += run.count;
+            // Float constant blocks of 64 dwords that changed (the renderer uploads only those).
+            const uint32_t a0 = std::max(run.first, pm4::kAluConstBase), a1 = std::min(run.first + run.count, pm4::kAluConstBase + 2048u);
+            for (uint32_t b = (a0 - pm4::kAluConstBase) >> 6; a0 < a1 && b <= (a1 - 1 - pm4::kAluConstBase) >> 6; b++) directRegs.aluDirty |= 1u << b;
+        }
+        const DirectShader* vs = DirectUcode(d.vsUcode, d.vsBytes, 0);
+        const DirectShader* ps = DirectUcode(d.psUcode, d.psBytes, 1);
+        stats.directDraws++;
+        if (!vs || !ps) { stats.drawsSkipped++; return true; }
+        DrawCall dc;
+        dc.primType = d.primType;
+        dc.indexCount = d.indexCount;
+        dc.indexed = d.indexAddr != 0;
+        dc.index32 = d.index32 != 0;
+        dc.indexGuestAddr = d.indexAddr;
+        dc.indexEndian = d.indexEndian;
+        dc.packetAddr = d.packetAddr;
+        dc.vsUcode = vs->ucode.data();
+        dc.vsDwords = uint32_t(vs->ucode.size());
+        dc.vsHash = vs->hash;
+        dc.psUcode = ps->ucode.data();
+        dc.psDwords = uint32_t(ps->ucode.size());
+        dc.psHash = ps->hash;
+        Draw(dc, directRegs);
+        return true;
+    }
+
     // ---- resolves ----------------------------------------------------------------------------
     void Resolve(const RegisterFile& regs) {
         prof::Scope ps_(prof::kResolve);
@@ -4420,6 +4479,13 @@ void VulkanRenderer::Draw(const DrawCall& draw, const RegisterFile& regs) {
     if (p_->ready && !p_->broken) p_->Draw(draw, regs);
     if (p_->next) p_->next->Draw(draw, regs);
 }
+
+bool VulkanRenderer::DrawDirect(const DirectDraw& draw, const uint8_t* payload) {
+    if (!p_->ready || p_->broken) return false;
+    return p_->DrawDirect(draw, payload);
+}
+
+const RegisterFile& VulkanRenderer::DirectRegisters() const { return p_->directRegs; }
 
 void VulkanRenderer::Resolve(const RegisterFile& regs) {
     if (p_->ready && !p_->broken) p_->Resolve(regs);

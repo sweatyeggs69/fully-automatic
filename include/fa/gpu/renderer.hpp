@@ -35,6 +35,8 @@ public:
         // called unchanged that had changed (FA_WW_VERIFY=1 only, should stay 0).
         std::atomic<uint64_t> writeWatch{0}, textureWwClean{0}, textureWwMiss{0};
         std::atomic<uint64_t> tileResolvesExtended{0};  // FA_TILE_ONCE: first-tile resolves copied at full height
+        // Direct draw records drawn, payload register dwords applied, shader microcode reads (new or changed).
+        std::atomic<uint64_t> directDraws{0}, directRegs{0}, directShaderReads{0};
     };
 
     // `next` receives every call too (FrameBackend: stats, texture debug view, window frames).
@@ -53,6 +55,9 @@ public:
     void Sync() override;
     bool WriteWhenDone(uint32_t addr, uint32_t value) override;
     void Idle() override;
+    bool DrawDirect(const DirectDraw& draw, const uint8_t* payload) override;
+    // Register state the direct records have built up (tests, diagnostics).
+    const RegisterFile& DirectRegisters() const;
 
     // Submits pending GPU work and waits for it (tests).
     void Flush();

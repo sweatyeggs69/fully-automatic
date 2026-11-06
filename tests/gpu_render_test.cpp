@@ -460,6 +460,87 @@ int main() {
         (void)none;
     }
 
+    // Direct draw records: the same red triangle as the first section, and a green one that only
+    // changes the vertex fetch constant, drawn from hand-made records with the shaders read from
+    // guest memory; then a resolve built from the records' register state.
+    {
+        const uint32_t vsAddr = 0x108000, psAddr = 0x10A000, greenVb = 0x107000, destD = 0x3A0000;
+        const std::vector<uint32_t> vsU = xasm::ColorVS(), psU = xasm::ColorPS();
+        for (size_t i = 0; i < vsU.size(); i++) mem.Write32(vsAddr + uint32_t(i) * 4, vsU[i]);
+        for (size_t i = 0; i < psU.size(); i++) mem.Write32(psAddr + uint32_t(i) * 4, psU[i]);
+        const float green[3][7] = {{64, 0, 0, 0, 1, 0, 1}, {128, 0, 0, 0, 1, 0, 1}, {64, 64, 0, 0, 1, 0, 1}};
+        for (int v = 0; v < 3; v++)
+            for (int c = 0; c < 7; c++) mem.Write32(greenVb + (v * 7 + c) * 4, F(green[v][c]));
+        std::vector<uint8_t> payload;
+        auto run = [&](uint32_t first, std::initializer_list<uint32_t> v) {
+            DirectRegRun h{first, uint32_t(v.size())};
+            const uint8_t* hp = reinterpret_cast<const uint8_t*>(&h);
+            payload.insert(payload.end(), hp, hp + sizeof h);
+            for (uint32_t x : v) { const uint8_t* xp = reinterpret_cast<const uint8_t*>(&x); payload.insert(payload.end(), xp, xp + 4); }
+        };
+        auto record = [&](uint32_t vbAddr) {
+            DirectDraw d;
+            d.primType = xe::kPrimTriangleList;
+            d.indexCount = 3;
+            d.vsObj = 0x40001000; d.vsUcode = vsAddr; d.vsBytes = uint32_t(vsU.size() * 4);
+            d.psObj = 0x40002000; d.psUcode = psAddr; d.psBytes = uint32_t(psU.size() * 4);
+            run(pm4::kFetchConstBase, {vbAddr | 3, (21u << 2) | kEndian8in32});
+            d.payloadBytes = uint32_t(payload.size());
+            return d;
+        };
+        // First record of a frame: all the state it needs.
+        run(xe::RB_SURFACE_INFO, {128, 0, 0x200});  // surface, colour, depth info
+        run(xe::RB_COLOR_MASK, {0xF});
+        run(xe::RB_DEPTHCONTROL, {0, 0x00010001});   // depth control, blend control 0
+        run(xe::PA_SU_SC_MODE_CNTL, {0, 0});         // SC mode, VTE (positions in pixels)
+        run(xe::PA_SC_WINDOW_OFFSET, {0, 0x80000000u, (64u << 16) | 128});
+        run(xe::PA_SU_VTX_CNTL, {1});
+        run(pm4::kAluConstBase + 256 * 4, {F(1), F(1), F(1), F(1)});  // PS c0
+        const uint64_t draws0 = st.draws, reads0 = st.directShaderReads;
+        DirectDraw d1 = record(vb);
+        // Clear to blue: copy and clear registers for the resolve.
+        RegisterFile rr;
+        rr[pm4::kFetchConstBase] = rectVb | 3;
+        rr[pm4::kFetchConstBase + 1] = (6u << 2) | kEndian8in32;
+        rr[xe::RB_COLOR_CLEAR] = rr[xe::RB_COLOR_CLEAR_LO] = 0xFFFF0000u;
+        rr[xe::RB_COPY_CONTROL] = (1u << 8) | (3u << 20);
+        rr[xe::RB_MODECONTROL] = xe::kEdramCopy;
+        CHECK(r.DrawDirect(d1, payload.data()));  // applies the state (this triangle is cleared away)
+        // Clear with the resolve built from that state, then draw the red triangle again (applying
+        // the same payload twice changes nothing).
+        RegisterFile rc = r.DirectRegisters();
+        for (uint32_t i : {uint32_t(xe::RB_COLOR_CLEAR), uint32_t(xe::RB_COLOR_CLEAR_LO), uint32_t(xe::RB_COPY_CONTROL), uint32_t(xe::RB_MODECONTROL),
+                           pm4::kFetchConstBase, pm4::kFetchConstBase + 1})
+            rc[i] = rr[i];
+        r.Resolve(rc);
+        CHECK(r.DrawDirect(d1, payload.data()));
+        // Second record: only the vertex fetch constant changes.
+        payload.clear();
+        DirectDraw d2 = record(greenVb);
+        CHECK(r.DrawDirect(d2, payload.data()));
+        CHECK(r.DirectRegisters()[xe::RB_COLOR_MASK] == 0xF);  // state from the first record kept
+        // Resolve the frame.
+        rc[xe::RB_COPY_CONTROL] = 0;
+        rc[xe::RB_COPY_DEST_BASE] = destD;
+        rc[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+        rc[xe::RB_COPY_DEST_INFO] = (kFmt8_8_8_8 << 7) | kEndian8in32;
+        r.Resolve(rc);
+        r.Flush();
+        CHECK(st.draws == draws0 + 3);
+        CHECK(st.directShaderReads == reads0 + 2);  // each shader read once, then reused
+        uint8_t px[4];
+        const uint32_t pts[3][2] = {{4, 4}, {100, 4}, {100, 60}};
+        const uint8_t want[3][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}};
+        for (int i = 0; i < 3; i++) {
+            Pixel(mem, destD, 128, 64, pts[i][0], pts[i][1], px);
+            const bool ok = px[0] == want[i][0] && px[1] == want[i][1] && px[2] == want[i][2];
+            if (!ok) std::printf("FAIL direct (%u,%u) = %02x %02x %02x %02x\n", pts[i][0], pts[i][1], px[0], px[1], px[2], px[3]);
+            CHECK(ok);
+        }
+        std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
+                    (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());
+    }
+
     if (failures) { std::printf("gpu_render_test: %d failure(s)\n", failures); return 1; }
     std::printf("gpu_render_test: ok\n");
     return 0;
