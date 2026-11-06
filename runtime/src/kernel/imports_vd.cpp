@@ -13,6 +13,8 @@
 #include "fa/rt/video.hpp"
 #include "fa/rt/store_trace_ctl.hpp"
 
+namespace fa::rt { __attribute__((weak)) void direct_tap_frame_end(); }  // runtime/src/direct_tap.cpp (fullauto only)
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -260,6 +262,7 @@ FA_IMPORT(VdSetDisplayMode) { ret32(ctx, 0); }
 FA_IMPORT(VdInitializeScalerCommandBuffer) { ret32(ctx, 0); }
 FA_IMPORT(VdSwap) {
     fa::rt::store_trace_frame_end();
+    if (fa::rt::direct_tap_frame_end) fa::rt::direct_tap_frame_end();
     // (buffer, fetch constant, writeback, system buffer, system buffer id, frontbuffer address ptr,
     //  format ptr, color space ptr, width ptr, height ptr). The caller reserves 64 dwords of the
     // ring at `buffer` for the swap: load the frontbuffer fetch constant into fetch slot 0, emit

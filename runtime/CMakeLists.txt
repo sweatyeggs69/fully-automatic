@@ -77,7 +77,7 @@ if(EXISTS ${FA_PPC_DIR}/ppc_config.h)
         DEPENDS ${FA_PPC_DIR}/ppc_func_mapping.cpp ${FA_RT_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_import_stubs.py
         VERBATIM)
 
-    add_executable(fullauto src/main.cpp ${STUBS} ${PPC_SOURCES})
+    add_executable(fullauto src/main.cpp src/direct_tap.cpp ${STUBS} ${PPC_SOURCES})
     # Printed at startup as "[build] commit ... ppc ...". tools/fa-build.sh passes both; a plain
     # cmake run falls back to the git commit at configure time and ppc/.fa-inputs if present.
     if(NOT FA_BUILD_COMMIT)
