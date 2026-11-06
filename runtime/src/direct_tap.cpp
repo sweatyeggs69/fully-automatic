@@ -268,9 +268,21 @@ static void tap_draw_shaders(const uint8_t* base, uint32_t dev) {
     for (int k = 0; k < 2; k++) {
         const uint32_t obj = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev + kOffs[k]));
         if (!obj) { g_dsh_null[k].fetch_add(1, std::memory_order_relaxed); continue; }
+        if (k == 1) {
+            // Slot 1 is not a shader object with the slot 0 layout (code pointer at +0x28 reads 0). Dump raw dwords only.
+            std::lock_guard<std::mutex> lk(g_sh_mu);
+            g_dsh_objs[1].insert(obj);
+            if (g_dsh_samples[1] < 4 && g_dsh_seen[1].insert(obj).second) {
+                g_dsh_samples[1]++;
+                std::fprintf(stderr, "[tap] draw slot1 raw obj %08x:", obj);
+                for (uint32_t i = 0; i < 24; i++) std::fprintf(stderr, " %08x", __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + i * 4)));
+                std::fprintf(stderr, "\n");
+            }
+            continue;
+        }
         const uint32_t code = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x28));
         const uint32_t size = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x258));
-        const bool ok = size && size < 65536 && (size & 3) == 0;
+        const bool ok = size && size < 65536 && (size & 3) == 0 && code >= 0x10000;
         uint64_t h = 1469598103934665603ull ^ size;
         if (ok) for (uint32_t i = 0; i < size; i++) h = (h ^ base[code + i]) * 1099511628211ull;
         else g_dsh_bad[k].fetch_add(1, std::memory_order_relaxed);
