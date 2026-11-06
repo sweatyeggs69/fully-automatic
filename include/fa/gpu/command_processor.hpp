@@ -78,6 +78,7 @@ private:
     void TraceReg(uint32_t reg, uint32_t value);
     void TraceSwap();
     Stats stats_;
+    uint32_t curPacket_ = 0;  // physical address of the packet being executed
     std::vector<uint32_t> payload_;  // scratch for the packet being executed
 };
 

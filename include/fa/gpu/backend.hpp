@@ -26,6 +26,7 @@ struct DrawCall {
     bool indexed = false;       // false = auto-generated indices
     bool index32 = false;
     uint32_t indexGuestAddr = 0;
+    uint32_t packetAddr = 0;    // physical address of the DRAW_INDX packet header (diagnostics, direct hooks)
     uint32_t indexEndian = 0;   // Xenos endian swap mode for index data
     std::vector<uint32_t> inlineIndices;  // indices carried inside the packet (host order)
     // Shader microcode loaded with IM_LOAD / IM_LOAD_IMMEDIATE (host order dwords), owned by the
