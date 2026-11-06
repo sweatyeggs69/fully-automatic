@@ -232,6 +232,26 @@ static void test_downmix() {
     AudioSystem::downmix_frame(in.data(), out.data());
     CHECK(std::fabs(out[0] - (0.25f + 0.70710678f * 0.5f)) < 1e-5f);
     CHECK(std::fabs(out[1] - (-0.25f + 0.70710678f * 0.5f)) < 1e-5f);
+
+    // Past full scale: soft limited, never above 1, still ordered, and counted.
+    for (int i = 0; i < 256; ++i) {
+        in[i] = 0.9f + 0.002f * float(i);   // FL rising from 0.9 to about 1.41
+        in[256 + i] = -1.5f;                // FR well past -1
+        in[512 + i] = 0.0f;
+    }
+    int expect = 256;  // every FR sample
+    for (int i = 0; i < 256; ++i) expect += in[i] > 1.0f;
+    int limited = AudioSystem::downmix_frame(in.data(), out.data());
+    CHECK(out[0] > 0.8f && out[0] < 0.9f);
+    bool ordered = true, bounded = true;
+    for (int i = 0; i < 256; ++i) {
+        if (std::fabs(out[2 * i]) > 1.0f || std::fabs(out[2 * i + 1]) > 1.0f) bounded = false;
+        if (i && out[2 * i] < out[2 * i - 2]) ordered = false;
+    }
+    CHECK(bounded);
+    CHECK(ordered);
+    CHECK(out[1] < -0.99f);
+    CHECK(limited == expect && expect > 400);
 }
 
 // FA_AUDIO_DUMP path: submitted frames land in a valid float WAV and in the stats.

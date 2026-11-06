@@ -77,8 +77,9 @@ public:
     bool has_device() const { return device_ != 0; }
 
     // 5.1 -> stereo downmix of one frame (planar host floats in, interleaved
-    // stereo out). Exposed for tests.
-    static void downmix_frame(const float* planar6, float* stereo_out);
+    // stereo out), with a soft limiter above 0.8. Returns how many output
+    // samples went past full scale before limiting. Exposed for tests.
+    static int downmix_frame(const float* planar6, float* stereo_out);
 
     static constexpr int kMaxQueuedFrames = 8;    // ~43 ms
 
@@ -94,6 +95,7 @@ public:
         uint64_t level_samples = 0;     // samples in sum_sq
         uint64_t silent_frames = 0;     // submitted frames that were all zero
         uint64_t clipped_samples = 0;   // device samples past +-1 after summing clients
+        uint64_t limited_samples = 0;   // downmixed samples past +-1 that the soft limiter bent back
         double max_gap_ms = 0;          // longest wait between device callbacks since the last take_stats()
         int min_queued = 1 << 30;       // fewest stereo samples queued at a device callback since the last take_stats()
     };
