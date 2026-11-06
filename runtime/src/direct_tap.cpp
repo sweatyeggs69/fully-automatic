@@ -1380,7 +1380,10 @@ PPC_FUNC(sub_82148508) {
 
 // Stage C3 writers: skipped inside the flush (see c3_skip).
 PPC_FUNC(sub_82146F60) {
-    if (c3_skip()) { g_c3_skipped++; return; }
+    // r5 = first register of the window. 0x2200 holds RB_MODECONTROL (0x2208): the resolve sets copy mode and only
+    // this window sets it back, so without it the CP took every later draw for a resolve (run 136: black screen).
+    // 0x2000 holds RB_SURFACE_INFO, which the CP's tile-once skip matches against. Both stay (28 dwords at most).
+    if (c3_skip() && ctx.r5.u32 != 0x2200 && ctx.r5.u32 != 0x2000) { g_c3_skipped++; return; }
     __imp__sub_82146F60(ctx, base);
 }
 PPC_FUNC(sub_82147020) {
