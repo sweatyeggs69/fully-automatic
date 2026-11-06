@@ -1889,6 +1889,8 @@ struct VulkanRenderer::Impl {
         for (int i = 0; i < n; i++) views.push_back({pv[i].base, pv[i].physOffset, pv[i].size});
         const char* why = nullptr;
         if (!ww.Init(views, mem.PhysicalSize(), &why)) { std::fprintf(stderr, "[writewatch] off: %s\n", why); return; }
+        // FA_WW_ALLVIEWS=1: a texture check asks the kernel about every view, not only the views seen writing there.
+        { const char* av = std::getenv("FA_WW_ALLVIEWS"); ww.SetQueryAllViews(av && av[0] == '1'); }
         stats.writeWatch = 1;
         std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
     }
@@ -1915,6 +1917,8 @@ struct VulkanRenderer::Impl {
         prof::Add(prof::kWwPagesWatched, st.pagesWatched);
         prof::Add(prof::kWwScanCalls, st.scanCalls);
         prof::Add(prof::kWwQueries, st.queryCalls);
+        prof::Add(prof::kWwQueryUs, uint64_t(st.queryMs * 1000.0));
+        prof::Add(prof::kWwQuerySkips, st.querySkips);
     }
 
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
