@@ -500,18 +500,21 @@ std::atomic<uint64_t> g_q_w{0}, g_q_r{0};
 constexpr uint32_t kRecHdr = 13;
 uint32_t g_prev_g[kGDwords];  // game thread
 bool g_prev_valid = false;    // game thread
-uint64_t g_q_pushed = 0, g_q_dropped = 0, g_q_words_pushed = 0;  // game thread
+uint64_t g_q_pushed = 0, g_q_dropped = 0, g_q_words_pushed = 0, g_q_nonidx = 0;  // game thread
 std::vector<uint32_t> g_rec_buf;                                // game thread
 
-uint32_t draw_key(const uint8_t* base, uint32_t dev) {
+// Packet address of the draw the game just wrote, from the device's write pointer (which points at the last dword
+// written). Indexed draws (82315500): the 5-dword DRAW_INDX starts 16 bytes back; in the recording variant
+// (predicated tiling) 48 bytes back (run 104: every lookup matched there). Non-indexed draws (823152C0): the 3-dword
+// auto-index DRAW_INDX starts 8 bytes back; in the recording variant it is the 4th of 14 dwords, 40 bytes back.
+uint32_t draw_key(const uint8_t* base, uint32_t dev, bool indexed = true) {
     const uint32_t wptr = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev));
-    // Recording variant (predicated tiling): the draw packet sits 48 bytes before the write pointer (run 104: every
-    // lookup matched at 12 dwords back); normal draws 16 bytes before.
     const bool rec = (base[dev + 10432] & 4) != 0;
-    return (wptr - (rec ? 48 : 16)) & 0x1FFFFFFF;
+    const uint32_t back = indexed ? (rec ? 48 : 16) : (rec ? 40 : 8);
+    return (wptr - back) & 0x1FFFFFFF;
 }
 
-void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a) {
+void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool indexed = true) {
     uint32_t g[kGDwords];
     {
         auto rd_block = [&](uint32_t* dst, uint32_t off, uint32_t n) {
@@ -544,10 +547,10 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a) {
     r.clear();
     r.resize(kRecHdr);
     r[1] = full ? 1 : 0;
-    r[2] = draw_key(base, dev);
+    r[2] = draw_key(base, dev, indexed);
     r[3] = a.prim;
     r[4] = a.count;
-    r[5] = a.ibBase ? a.ibBase + a.start * 2 : 0;
+    r[5] = indexed && a.ibBase ? a.ibBase + a.start * 2 : 0;
     r[6] = rd(dev + 0x3294);
     r[7] = r[6] ? rd(r[6] + 0x28) : 0;
     r[8] = r[6] ? rd(r[6] + 0x258) : 0;
@@ -594,7 +597,7 @@ constexpr uint32_t kImg = 0x4928, kBlocks = (kImg + 15) / 16;
 uint32_t g_cur[kImg], g_sent[kImg];
 uint64_t g_blk_dirty[(kBlocks + 63) / 64];
 bool g_cur_init = false, g_sent_valid = false;
-uint64_t g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
+uint64_t g_b_nonidx = 0, g_b_draws = 0, g_b_missing = 0, g_b_refused = 0, g_b_dwords = 0, g_b_skipped = 0, g_b_recs = 0;
 uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args = 0;
 int g_b_printed = 0;
 std::vector<uint8_t> g_b_payload;
@@ -602,7 +605,8 @@ std::vector<uint8_t> g_b_payload;
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
 
 bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
-    if (!dc.indexed || !dc.inlineIndices.empty()) return false;
+    // FA_DIRECT bit 4 (16) adds non-indexed draws (auto indices); their records are queued either way.
+    if (!dc.inlineIndices.empty() || (!dc.indexed && !(g_direct & 16))) return false;
     if (!g_cur_init) {
         std::memcpy(g_cur + 0x2000, regs.r.data() + 0x2000, 0x400 * 4);
         std::memcpy(g_cur + 0x4000, regs.r.data() + 0x4000, 0x928 * 4);
@@ -657,16 +661,17 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
             si++;
         }
         g_b_diff_draws += any;
-        g_b_bad_args += hv(3) != dc.primType || hv(4) != dc.indexCount || (hv(5) & 0x1FFFFFFF) != (dc.indexGuestAddr & 0x1FFFFFFF);
+        g_b_bad_args += hv(3) != dc.primType || hv(4) != dc.indexCount || (dc.indexed && (hv(5) & 0x1FFFFFFF) != (dc.indexGuestAddr & 0x1FFFFFFF));
     }
     fa::gpu::DirectDraw rec;
     rec.seq = g_dd_seq++;
     rec.packetAddr = dc.packetAddr;
     rec.primType = dc.primType;
     rec.indexCount = dc.indexCount;
-    rec.indexAddr = dc.indexGuestAddr;
+    rec.indexAddr = dc.indexed ? dc.indexGuestAddr : 0;
     rec.index32 = dc.index32;
     rec.indexEndian = uint8_t(dc.indexEndian);
+    if (!dc.indexed) g_b_nonidx++;
     rec.vsObj = hv(6); rec.vsUcode = hv(7); rec.vsBytes = hv(8);
     rec.psObj = hv(9); rec.psUcode = hv(10); rec.psBytes = hv(11);
     rec.declObj = hv(12);
@@ -884,9 +889,24 @@ PPC_FUNC(sub_82147370) {
     __imp__sub_82147370(ctx, base);
 }
 
+void apply_pending_locked(const uint8_t* base);
+
+// Non-indexed draw (823152C0): r3 device, r4 primitive type, r5 start vertex (written to the shadow as 0x2102
+// VGT_INDX_OFFSET before the flush), r6 vertex count. Counts above 65535 are split into several packets by the
+// game; those are left to the PM4 path (no record).
 PPC_FUNC(sub_823152C0) {
     if (g_on) g_tap2_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t dev = ctx.r3.u32;
+    const DrawArgs a{ctx.r4.u32, 0, ctx.r6.u32, 0, 0};
     __imp__sub_823152C0(ctx, base);
+    if ((g_direct & 8) && a.count <= 65535) {
+        {
+            std::lock_guard<std::mutex> lk(g_set_mu);
+            apply_pending_locked(base);
+        }
+        push_record(base, dev, a, false);
+        g_q_nonidx++;
+    }
 }
 
 // Applies the per-object constant blocks issued so far to the mirror, in stream order (caller holds g_set_mu).
@@ -992,8 +1012,8 @@ void direct_tap_frame_end() {
                          (unsigned long long)g_dd_draws, (unsigned long long)g_dd_missing, (unsigned long long)g_dd_refused, (unsigned long long)g_dd_dwords);
     }
     if ((g_direct & 8) && g_swaps % 300 == 0) {
-        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), payload dwords %llu\n",
-                     (unsigned long long)g_q_pushed, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
+        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (non-indexed %llu, drawn direct %llu) (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), payload dwords %llu\n",
+                     (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
                      (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_dwords);
         if (g_tap_report) {
