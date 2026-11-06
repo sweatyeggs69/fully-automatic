@@ -34,7 +34,7 @@ struct KeyHash {
         return h;
     }
 };
-struct Agg { uint64_t stores = 0, bytes = 0; std::map<uint32_t, uint64_t> ops; };
+struct Agg { uint64_t stores = 0, bytes = 0, draws = 0; std::map<uint32_t, uint64_t> ops; };
 
 std::mutex g_mu;
 std::vector<Range> g_ranges;
@@ -84,6 +84,7 @@ void dump() {
         Agg& l = leaf[name_of(k.pc[0])];
         l.stores += a.stores;
         l.bytes += a.bytes;
+        l.draws += a.draws;
         for (auto& [op, n] : a.ops) l.ops[op] += n;
     }
     std::fprintf(f, "# guest stores into GPU command buffers, %d frame(s) from swap %d\n", g_frames, g_first);
@@ -102,6 +103,19 @@ void dump() {
         for (auto& [op, c] : a->ops) std::fprintf(f, "%02x:%llu ", op, (unsigned long long)c);
         std::fprintf(f, "]\n");
     }
+    std::fprintf(f, "\n## draw packet headers (exact DRAW_INDX/DRAW_INDX_2 headers) by writing function\n");
+    {
+        uint64_t total = 0;
+        for (auto& [n, a] : leaf) total += a.draws;
+        std::fprintf(f, "# total draw headers %llu\n", (unsigned long long)total);
+        for (auto& [n, a] : leaf)
+            if (a.draws) std::fprintf(f, "%9llu %s\n", (unsigned long long)a.draws, n.c_str());
+        std::map<std::string, uint64_t> chain2;
+        for (auto& [k, a] : g_agg)
+            if (a.draws) chain2[name_of(k.pc[0]) + " < " + name_of(k.pc[1]) + " < " + name_of(k.pc[2])] += a.draws;
+        std::fprintf(f, "# by leaf < caller < caller2\n");
+        for (auto& [c, n] : chain2) std::fprintf(f, "%9llu %s\n", (unsigned long long)n, c.c_str());
+    }
     std::fprintf(f, "\n## counters: instrumented stores seen %llu, in physical windows %llu, inside known ranges %llu, ranges %zu, instrumented TUs %d\n",
                  (unsigned long long)g_hits, (unsigned long long)g_hits_phys, (unsigned long long)g_hits_in, g_ranges.size(), g_tus);
     {
@@ -109,8 +123,11 @@ void dump() {
         for (auto& [k, a] : g_out) {
             Agg& l = oleaf[name_of(k.pc[0])];
             l.stores += a.stores;
+            l.draws += a.draws;
             for (auto& [op, n] : a.ops) l.ops[op] += n;
         }
+        for (auto& [n, a] : oleaf)
+            if (a.draws) std::fprintf(f, "# OUTSIDE known ranges: %llu exact draw headers from %s\n", (unsigned long long)a.draws, n.c_str());
         std::fprintf(f, "## PM4-header-looking 32-bit stores OUTSIDE known ranges (%zu leaf functions)\n", oleaf.size());
         for (auto& [n, a] : oleaf) {
             std::fprintf(f, "%9llu %s  [", (unsigned long long)a.stores, n.c_str());
@@ -168,6 +185,8 @@ extern "C" void fa_st_hit(uint32_t ea, uint32_t size, uint64_t value) {
         a2.stores++;
         a2.bytes += size;
         a2.ops[(value >> 8) & 0x7F]++;
+        if ((value >> 24) == 0xC0 && (((value >> 8) & 0xFF) == 0x22 || ((value >> 8) & 0xFF) == 0x36) && ((value >> 16) & 0x3FFF) <= 7)
+            a2.draws++;
         g_out_pages[phys >> 16]++;
         return;
     }
@@ -180,6 +199,11 @@ extern "C" void fa_st_hit(uint32_t ea, uint32_t size, uint64_t value) {
     a.bytes += size;
     // A 32-bit store that looks like a type-3 PM4 header: record its opcode.
     if (size == 4 && (value >> 30) == 3) a.ops[(value >> 8) & 0x7F]++;
+    // A real draw packet header: type 3, opcode DRAW_INDX (0x22) or DRAW_INDX_2 (0x36), at most 8 payload dwords.
+    // Far fewer false hits than the opcode histogram above, which also counts negative floats.
+    if (size == 4 && (value >> 24) == 0xC0 && (((value >> 8) & 0xFF) == 0x22 || ((value >> 8) & 0xFF) == 0x36) &&
+        ((value >> 16) & 0x3FFF) <= 7)
+        a.draws++;
 }
 
 namespace fa::rt {
