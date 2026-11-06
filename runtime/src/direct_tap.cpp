@@ -23,6 +23,7 @@ namespace fa::rt { uint64_t gpu_predicated_skips(); }
 
 PPC_FUNC_IMPL(__imp__sub_82315500);  // generated as extern "C"
 PPC_FUNC_IMPL(__imp__sub_823152C0);
+PPC_FUNC_IMPL(__imp__sub_82147BF8);
 PPC_FUNC_IMPL(__imp__sub_823162F8);
 
 namespace {
@@ -30,6 +31,11 @@ bool g_on = std::getenv("FA_TAP") != nullptr;
 std::atomic<uint64_t> g_tap_calls{0}, g_tap_indices{0}, g_cp_draws{0}, g_cp_indices{0};
 std::atomic<uint64_t> g_tap_last_calls{0};
 std::atomic<uint64_t> g_tap2_calls{0}, g_cp_auto_draws{0};
+// Shader bind tap (82147BF8: r4 flag, r5 shader object, microcode pointer at +0x28, byte size at +0x258).
+std::mutex g_sh_mu;
+std::atomic<uint64_t> g_sh_calls[2]{};
+std::unordered_set<uint32_t> g_sh_objs;
+std::unordered_set<uint64_t> g_sh_code;
 std::atomic<int> g_swaps_a{0};
 int g_swaps = 0;
 // Draw identity repeats within one game frame (CP thread only). If the command processor sees every
@@ -231,6 +237,22 @@ PPC_FUNC(sub_823162F8) {
     __imp__sub_823162F8(ctx, base);
 }
 
+PPC_FUNC(sub_82147BF8) {
+    if (g_on) {
+        const uint32_t obj = ctx.r5.u32;
+        g_sh_calls[ctx.r4.u32 != 0].fetch_add(1, std::memory_order_relaxed);
+        const uint32_t code = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x28));
+        const uint32_t size = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x258));
+        uint64_t h = 1469598103934665603ull ^ size;
+        if (size && size < 65536)
+            for (uint32_t i = 0; i < size; i++) h = (h ^ base[code + i]) * 1099511628211ull;
+        std::lock_guard<std::mutex> lk(g_sh_mu);
+        g_sh_objs.insert(obj);
+        g_sh_code.insert(h);
+    }
+    __imp__sub_82147BF8(ctx, base);
+}
+
 PPC_FUNC(sub_823152C0) {
     if (g_on) g_tap2_calls.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_823152C0(ctx, base);
@@ -307,6 +329,11 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   recording-variant match offsets (dwords back from end, count):");
         for (uint32_t k = 1; k <= 24; k++) if (g_rec_k[k]) std::fprintf(stderr, " %u:%llu", k, (unsigned long long)g_rec_k[k]);
         std::fprintf(stderr, "\n");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sh_mu);
+        std::fprintf(stderr, "[tap]   shader binds: flag0 %llu flag1 %llu | distinct shader objects %zu, distinct microcode hashes %zu\n",
+                     (unsigned long long)g_sh_calls[0].load(), (unsigned long long)g_sh_calls[1].load(), g_sh_objs.size(), g_sh_code.size());
     }
     std::fprintf(stderr, "[tap]   repeats with identical window/target state %llu, with different state %llu | CP predicatedSkips %llu\n",
                  (unsigned long long)g_rep_same_sig, (unsigned long long)g_rep_diff_sig,
