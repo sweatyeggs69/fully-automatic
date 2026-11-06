@@ -11,24 +11,48 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 
 #include "fa/gpu/command_processor.hpp"
 #include "fa/rt/import.hpp"
 
 PPC_FUNC_IMPL(__imp__sub_82315500);  // generated as extern "C"
+PPC_FUNC_IMPL(__imp__sub_823152C0);
 
 namespace {
 bool g_on = std::getenv("FA_TAP") != nullptr;
 std::atomic<uint64_t> g_tap_calls{0}, g_tap_indices{0}, g_cp_draws{0}, g_cp_indices{0};
 std::atomic<uint64_t> g_tap_last_calls{0};
+std::atomic<uint64_t> g_tap2_calls{0}, g_cp_auto_draws{0};
+std::atomic<int> g_swaps_a{0};
 int g_swaps = 0;
+// Draw identity repeats within one game frame (CP thread only). If the command processor sees every
+// draw about three times, the game is replaying its command buffer once per screen tile.
+std::unordered_map<uint64_t, uint32_t> g_frame_draws;
+int g_epoch = 0;
+uint64_t g_hist[6] = {};   // [1..4] draws seen that many times in a frame, [5] five or more
+uint64_t g_frames_hist = 0;
 
 void on_cp_draw(const fa::gpu::DrawCall& dc) {
-    if (!dc.indexed) return;
+    if (!dc.indexed) { g_cp_auto_draws.fetch_add(1, std::memory_order_relaxed); return; }
+    const int e = g_swaps_a.load(std::memory_order_relaxed);
+    if (e != g_epoch) {
+        for (auto& [k, c] : g_frame_draws) g_hist[c > 5 ? 5 : c]++;
+        g_frame_draws.clear();
+        g_epoch = e;
+        g_frames_hist++;
+    }
+    uint64_t key = dc.indexGuestAddr * 0x9E3779B97F4A7C15ull ^ (uint64_t(dc.indexCount) << 8) ^ dc.vsHash * 31 ^ dc.psHash * 131 ^ dc.primType;
+    g_frame_draws[key]++;
     g_cp_draws.fetch_add(1, std::memory_order_relaxed);
     g_cp_indices.fetch_add(dc.indexCount, std::memory_order_relaxed);
 }
 }  // namespace
+
+PPC_FUNC(sub_823152C0) {
+    if (g_on) g_tap2_calls.fetch_add(1, std::memory_order_relaxed);
+    __imp__sub_823152C0(ctx, base);
+}
 
 PPC_FUNC(sub_82315500) {
     if (g_on) {
@@ -44,10 +68,15 @@ namespace fa::rt {
 void direct_tap_frame_end() {
     if (!g_on) return;
     if (!fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
-    if (++g_swaps % 300) return;
+    g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
+    if (g_swaps % 300) return;
     const uint64_t tc = g_tap_calls.load(), ti = g_tap_indices.load(), cd = g_cp_draws.load(), ci = g_cp_indices.load();
     std::fprintf(stderr, "[tap] swap %d: game DrawIndexed calls %llu indices %llu | CP indexed draws %llu indices %llu | index diff %lld\n",
                  g_swaps, (unsigned long long)tc, (unsigned long long)ti, (unsigned long long)cd, (unsigned long long)ci,
                  (long long)ti - (long long)ci);
+    std::fprintf(stderr, "[tap]   game non-indexed (823152C0) calls %llu | CP auto-index draws %llu | repeats of an identical CP draw within a frame (cumulative, 1x 2x 3x 4x 5x+): %llu %llu %llu %llu %llu over %llu frames\n",
+                 (unsigned long long)g_tap2_calls.load(), (unsigned long long)g_cp_auto_draws.load(), (unsigned long long)g_hist[1],
+                 (unsigned long long)g_hist[2], (unsigned long long)g_hist[3], (unsigned long long)g_hist[4],
+                 (unsigned long long)g_hist[5], (unsigned long long)g_frames_hist);
 }
 }  // namespace fa::rt
