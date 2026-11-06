@@ -104,12 +104,14 @@ constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;  // covers all windows
 // the per-object constant blocks the game writes straight into the stream (823162F8 + 821B8510), which are not in the
 // shadow. The mirror holds the latest value of every ALU vec4 any block wrote (the GPU keeps registers until rewritten).
 struct DrawArgs { uint32_t prim, start, count, ibFlags, ibBase; };
-struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords], mir[1024]; DrawArgs a; };  // mir: VS vec4s only (all blocks seen start at VS vec4 64)
+struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords], mir[1024]; uint64_t own[4]; DrawArgs a; };  // mir: VS vec4s only (all blocks seen start at VS vec4 64)
 struct PendingBlock { uint32_t first, count, payload; };
 std::vector<PendingBlock> g_pending;   // under g_set_mu
 uint32_t g_mirror[2048];               // under g_set_mu
 uint64_t g_mirror_valid[8];            // vec4 bits ever written by a block (under g_set_mu)
-DrawArgs g_cur_args{};                 // set by the draw hook for snapshot_draw (game draw thread)
+DrawArgs g_cur_args{};
+uint64_t g_cur_own[4];                 // vec4s written by blocks issued since the previous draw (draw thread)
+uint64_t g_own_cmp = 0, g_own_diff = 0;                 // set by the draw hook for snapshot_draw (game draw thread)
 uint64_t g_rec_cmp = 0, g_rec_bad_prim = 0, g_rec_bad_count = 0, g_rec_bad_addr = 0, g_mir_cmp = 0, g_mir_diff = 0;
 int g_rec_printed = 0, g_mir_printed = 0;
 uint64_t g_mir_vec[256];
@@ -185,6 +187,7 @@ void snapshot_draw(const uint8_t* base, uint32_t dev) {
     const uint32_t* q = reinterpret_cast<const uint32_t*>(base + dev + kStBase);
     for (uint32_t i = 0; i < kStDwords; i++) s.st[i] = __builtin_bswap32(q[i]);
     s.a = g_cur_args;
+    std::memcpy(s.own, g_cur_own, sizeof s.own);
     {
         std::lock_guard<std::mutex> lk(g_set_mu);
         std::memcpy(s.mir, g_mirror, sizeof s.mir);
@@ -246,12 +249,14 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs, const fa::gp
             g_mir_cmp++;
             bool same = true;
             for (uint32_t j = 0; j < 4; j++) same &= sn->mir[v * 4 + j] == regs[0x4000 + v * 4 + j];
+            const bool own = sn->own[v >> 6] >> (v & 63) & 1;
+            if (own) { g_own_cmp++; g_own_diff += !same; }
             if (!same) {
                 g_mir_diff++;
                 g_mir_vec[v]++;
                 if (g_mir_printed < 12 && g_mir_cmp > 20000000) {
                     g_mir_printed++;
-                    std::fprintf(stderr, "[tap] mirror vec4 %u: game %08x %08x %08x %08x cp %08x %08x %08x %08x (packet %08x)\n", v,
+                    std::fprintf(stderr, "[tap] mirror vec4 %u%s: game %08x %08x %08x %08x cp %08x %08x %08x %08x (packet %08x)\n", v, own ? " (own block)" : "",
                                  sn->mir[v * 4], sn->mir[v * 4 + 1], sn->mir[v * 4 + 2], sn->mir[v * 4 + 3],
                                  regs[0x4000 + v * 4], regs[0x4001 + v * 4], regs[0x4002 + v * 4], regs[0x4003 + v * 4], pkt);
                 }
@@ -526,7 +531,9 @@ PPC_FUNC(sub_82315500) {
     if (g_on) {
         {
             std::lock_guard<std::mutex> lk(g_set_mu);
+            std::memset(g_cur_own, 0, sizeof g_cur_own);
             for (const PendingBlock& b : g_pending) {
+                for (uint32_t v = b.first; v < b.first + b.count && v < 256; v++) g_cur_own[v >> 6] |= 1ull << (v & 63);
                 for (uint32_t i = 0; i < b.count * 4 && b.first * 4 + i < 2048; i++)
                     g_mirror[b.first * 4 + i] = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + b.payload + i * 4));
                 for (uint32_t v = b.first; v < b.first + b.count && v < 512; v++) g_mirror_valid[v >> 6] |= 1ull << (v & 63);
@@ -610,6 +617,7 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   stage A record: draws %llu, prim differs %llu, count differs %llu, index address differs %llu | per-object constant mirror: vec4 compared %llu, differ %llu\n",
                      (unsigned long long)g_rec_cmp, (unsigned long long)g_rec_bad_prim, (unsigned long long)g_rec_bad_count, (unsigned long long)g_rec_bad_addr,
                      (unsigned long long)g_mir_cmp, (unsigned long long)g_mir_diff);
+        std::fprintf(stderr, "[tap]   vec4s written by the draw's own blocks: compared %llu, differ %llu\n", (unsigned long long)g_own_cmp, (unsigned long long)g_own_diff);
         std::fprintf(stderr, "[tap]   mirror differences by vec4:");
         for (uint32_t v = 0; v < 256; v++) if (g_mir_vec[v]) std::fprintf(stderr, " %u:%llu", v, (unsigned long long)g_mir_vec[v]);
         std::fprintf(stderr, "\n");
