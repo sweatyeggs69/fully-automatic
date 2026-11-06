@@ -640,6 +640,10 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
                     key = a & 0x1FFFFFFF;
                     prim = init & 0x3F;
                     count = init >> 16;
+                    // Stop at the copy draw: after it the game clears RB_COPY_CONTROL and RB_COPY_DEST_INFO (run 113:
+                    // all 5085 resolve images had 0 there), and those later writes must not reach the copy.
+                    a = after + 4;
+                    break;
                 }
                 a += 4 + n * 4;
                 break;
