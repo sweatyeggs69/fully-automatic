@@ -692,6 +692,8 @@ uint64_t g_b_cmp_draws = 0, g_b_diff_draws = 0, g_b_diff_seg[16], g_b_bad_args =
 int g_b_printed = 0, g_b_sh_printed = 0;
 uint64_t g_b_bad_sh[2][2];  // [vs/ps][indexed/non-indexed]
 std::vector<uint8_t> g_b_payload;
+std::unordered_map<uint32_t, int> g_b_drawn;  // packet -> swap it was drawn direct (CP thread)
+uint64_t g_b_repeats = 0;
 
 inline void mark(uint32_t reg) { g_blk_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
 
@@ -714,6 +716,13 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     }
     if (match == ~0ull) {
         g_b_missing++;
+        // FA_DIRECT bit 6 (64): a packet the direct path already drew in this or the previous frame is a tile replay
+        // that the tile-once skip did not catch (about 31% of CP draws, run 106). With one record = one draw at full
+        // frame there is nothing left to draw.
+        if ((g_direct & 64) && eligible) {
+            const auto it = g_b_drawn.find(dc.packetAddr);
+            if (it != g_b_drawn.end() && it->second + 1 >= g_swaps_a.load(std::memory_order_relaxed)) { g_b_repeats++; return true; }
+        }
         // Safety valve: if the backlog grows past half the ring, apply everything queued (applying in order always
         // keeps the image consistent; only the lookups for those draws are lost).
         if (w - r > kQWords / 2) match = ~0ull - 1;
@@ -847,13 +856,17 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         }
     }
     std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
+    if (g_direct & 64) {
+        if (g_b_drawn.size() > 65536) g_b_drawn.clear();
+        g_b_drawn[dc.packetAddr] = g_swaps_a.load(std::memory_order_relaxed);
+    }
     g_b_draws++;
     return true;
 }
 
 // CP resolve (copy-mode draw): consume records up to the resolve record of this packet; with FA_TAP=1 compare the
 // image with the CP's registers the resolve reads; with FA_DIRECT bit 5 (32) resolve from the image.
-uint64_t g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[0x30];
+uint64_t g_rb_notcopy = 0, g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[32];
 int g_rb_printed = 0;
 constexpr uint32_t kResolveRegs[] = {0x2000, 0x2001, 0x2002, 0x2080, 0x2081, 0x2082, 0x2205, 0x2208, 0x2302,
                                      0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801};
@@ -891,10 +904,11 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
     if (g_tap_report) {
         g_rb_cmp++;
         bool any = false;
-        for (uint32_t reg : kResolveRegs) {
+        for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++) {
+            const uint32_t reg = kResolveRegs[ri];
             if (g_cur[reg] == regs[reg]) continue;
             any = true;
-            g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F]++;
+            g_rb_reg[ri]++;
             if (g_rb_printed < 12) {
                 g_rb_printed++;
                 std::fprintf(stderr, "[direct] resolve image reg %04x: game %08x cp %08x (packet %08x)\n", reg, g_cur[reg], regs[reg], dc.packetAddr);
@@ -903,6 +917,9 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
         g_rb_diff += any;
     }
     if (!(g_direct & 32)) return false;
+    // A record that does not describe a copy cannot be this resolve (run 116: 12 of 160,557 resolves had
+    // RB_MODECONTROL 4 in the record against 6 in the CP, with other state from a different pass): leave it to the CP.
+    if ((g_cur[0x2208] & 7) != 6) { g_rb_notcopy++; return false; }
     static fa::gpu::RegisterFile rf;
     rf = regs;  // registers no record covers yet keep the CP's values
     std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
@@ -1204,19 +1221,17 @@ void direct_tap_frame_end() {
                          (unsigned long long)g_dd_draws, (unsigned long long)g_dd_missing, (unsigned long long)g_dd_refused, (unsigned long long)g_dd_dwords);
     }
     if ((g_direct & 8) && g_swaps % 300 == 0) {
-        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (non-indexed %llu, drawn direct %llu) (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), backlog flushes %llu, payload dwords %llu\n",
+        std::fprintf(stderr, "[direct] stage B queue: records pushed %llu (non-indexed %llu, drawn direct %llu) (avg %.1f words), dropped %llu | CP draws through DrawDirect %llu, no record %llu, refused %llu, records applied %llu (not drawn by the CP %llu), backlog flushes %llu, tile replays skipped %llu, payload dwords %llu\n",
                      (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
-                     (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_dwords);
-        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, resolved from the record %llu\n",
+                     (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_repeats, (unsigned long long)g_b_dwords);
+        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, record not a copy %llu, resolved from the record %llu\n",
                      (unsigned long long)g_rs_pushed, (unsigned long long)g_rs_wrapped, (unsigned long long)g_rs_nodraw,
-                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_direct);
+                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_notcopy, (unsigned long long)g_rb_direct);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B resolve check: compared %llu, image differs %llu | by reg:", (unsigned long long)g_rb_cmp, (unsigned long long)g_rb_diff);
-            for (uint32_t reg : kResolveRegs) {
-                const uint64_t c = g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F];
-                if (c) std::fprintf(stderr, " %04x:%llu", reg, (unsigned long long)c);
-            }
+            for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++)
+                if (g_rb_reg[ri]) std::fprintf(stderr, " %04x:%llu", kResolveRegs[ri], (unsigned long long)g_rb_reg[ri]);
             std::fprintf(stderr, "\n");
         }
         if (g_tap_report) {
