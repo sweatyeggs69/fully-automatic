@@ -572,7 +572,34 @@ struct VulkanRenderer::Impl {
     // a texture or snapshot invalidation). Draws repeating the previous lookup of a slot within one epoch reuse it.
     uint64_t upCreateNs = 0, upStageNs = 0, upRecNs = 0, upBytes = 0, upNew = 0;  // FA_PROFILE: upload phases
     uint64_t texEpoch = 1;
-    struct SlotMemo { uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; float xf[4] = {0, 0, 0, 0}; };
+    struct SlotMemo {
+        uint32_t d[6]; bool cube = false; VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; uint64_t epoch = 0; float xf[4] = {0, 0, 0, 0};
+        uint32_t lo[2] = {0, 0}, hi[2] = {0, 0};  // guest memory the lookup read (base levels, mips), physical
+    };
+    // A resolve or snapshot write drops only the memo entries over its memory (FA_MEMO_RANGE=0: all of them,
+    // by bumping texEpoch). With all of them dropped, the race's 79 writes per frame left about 700 of its
+    // 1,100 to 2,900 texture fetches per frame to the full lookup (dt.get 2.8 to 5 ms).
+    static inline const bool memoRange = [] { const char* e = std::getenv("FA_MEMO_RANGE"); return !(e && e[0] == '0'); }();
+    void MemoDrop(uint64_t lo, uint64_t hi) {
+        auto drop = [&](SlotMemo& m) {
+            if (m.epoch != texEpoch) return;
+            for (int i = 0; i < 2; i++)
+                if (m.lo[i] < hi && lo < m.hi[i]) { m.epoch = 0; return; }
+        };
+        for (SlotMemo& m : slotMemo) drop(m);
+        for (SlotMemo& m : texMemo) drop(m);
+    }
+    static void MemoRange(SlotMemo& m, const uint32_t* fc) {
+        TextureFetch t = ParseTextureFetch(fc);
+        m.lo[0] = m.hi[0] = m.lo[1] = m.hi[1] = 0;
+        if (!t.IsTexture() || !t.base) return;
+        m.lo[0] = t.base & 0x1FFFFFFFu;
+        m.hi[0] = uint32_t(std::min<uint64_t>(uint64_t(m.lo[0]) + HostTextureByteSize(t), 0x20000000u));
+        if (const uint32_t mb = HostMipByteSize(t)) {
+            m.lo[1] = t.mipBase & 0x1FFFFFFFu;
+            m.hi[1] = uint32_t(std::min<uint64_t>(uint64_t(m.lo[1]) + mb, 0x20000000u));
+        }
+    }
     SlotMemo slotMemo[32];
     // Same idea across slots: a direct-mapped table of recent lookups (any slot) in this epoch, so draws that
     // alternate between textures still skip GetTexture. FA_TEX_MEMO2=0 disables.
@@ -587,9 +614,10 @@ struct VulkanRenderer::Impl {
     // samples are taken again: this write is ours, not the CPU's, and must not read as "samples changed".
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0, bool snapsToo = true) {
         prof::Scope pi_(prof::kInval);
-        texEpoch++;
         WwTouch(base, size);  // the host writes this memory now or at the next flush
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        if (memoRange) MemoDrop(lo, hi);
+        else texEpoch++;
         for (auto& [k, e] : snaps) {
             if (!e.valid || uint64_t(e.base) >= hi || lo >= uint64_t(e.base) + e.size) continue;
             if (snapsToo) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; continue; }
@@ -1119,6 +1147,7 @@ struct VulkanRenderer::Impl {
             c.views.clear();
             garbageImages.push_back(c.img);
             c.img = Image{};
+            texEpoch++;  // memo entries may hold its views
         }
         Begin();
         if (!c.img.img) {
@@ -2907,7 +2936,10 @@ struct VulkanRenderer::Impl {
                        tex.image.layers != ht.layers || tex.image.levels != ht.levels;
         EndRendering("gettexture");
         if (needNew) {
-            if (tex.ok) garbageImages.push_back(tex.image);
+            if (tex.ok) {
+                garbageImages.push_back(tex.image);
+                texEpoch++;  // memo entries of other slots may still hold the old view
+            }
             tex.image = Image{};
             tex.ok = false;
             VkComponentMapping cm;
@@ -3276,6 +3308,7 @@ struct VulkanRenderer::Impl {
                         m.view = view;
                         m.smp = smp;
                         std::memcpy(m.xf, curXf, sizeof m.xf);
+                        MemoRange(m, fc);
                         g = m;
                     }
                     std::memcpy(texXf[s], m.xf, sizeof m.xf);
