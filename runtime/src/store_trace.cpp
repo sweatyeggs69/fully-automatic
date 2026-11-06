@@ -39,7 +39,7 @@ struct Agg { uint64_t stores = 0, bytes = 0; std::map<uint32_t, uint64_t> ops; }
 std::mutex g_mu;
 std::vector<Range> g_ranges;
 std::unordered_map<Key, Agg, KeyHash> g_agg;
-int g_swap = 0, g_first = -1, g_frames = 1;
+int g_swap = 0, g_first = -1, g_frames = 1, g_period = 0;
 bool g_cfg_done = false;
 volatile sig_atomic_t g_usr2 = 0;
 void on_usr2(int) { g_usr2 = 1; }
@@ -50,7 +50,10 @@ void configure() {
     if (!e || !*e) return;
     signal(SIGUSR2, on_usr2);  // kill -USR2 <pid> arms a capture at the next swap, whatever the swap count
     g_first = std::atoi(e);
-    if (const char* c = std::strchr(e, ',')) g_frames = std::max(1, std::atoi(c + 1));
+    if (const char* c = std::strchr(e, ',')) {
+        g_frames = std::max(1, std::atoi(c + 1));
+        if (const char* d = std::strchr(c + 1, ',')) g_period = std::max(0, std::atoi(d + 1));  // repeat every N swaps
+    }
 }
 
 std::string name_of(void* pc) {
@@ -62,8 +65,12 @@ std::string name_of(void* pc) {
 }
 
 void dump() {
-    const char* path = std::getenv("FA_STORE_TRACE_OUT");
-    FILE* f = std::fopen(path && *path ? path : "store-trace.txt", "w");
+    const char* base = std::getenv("FA_STORE_TRACE_OUT");
+    static char path_buf[600];
+    std::snprintf(path_buf, sizeof path_buf, "%s", base && *base ? base : "store-trace.txt");
+    if (g_period) std::snprintf(path_buf, sizeof path_buf, "%s.swap%d", base && *base ? base : "store-trace.txt", g_first);
+    const char* path = path_buf;
+    FILE* f = std::fopen(path, "w");
     if (!f) f = stderr;
     uint64_t totalStores = 0, totalBytes = 0;
     std::map<std::string, Agg> leaf;
@@ -104,7 +111,7 @@ void dump() {
     }
     if (f != stderr) std::fclose(f);
     std::fprintf(stderr, "[store-trace] %llu stores, %llu bytes, %zu leaf functions -> %s\n", (unsigned long long)totalStores,
-                 (unsigned long long)totalBytes, leaf.size(), path && *path ? path : "store-trace.txt");
+                 (unsigned long long)totalBytes, leaf.size(), path);
 }
 }  // namespace
 
@@ -154,6 +161,7 @@ void store_trace_frame_end() {
         fa_st_armed = 0;
         std::lock_guard<std::mutex> lk(g_mu);
         dump();
+        if (g_period) g_first += g_period;  // next periodic capture
     }
 }
 }  // namespace fa::rt
