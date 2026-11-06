@@ -1913,6 +1913,8 @@ struct VulkanRenderer::Impl {
         const auto st = ww.TakeStats();
         prof::Add(prof::kWwPagesWritten, st.pagesWritten);
         prof::Add(prof::kWwPagesWatched, st.pagesWatched);
+        prof::Add(prof::kWwScanCalls, st.scanCalls);
+        prof::Add(prof::kWwQueries, st.queryCalls);
     }
 
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
@@ -2719,7 +2721,7 @@ struct VulkanRenderer::Impl {
         tex.validatedGen = generation;
         tex.lastFullGen = generation;
         tex.sampleHash = sh;
-        tex.wwToken = wwTok;
+        tex.wwToken = 0;  // set again once the image matches these bytes
         if (wwClean) {
             prof::Add(prof::kWwClean, 1);
             stats.textureWwClean++;
@@ -2732,7 +2734,7 @@ struct VulkanRenderer::Impl {
                                  t.base, size, t.mipBase, mipBytes);
             }
         }
-        if (tex.ok && h == tex.contentHash) { tex.stable++; return tex.image.view; }
+        if (tex.ok && h == tex.contentHash) { tex.stable++; tex.wwToken = wwTok; return tex.image.view; }
         tex.stable = 0;
         prof::Scope ps_(prof::kTexUpload);
         {   // FA_TEXLOG=1: one line per upload, to see when the game's streaming changes each texture
@@ -2864,6 +2866,7 @@ struct VulkanRenderer::Impl {
         tex.guestBase = t.base;
         tex.guestSize = size;
         tex.ok = true;
+        tex.wwToken = wwTok;
         stats.textureUploads++;
         return tex.image.view;
     }

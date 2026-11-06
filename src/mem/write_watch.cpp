@@ -108,7 +108,37 @@ bool WriteWatch::Clean(uint32_t phys, uint32_t size, uint64_t token) const {
     if (end64 > pages_) return false;
     for (uint32_t p = first; p < uint32_t(end64); p++)
         if (!watched_[p] || written_[p] > token) return false;
+    // Writes since the last Harvest: the kernel still shows those pages as written.
+    return !WrittenNow(first, uint32_t(end64) - first);
+}
+
+bool WriteWatch::WrittenNow(uint32_t firstPage, uint32_t count) const {
+#if defined(PAGEMAP_SCAN)
+    for (const View& v : views_) {
+        const uint32_t vFirst = v.physOffset / kPage, vEnd = vFirst + v.size / kPage;
+        const uint32_t a = std::max(firstPage, vFirst), b = std::min(firstPage + count, vEnd);
+        if (a >= b) continue;
+        const uint64_t base = reinterpret_cast<uint64_t>(v.base) - uint64_t(vFirst) * kPage;
+        page_region r{};
+        pm_scan_arg s{};
+        s.size = sizeof s;
+        s.start = base + uint64_t(a) * kPage;
+        s.end = base + uint64_t(b) * kPage;
+        s.vec = reinterpret_cast<uint64_t>(&r);
+        s.vec_len = 1;
+        s.max_pages = 1;
+        s.category_mask = PAGE_IS_WRITTEN;
+        s.return_mask = PAGE_IS_WRITTEN;
+        const long n = ioctl(pagemap_, PAGEMAP_SCAN, &s);
+        stats_.queryCalls++;
+        if (n != 0) return true;  // written, or unknown
+    }
+    return false;
+#else
+    (void)firstPage;
+    (void)count;
     return true;
+#endif
 }
 
 void WriteWatch::Touch(uint32_t phys, uint32_t size) {
@@ -126,14 +156,14 @@ void WriteWatch::Scan(const View& v, uint32_t firstPage, uint32_t count) {
     const uint32_t a = std::max(firstPage, vFirst), b = std::min(firstPage + count, vEnd);
     if (a >= b) return;
     const uint64_t base = reinterpret_cast<uint64_t>(v.base) - uint64_t(vFirst) * kPage;  // host address of physical page 0
-    page_region regions[64];
+    static page_region regions[512];
     pm_scan_arg s{};
     s.size = sizeof s;
     s.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
     s.start = base + uint64_t(a) * kPage;
     s.end = base + uint64_t(b) * kPage;
     s.vec = reinterpret_cast<uint64_t>(regions);
-    s.vec_len = 64;
+    s.vec_len = 512;
     s.category_mask = PAGE_IS_WRITTEN;
     s.return_mask = PAGE_IS_WRITTEN;
     while (s.start < s.end) {
@@ -166,11 +196,18 @@ void WriteWatch::Harvest() {
     ++epoch_;
     if (runsDirty_) {
         runs_.clear();
+        // Runs closer than kMergeGap pages are scanned as one: a scan call costs more than walking a
+        // short gap. Unwatched pages in a gap may be reported (and protected) too, which is harmless:
+        // unwatched pages never count as clean.
+        constexpr uint32_t kMergeGap = 256;
         for (uint32_t p = 0; p < pages_;) {
             if (!watched_[p]) { p++; continue; }
             uint32_t q = p;
             while (q < pages_ && watched_[q]) q++;
-            runs_.push_back({p, q - p});
+            if (!runs_.empty() && p - (runs_.back().first + runs_.back().count) <= kMergeGap)
+                runs_.back().count = q - runs_.back().first;
+            else
+                runs_.push_back({p, q - p});
             p = q;
         }
         runsDirty_ = false;

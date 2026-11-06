@@ -44,8 +44,9 @@ public:
     // Before reading [phys, phys + size) for a copy: makes sure its pages are watched and returns
     // the token to keep with the copy. 0 means not watched (never clean).
     uint64_t Watch(uint32_t phys, uint32_t size);
-    // True when no page of the range was written after the copy that got `token` was taken (as
-    // known at the last Harvest). Unwatched pages and token 0 count as written.
+    // True when no page of the range was written after the copy that got `token` was taken.
+    // Writes since the last Harvest are seen too (asks the kernel, one call per view). Unwatched
+    // pages and token 0 count as written.
     bool Clean(uint32_t phys, uint32_t size, uint64_t token) const;
     // The host wrote the range itself (or freed it): treat it as written.
     void Touch(uint32_t phys, uint32_t size);
@@ -53,7 +54,7 @@ public:
     void Harvest();
 
     struct Stats {
-        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0;
+        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0;
         double ms = 0;
     };
     // Since the last call.
@@ -63,6 +64,7 @@ private:
     struct Run { uint32_t first, count; };  // physical pages
     void Protect(uint32_t firstPage, uint32_t count);
     void Scan(const View& v, uint32_t firstPage, uint32_t count);
+    bool WrittenNow(uint32_t firstPage, uint32_t count) const;
 
     int uffd_ = -1;
     int pagemap_ = -1;
@@ -73,7 +75,7 @@ private:
     std::vector<uint8_t> watched_;       // per page
     std::vector<Run> runs_;              // watched pages, coalesced (rebuilt lazily)
     bool runsDirty_ = false;
-    Stats stats_;
+    mutable Stats stats_;
 };
 
 }  // namespace fa::mem

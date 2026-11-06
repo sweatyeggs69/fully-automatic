@@ -58,6 +58,13 @@ int main() {
     a[0x800010] = 1;
     ww.Harvest();
     CHECK(!ww.Clean(0x800000, 0x1000, t3));
+    // A write since the last Harvest is seen right away.
+    uint64_t t3b = ww.Watch(0x60000, 0x2000);
+    ww.Harvest();
+    CHECK(ww.Clean(0x60000, 0x2000, t3b));
+    b[0x61000 - 4096 + 8] = 5;  // physical 0x61008, through the aliased view
+    CHECK(!ww.Clean(0x60000, 0x2000, t3b));
+    CHECK(ww.Clean(0x60000, 0x1000, t3b));
     // Unwatched memory is never clean.
     CHECK(!ww.Clean(0x900000, 0x1000, ww.Watch(0, 0)));
     // Touch marks host writes.
@@ -112,6 +119,15 @@ int main() {
     CHECK(st.pagesWritten == big / 4096);
     ww.Harvest();
     auto t3h = std::chrono::steady_clock::now();
+    // Cost of Clean on a 64 KB range (one kernel query per view).
+    auto tq0 = std::chrono::steady_clock::now();
+    uint64_t tq = ww.Watch(base, big);
+    ww.Harvest();
+    int cleanCount = 0;
+    for (uint32_t i = 0; i < 1000; i++) cleanCount += ww.Clean(base + (i % 256) * 65536, 65536, tq);
+    CHECK(cleanCount == 1000);
+    const double perClean = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tq0).count() / 1000.0;
+    std::printf("write_watch_test: Clean of 64 KB about %.2f us (including one harvest)\n", perClean);
     auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
     std::printf("write_watch_test: %u first writes %.2f ms (%.2f us each), harvest %.2f ms (%llu pages), idle harvest %.2f ms\n",
                 big / 4096, ms(t0, t1w), ms(t0, t1w) * 1000.0 / (big / 4096), ms(t1w, t2h),
