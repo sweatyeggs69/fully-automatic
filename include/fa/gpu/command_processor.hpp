@@ -11,6 +11,9 @@ namespace fa::gpu {
 inline void (*g_indirect_buffer_observer)(uint32_t addr, uint32_t dwords) = nullptr;
 // Diagnostics: called for every draw (not resolves) just before the backend sees it.
 inline void (*g_draw_observer)(const DrawCall& draw, const RegisterFile& regs) = nullptr;
+// Direct hooks (runtime/src/direct_tap.cpp, FA_DIRECT): called right before the backend draws, may replace
+// register values with ones taken from the game's own device state. Null in normal runs.
+inline void (*g_draw_feeder)(const DrawCall& draw, RegisterFile& regs) = nullptr;
 
 // Consumes the PM4 ring buffer the game fills (set up through VdInitializeRingBuffer).
 // Single threaded: the runtime core calls Pump() from its GPU thread whenever the
