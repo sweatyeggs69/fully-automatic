@@ -31,6 +31,10 @@ public:
     struct Stats {
         std::atomic<uint64_t> draws{0}, drawsSkipped{0}, resolves{0}, clears{0}, shadersCompiled{0},
             shaderErrors{0}, pipelines{0}, textureUploads{0}, submits{0};
+        // Kernel write tracking: 1 when on; texture checks it answered without hashing; textures it
+        // called unchanged that had changed (FA_WW_VERIFY=1 only, should stay 0).
+        std::atomic<uint64_t> writeWatch{0}, textureWwClean{0}, textureWwMiss{0};
+        std::atomic<uint64_t> tileResolvesExtended{0};  // FA_TILE_ONCE: first-tile resolves copied at full height
     };
 
     // `next` receives every call too (FrameBackend: stats, texture debug view, window frames).
@@ -47,6 +51,8 @@ public:
     void Resolve(const RegisterFile& regs) override;
     void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height, const RegisterFile& regs) override;
     void Sync() override;
+    bool WriteWhenDone(uint32_t addr, uint32_t value) override;
+    void Idle() override;
 
     // Submits pending GPU work and waits for it (tests).
     void Flush();

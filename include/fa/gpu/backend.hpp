@@ -16,6 +16,10 @@ struct RegisterFile {
     // Float constant blocks (64 dwords = 16 vec4 each, 32 blocks) written since the renderer last
     // uploaded them. Set by the command processor, cleared by the renderer as it uploads.
     mutable uint32_t aluDirty = ~0u;
+    // Tile replay (FA_TILE_ONCE=1): non-zero while the command processor runs the first tile of a
+    // tiled frame and skips the others. It is the tile height in rows: a scissor or resolve that
+    // ends there stands for the whole frame, so the backend extends it to the full target.
+    uint32_t tileRows = 0;
     uint32_t& operator[](uint32_t i) { return r[i]; }
     uint32_t operator[](uint32_t i) const { return r[i]; }
 };
@@ -53,6 +57,13 @@ public:
     // The command stream is about to make GPU progress visible to the guest (fence, memory write,
     // interrupt): backends that defer writes into guest memory must finish them now.
     virtual void Sync() {}
+    // A write of the command stream the guest may wait on (fence, memory write). A backend that runs
+    // the GPU behind the command stream applies it once the GPU finished the work before it and
+    // returns true; false means the command processor writes it now.
+    virtual bool WriteWhenDone(uint32_t addr, uint32_t value) { return false; }
+    // The command processor ran out of commands or is blocked waiting: a good moment to hand
+    // recorded work to the GPU and apply finished writes.
+    virtual void Idle() {}
 };
 
 }  // namespace fa::gpu

@@ -1,8 +1,12 @@
 // End-to-end renderer test: PM4 stream -> CommandProcessor -> VulkanRenderer (offscreen EDRAM
 // targets) -> resolve into guest memory, then decode the resolved surface and check pixels.
 // Runs on any Vulkan 1.3 device (lavapipe works). Exits 0 with "skipped" when there is none.
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -17,7 +21,27 @@
 using namespace fa::gpu;
 
 struct FakeMem : GuestMemory {
-    std::vector<uint8_t> bytes = std::vector<uint8_t>(16 << 20);  // big-endian storage
+    // Big-endian storage in a shared mapping, like the runtime's physical memory, so the kernel
+    // write tracking can watch it.
+    struct Bytes {
+        size_t n = 16 << 20;
+        uint8_t* p = [this] {
+            int fd = memfd_create("render-test", 0);
+            void* m = fd >= 0 && ftruncate(fd, n) == 0 ? mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+            if (fd >= 0) close(fd);
+            if (m == MAP_FAILED) { std::printf("gpu_render_test: guest memory mapping failed\n"); std::exit(1); }
+            return static_cast<uint8_t*>(m);
+        }();
+        size_t size() const { return n; }
+        uint8_t& operator[](size_t i) { return p[i]; }
+        const uint8_t& operator[](size_t i) const { return p[i]; }
+    } bytes;
+    uint32_t PhysicalSize() const override { return uint32_t(bytes.size()); }
+    int PhysicalViews(PhysicalView* out, int max) const override {
+        if (max < 1) return 0;
+        out[0] = {bytes.p, 0, uint32_t(bytes.size())};
+        return 1;
+    }
     uint32_t Read32(uint32_t a) const override {
         return (uint32_t(bytes[a]) << 24) | (bytes[a + 1] << 16) | (bytes[a + 2] << 8) | bytes[a + 3];
     }
@@ -77,6 +101,7 @@ static void Pixel(const FakeMem& mem, uint32_t base, uint32_t pitch, uint32_t he
 
 int main() {
     FakeMem mem;
+    setenv("FA_WW", "2", 0);  // write tracking without pinned memory (no udmabuf here)
     VulkanRenderer r(mem, nullptr);
     VulkanRenderer::Options opt;
     opt.validation = std::getenv("FA_VK_VALIDATION") != nullptr;
@@ -88,7 +113,9 @@ int main() {
     }
     std::printf("gpu_render_test: device %s\n", r.DeviceName().c_str());
 
+    setenv("FA_TILE_ONCE", "0", 1);  // the main command processor replays every tile
     CommandProcessor cp(mem, r);
+    unsetenv("FA_TILE_ONCE");
     const uint32_t ring = 0x1000, ringBytes = 0x10000;
     cp.SetRingBuffer(ring, ringBytes);
     Stream s{mem, ring, ringBytes / 4};
@@ -244,6 +271,193 @@ int main() {
         Pixel(mem, dest2, 128, 64, 60, 60, p);
         std::printf("  perspective (60,60) = %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
         CHECK(p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255);
+    }
+
+    // Kernel write tracking: next frame an unchanged texture is not hashed again, and a texture the
+    // guest wrote is uploaded again.
+    {
+        RegisterFile none;
+        Stream q{mem, ring, ringBytes / 4, s.w};
+        auto texDraw = [&] {
+            q.shader(0, xasm::ColorVS());
+            q.shader(1, xasm::TexturePS(1));
+            q.reg(xe::PA_CL_VTE_CNTL, 0);
+            q.vfetch0(texVb, 21);
+            q.draw(xe::kPrimRectangleList, 3);
+            cp.SetWritePtr(q.w % (ringBytes / 4));
+            CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+            r.Flush();
+        };
+        const uint64_t up0 = st.textureUploads, clean0 = st.textureWwClean;
+        r.Swap(0, 0, 0, none);
+        texDraw();
+        CHECK(st.textureUploads == up0);
+        const bool on = st.writeWatch != 0;
+        if (on) CHECK(st.textureWwClean == clean0 + 1);
+        mem.Write32(tex, 0xFF00FF00u);
+        r.Swap(0, 0, 0, none);
+        texDraw();
+        CHECK(st.textureUploads == up0 + 1);
+        if (on) CHECK(st.textureWwClean == clean0 + 1);
+        std::printf("  write watch %s: unchanged texture %s, written texture uploaded again %s\n", on ? "on" : "off",
+                    st.textureWwClean > clean0 ? "skipped" : "hashed", st.textureUploads == up0 + 1 ? "yes" : "NO");
+    }
+
+    // Fences and the swap's writebacks (FA_FRAMES=2 runs this test with frames in flight too): a fence
+    // the stream writes reaches guest memory once the GPU is done, and a resolve flushed by the swap
+    // lands in guest memory by the next full flush.
+    {
+        RegisterFile none;
+        const uint32_t fenceAddr = 0x280000, dest3 = 0x2C0000;
+        mem.Write32(fenceAddr, 0);
+        Stream q{mem, ring, ringBytes / 4, s.w};
+        q.shader(0, xasm::ColorVS());
+        q.shader(1, xasm::ColorPS());
+        q.reg(xe::PA_CL_VTE_CNTL, 0);
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::RB_COPY_CONTROL, (1u << 8) | (3u << 20));  // clear to blue
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        q.vfetch0(vb, 21);
+        q.draw(xe::kPrimTriangleList, 3);
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::RB_COPY_CONTROL, 0);
+        q.reg(xe::RB_COPY_DEST_BASE, dest3);
+        q.reg(xe::RB_COPY_DEST_PITCH, (64u << 16) | 128);
+        q.reg(xe::RB_COPY_DEST_INFO, (kFmt8_8_8_8 << 7) | kEndian8in32);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        q.put(T3(pm4::kEventWriteShd, 3));
+        q.put(0);
+        q.put(fenceAddr);
+        q.put(0x1234);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        int polls = 0;
+        while (mem.Read32(fenceAddr) != 0x1234 && polls < 2000) {
+            usleep(1000);  // like the runtime's GPU thread, which polls every 0.5 ms
+            cp.Pump();     // idle: finished GPU work applies its writes
+            polls++;
+        }
+        CHECK(mem.Read32(fenceAddr) == 0x1234);
+        r.Swap(0, 0, 0, none);
+        r.Flush();
+        Pixel(mem, dest3, 128, 64, 4, 4, p);
+        CHECK(p[0] == 255 && p[1] == 0 && p[2] == 0 && p[3] == 255);
+        Pixel(mem, dest3, 128, 64, 60, 60, p);
+        CHECK(p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255);
+        std::printf("  fence written after %d idle polls, swap writeback (60,60) = %02x %02x %02x %02x\n", polls, p[0], p[1], p[2], p[3]);
+    }
+
+    // Tile replay: a frame drawn in two 32-row tiles (predicated tiling, window offset per tile),
+    // each resolved to its band of a 128x64 destination. With tile once (the default) the second frame
+    // draws the first tile at full height and skips the second; the destination must match.
+    {
+        RegisterFile none;
+        const uint32_t blueVb = 0x105000, tileRect = 0x106000, destT[2] = {0x340000, 0x360000};
+        const float blue[3][7] = {{0, 0, 0, 0, 0, 1, 1}, {128, 0, 0, 0, 0, 1, 1}, {0, 64, 0, 0, 0, 1, 1}};
+        for (int v = 0; v < 3; v++)
+            for (int c = 0; c < 7; c++) mem.Write32(blueVb + (v * 7 + c) * 4, F(blue[v][c]));
+        for (int t = 0; t < 2; t++) {
+            const float rc[6] = {0, float(32 * t), 128, float(32 * t), 128, float(32 * t + 32)};
+            for (int i = 0; i < 6; i++) mem.Write32(tileRect + t * 64 + i * 4, F(rc[i]));
+        }
+        auto tiledFrame = [&](Stream& q, uint32_t dest) {
+            q.shader(0, xasm::ColorVS());
+            q.shader(1, xasm::ColorPS());
+            q.reg(xe::PA_CL_VTE_CNTL, 0);
+            q.reg(xe::PA_SU_SC_MODE_CNTL, 1u << 16);  // window offset applies to vertices and resolves
+            // Full state: the second command processor starts from zeroed registers.
+            q.alu(256 * 4, {1, 1, 1, 1});
+            q.reg(xe::RB_SURFACE_INFO, 128);
+            q.reg(xe::RB_COLOR_INFO, 0);
+            q.reg(xe::RB_DEPTH_INFO, 0x200);
+            q.reg(xe::RB_COLOR_MASK, 0xF);
+            q.reg(xe::RB_DEPTHCONTROL, 0);
+            q.reg(xe::RB_BLENDCONTROL0, 0x00010001);
+            q.reg(xe::PA_SU_VTX_CNTL, 1);
+            for (uint32_t t = 0; t < 2; t++) {
+                q.put(T3(pm4::kSetBinSelect, 2));
+                q.put(1u << (2 * t));  // high word: tile t, first pass
+                q.put(0);
+                q.reg(xe::PA_SC_WINDOW_OFFSET, ((0u - 32u * t) & 0x7FFF) << 16);
+                q.reg(xe::PA_SC_WINDOW_SCISSOR_TL, (32u * t) << 16);
+                q.reg(xe::PA_SC_WINDOW_SCISSOR_BR, ((32u * t + 32) << 16) | 128);
+                q.vfetch0(blueVb, 21);
+                q.draw(xe::kPrimRectangleList, 3);
+                q.vfetch0(vb, 21);
+                q.draw(xe::kPrimTriangleList, 3);
+                q.vfetch0(tileRect + t * 64, 6);
+                q.reg(xe::RB_COPY_CONTROL, 0);
+                q.reg(xe::RB_COPY_DEST_BASE, dest + t * 32 * 128 * 4);
+                q.reg(xe::RB_COPY_DEST_PITCH, ((64u - 32u * t) << 16) | 128);
+                q.reg(xe::RB_COPY_DEST_INFO, (kFmt8_8_8_8 << 7) | kEndian8in32);
+                q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+                q.draw(xe::kPrimRectangleList, 3);
+                q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+            }
+            q.put(T3(pm4::kSetBinSelect, 2));
+            q.put(0xFFFFFFFFu);
+            q.put(0xFFFFFFFFu);
+            q.reg(xe::PA_SC_WINDOW_OFFSET, 0);
+            q.reg(xe::PA_SU_SC_MODE_CNTL, 0);
+            q.reg(xe::PA_SC_WINDOW_SCISSOR_TL, 0x80000000u);
+            q.reg(xe::PA_SC_WINDOW_SCISSOR_BR, (64u << 16) | 128);
+            q.put(T3(pm4::kXeSwap, 4));
+            q.put(0x50415753);
+            q.put(0);
+            q.put(128);
+            q.put(64);
+        };
+        auto check = [&](const char* what, uint32_t dest) {
+            uint8_t px[4];
+            const uint32_t pts[4][2] = {{4, 4}, {40, 4}, {4, 40}, {40, 40}};
+            const bool red[4] = {true, true, true, false};
+            for (int i = 0; i < 4; i++) {
+                Pixel(mem, dest, 128, 64, pts[i][0], pts[i][1], px);
+                const bool ok = red[i] ? (px[0] == 255 && px[1] == 0 && px[2] == 0) : (px[0] == 0 && px[1] == 0 && px[2] == 255);
+                if (!ok) std::printf("FAIL %s (%u,%u) = %02x %02x %02x %02x\n", what, pts[i][0], pts[i][1], px[0], px[1], px[2], px[3]);
+                CHECK(ok);
+            }
+        };
+        // Normal path.
+        Stream q{mem, ring, ringBytes / 4, cp.ReadPtr()};
+        tiledFrame(q, destT[0]);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        r.Flush();
+        check("tiles", destT[0]);
+        // Tile once: the first frame learns the tile height, the second skips the second tile.
+        CommandProcessor cpT(mem, r);  // default: tile once
+        const uint32_t ring2 = 0x380000;
+        cpT.SetRingBuffer(ring2, ringBytes);
+        Stream q2{mem, ring2, ringBytes / 4};
+        tiledFrame(q2, destT[1]);
+        cpT.SetWritePtr(q2.w % (ringBytes / 4));
+        CHECK(cpT.Pump() == CommandProcessor::Status::Idle);
+        r.Flush();
+        CHECK(cpT.GetStats().tileSkips == 0);
+        for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destT[1] + i * 4, 0);
+        // Clear EDRAM to green, so rows the second frame does not draw show up.
+        q2.vfetch0(rectVb, 6);
+        q2.reg(xe::RB_COLOR_CLEAR, 0xFF00FF00u);
+        q2.reg(xe::RB_COLOR_CLEAR_LO, 0xFF00FF00u);
+        q2.reg(xe::RB_COPY_CONTROL, (1u << 8) | (3u << 20));
+        q2.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q2.draw(xe::kPrimRectangleList, 3);
+        q2.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        tiledFrame(q2, destT[1]);
+        cpT.SetWritePtr(q2.w % (ringBytes / 4));
+        CHECK(cpT.Pump() == CommandProcessor::Status::Idle);
+        r.Flush();
+        CHECK(cpT.GetStats().tileSkips == 3);  // two draws and a resolve of tile 1, second frame
+        CHECK(st.tileResolvesExtended >= 1);
+        check("tile once", destT[1]);
+        std::printf("  tile once: %llu draws/resolves skipped, %llu resolves extended\n",
+                    (unsigned long long)cpT.GetStats().tileSkips, (unsigned long long)st.tileResolvesExtended.load());
+        (void)none;
     }
 
     if (failures) { std::printf("gpu_render_test: %d failure(s)\n", failures); return 1; }
