@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -98,7 +100,18 @@ struct StWin { uint32_t off, reg, n; };
 constexpr StWin kStWins[] = {{0x2CC0, 0x2000, 18}, {0x2D0C, 0x2100, 21}, {0x2D60, 0x2180, 5}, {0x2D74, 0x2200, 12},
                              {0x2DA4, 0x2280, 21}, {0x2DF8, 0x2300, 38}, {0x2E90, 0x2380, 9}};
 constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;  // covers all windows
-struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords]; };
+// Stage A draw record: besides the shadow, the hook keeps the draw call arguments, the index buffer and a mirror of
+// the per-object constant blocks the game writes straight into the stream (823162F8 + 821B8510), which are not in the
+// shadow. The mirror holds the latest value of every ALU vec4 any block wrote (the GPU keeps registers until rewritten).
+struct DrawArgs { uint32_t prim, start, count, ibFlags, ibBase; };
+struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords], mir[1024]; DrawArgs a; };  // mir: VS vec4s only (all blocks seen start at VS vec4 64)
+struct PendingBlock { uint32_t first, count, payload; };
+std::vector<PendingBlock> g_pending;   // under g_set_mu
+uint32_t g_mirror[2048];               // under g_set_mu
+uint64_t g_mirror_valid[8];            // vec4 bits ever written by a block (under g_set_mu)
+DrawArgs g_cur_args{};                 // set by the draw hook for snapshot_draw (game draw thread)
+uint64_t g_rec_cmp = 0, g_rec_bad_prim = 0, g_rec_bad_count = 0, g_rec_bad_addr = 0, g_mir_cmp = 0, g_mir_diff = 0;
+int g_rec_printed = 0, g_mir_printed = 0;
 uint64_t g_st_mis[0x400], g_st_cmp = 0;
 int g_st_printed = 0;
 std::mutex g_snap_mu;
@@ -170,6 +183,11 @@ void snapshot_draw(const uint8_t* base, uint32_t dev) {
     for (uint32_t i = 0; i < kTexDwords; i++) s.tex[i] = __builtin_bswap32(t[i]);
     const uint32_t* q = reinterpret_cast<const uint32_t*>(base + dev + kStBase);
     for (uint32_t i = 0; i < kStDwords; i++) s.st[i] = __builtin_bswap32(q[i]);
+    s.a = g_cur_args;
+    {
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        std::memcpy(s.mir, g_mirror, sizeof s.mir);
+    }
     std::lock_guard<std::mutex> lk(g_snap_mu);
     g_snaps[g_snap_gen][pkt] = s;
 }
@@ -193,7 +211,7 @@ const Snap* lookup_snap_locked(uint32_t pkt) {
     return sn;
 }
 
-void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
+void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs, const fa::gpu::DrawCall* dc = nullptr) {
     std::lock_guard<std::mutex> lk(g_snap_mu);
     const Snap* sn = lookup_snap_locked(pkt);
     if (!sn) { g_ex_missing++; return; }
@@ -215,6 +233,43 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs) {
     cmp("vs", sn->vs, kRegVs, kVsDwords, true, 0, dv);
     cmp("ps", sn->ps, kRegPs, kPsDwords, true, 256, dp);
     cmp("fetch", sn->tex, kRegTex, kTexDwords, false, 0, dt);
+    // Stage A record checks: per-object constant mirror on touched vec4s, and the draw arguments.
+    {
+        uint64_t valid[8];
+        {
+            std::lock_guard<std::mutex> lk2(g_set_mu);
+            std::memcpy(valid, g_mirror_valid, sizeof valid);
+        }
+        for (uint32_t v = 0; v < 256; v++) {
+            if (!(valid[v >> 6] >> (v & 63) & 1)) continue;
+            g_mir_cmp++;
+            bool same = true;
+            for (uint32_t j = 0; j < 4; j++) same &= sn->mir[v * 4 + j] == regs[0x4000 + v * 4 + j];
+            if (!same) {
+                g_mir_diff++;
+                if (g_mir_printed < 12) {
+                    g_mir_printed++;
+                    std::fprintf(stderr, "[tap] mirror vec4 %u: game %08x %08x %08x %08x cp %08x %08x %08x %08x (packet %08x)\n", v,
+                                 sn->mir[v * 4], sn->mir[v * 4 + 1], sn->mir[v * 4 + 2], sn->mir[v * 4 + 3],
+                                 regs[0x4000 + v * 4], regs[0x4001 + v * 4], regs[0x4002 + v * 4], regs[0x4003 + v * 4], pkt);
+                }
+            }
+        }
+    }
+    if (dc) {
+        g_rec_cmp++;
+        const DrawArgs& a = sn->a;
+        const uint32_t isz = (a.ibFlags & 0x80000000u) ? 4 : 2;  // guess: flag bit 0 (MSB) of the index buffer object = 32-bit
+        const uint32_t addr = (a.ibBase + a.start * isz) & 0x1FFFFFFF;
+        const bool bp = (dc->primType & 0x3F) != (a.prim & 0x3F), bc = a.count <= 65535 && dc->indexCount != a.count,
+                   ba = dc->indexGuestAddr != addr && dc->indexGuestAddr != addr + 0x1000 && dc->indexGuestAddr + 0x1000 != addr;
+        g_rec_bad_prim += bp; g_rec_bad_count += bc; g_rec_bad_addr += ba;
+        if ((bp || bc || ba) && g_rec_printed < 12) {
+            g_rec_printed++;
+            std::fprintf(stderr, "[tap] record args: game prim %u start %u count %u ib flags %08x base %08x -> addr %08x | cp prim %u count %u addr %08x idx32 %d (packet %08x)\n",
+                         a.prim, a.start, a.count, a.ibFlags, a.ibBase, addr, dc->primType, dc->indexCount, dc->indexGuestAddr, int(dc->index32), pkt);
+        }
+    }
     for (const StWin& w : kStWins)
         for (uint32_t j = 0; j < w.n; j++) {
             const uint32_t g = sn->st[(w.off - kStBase) / 4 + j], c = regs[w.reg + j];
@@ -297,7 +352,7 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
 
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
     cp_parity(regs);
-    exact_compare(dc.packetAddr, regs);
+    exact_compare(dc.packetAddr, regs, &dc);
     if (!dc.indexed) { g_cp_auto_draws.fetch_add(1, std::memory_order_relaxed); return; }
     const int e = g_swaps_a.load(std::memory_order_relaxed);
     if (e != g_epoch) {
@@ -335,13 +390,19 @@ void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) 
 }  // namespace
 
 PPC_FUNC(sub_823162F8) {
+    const uint32_t first_arg = ctx.r5.u32, count_arg = ctx.r6.u32;
     if (g_on) {
-        const uint32_t first = ctx.r5.u32, count = ctx.r6.u32;
+        const uint32_t first = first_arg, count = count_arg;
         for (uint32_t v = first; v < first + count && v < 512; v++) g_touched[v >> 6].fetch_or(1ull << (v & 63), std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_set_mu);
         g_sets[(uint64_t(first) << 32) | count]++;
     }
     __imp__sub_823162F8(ctx, base);
+    if (g_on) {
+        // Returns the payload pointer the caller then fills (821B8510); read it at the next draw.
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        g_pending.push_back({first_arg, count_arg, ctx.r3.u32});
+    }
 }
 
 // Shader pair link (82147370): r4 = shader object A (device+0x3294), r6 = shader object B (device+0x2C90).
@@ -450,8 +511,24 @@ PPC_FUNC(sub_82315500) {
         g_tap_indices.fetch_add(ctx.r7.u32, std::memory_order_relaxed);
     }
     const uint32_t dev = ctx.r3.u32;
+    const DrawArgs args0{ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, 0, 0};
     __imp__sub_82315500(ctx, base);
     if (g_on) {
+        {
+            std::lock_guard<std::mutex> lk(g_set_mu);
+            for (const PendingBlock& b : g_pending) {
+                for (uint32_t i = 0; i < b.count * 4 && b.first * 4 + i < 2048; i++)
+                    g_mirror[b.first * 4 + i] = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + b.payload + i * 4));
+                for (uint32_t v = b.first; v < b.first + b.count && v < 512; v++) g_mirror_valid[v >> 6] |= 1ull << (v & 63);
+            }
+            g_pending.clear();
+        }
+        g_cur_args = args0;
+        const uint32_t ib = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev + 0x30F4));
+        if (ib) {
+            g_cur_args.ibFlags = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ib));
+            g_cur_args.ibBase = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ib + 0xC));
+        }
         snapshot_draw(base, dev);
         if (g_tap_report) {
             tap_draw_shaders(base, dev);
@@ -520,6 +597,9 @@ void direct_tap_frame_end() {
     }
     {
         std::lock_guard<std::mutex> lk(g_snap_mu);
+        std::fprintf(stderr, "[tap]   stage A record: draws %llu, prim differs %llu, count differs %llu, index address differs %llu | per-object constant mirror: vec4 compared %llu, differ %llu\n",
+                     (unsigned long long)g_rec_cmp, (unsigned long long)g_rec_bad_prim, (unsigned long long)g_rec_bad_count, (unsigned long long)g_rec_bad_addr,
+                     (unsigned long long)g_mir_cmp, (unsigned long long)g_mir_diff);
         std::fprintf(stderr, "[tap]   render-state windows: compared %llu dwords; registers that differ (reg:count of %llu draws):", (unsigned long long)g_st_cmp, (unsigned long long)g_ex_found);
         for (uint32_t i = 0; i < 0x400; i++) if (g_st_mis[i]) std::fprintf(stderr, " %04x:%llu", 0x2000 + i, (unsigned long long)g_st_mis[i]);
         std::fprintf(stderr, "\n");
