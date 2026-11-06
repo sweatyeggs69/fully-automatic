@@ -23,7 +23,8 @@ int main() {
     int fd = memfd_create("ww-test", MFD_ALLOW_SEALING);
     if (fd < 0 || ftruncate(fd, size) != 0) { std::printf("memfd failed\n"); return 1; }
     auto* a = static_cast<uint8_t*>(mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    auto* b = static_cast<uint8_t*>(mmap(nullptr, size - 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096));  // like the 0xE0000000 view
+    // Like the runtime's 0xE0000000 view: mapped PROT_NONE and committed later, piece by piece.
+    auto* b = static_cast<uint8_t*>(mmap(nullptr, size - 4096, PROT_NONE, MAP_SHARED, fd, 4096));
     if (a == MAP_FAILED || b == MAP_FAILED) { std::printf("mmap failed\n"); return 1; }
     std::memset(a, 1, 1u << 20);  // some populated pages, the rest unpopulated
 
@@ -33,6 +34,8 @@ int main() {
         std::printf("write_watch_test: SKIPPED, not supported here: %s\n", why);
         return 0;
     }
+
+    mprotect(b, 1u << 20, PROT_READ | PROT_WRITE);  // committed after Init, as allocations are
 
     // A watched range is clean until written.
     uint64_t t1 = ww.Watch(0x10000, 0x4000);
@@ -74,6 +77,25 @@ int main() {
     a[0x30000] = 9;
     ww.Harvest();
     CHECK(!ww.Clean(0x30000, 0x1000, t6));
+
+    // Kernel writes (read() into guest memory, as file I/O does) are seen too.
+    uint64_t t7 = ww.Watch(0x40000, 0x1000);
+    ww.Harvest();
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    CHECK(write(pfd[1], "abcd", 4) == 4);
+    CHECK(read(pfd[0], a + 0x40100, 4) == 4);
+    close(pfd[0]);
+    close(pfd[1]);
+    ww.Harvest();
+    CHECK(!ww.Clean(0x40000, 0x1000, t7));
+    // Zeroing in place (the runtime's free while memory is pinned) counts as a write.
+    uint64_t t8 = ww.Watch(0x50000, 0x2000);
+    ww.Harvest();
+    std::memset(a + 0x51000, 0, 0x1000);
+    ww.Harvest();
+    CHECK(ww.Clean(0x50000, 0x1000, t8));
+    CHECK(!ww.Clean(0x51000, 0x1000, t8));
 
     // Cost: watch 16 MB, write one byte per page, harvest.
     const uint32_t big = 16u << 20, base = 32u << 20;

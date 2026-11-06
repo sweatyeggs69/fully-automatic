@@ -114,6 +114,15 @@ struct RtGuestMemory : fa::gpu::GuestMemory {
     int PhysicalFd() const override { return g_mem.phys_fd(); }
     uint32_t PhysicalSize() const override { return kPhysicalSize; }
     void PhysicalPinned() override { g_mem.set_physical_pinned(); }
+    int PhysicalViews(PhysicalView* out, int max) const override {
+        // Same layout as GuestMemory::init: 0xA0000000 + p, 0xC0000000 + p, 0xE0000000 + p - 0x1000.
+        const PhysicalView v[3] = {{host(0xA0000000u), 0, kPhysicalSize},
+                                   {host(0xC0000000u), 0, kPhysicalSize},
+                                   {host(0xE0000000u), 0x1000, kPhysicalSize - 0x1000}};
+        int n = 0;
+        for (; n < 3 && n < max; n++) out[n] = v[n];
+        return n;
+    }
 };
 
 constexpr uint32_t kCpRbRptr = 0x7FC80000 + 0x1C4 * 4;

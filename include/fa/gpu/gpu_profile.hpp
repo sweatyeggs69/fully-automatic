@@ -41,20 +41,21 @@ enum Section : int {
     kInval,        // InvalidateTextures, from any caller
     kRcGen,        // inside resolve cpu: generic resolve conversions (FinishGenerics)
     kRcRaw,        // inside resolve cpu: raw snapshot writebacks (ResolveRaw)
+    kWwHarvest,    // asking the kernel which watched guest pages were written (once per frame)
     kCount
 };
 
 inline const char* const kNames[kCount] = {"busy",         "draw",        "tex check",  "tex upload",
                                            "shader",       "pipeline",    "resolve",    "resolve wait",
-                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc", "up.const", "up.vb", "up.idx", "dt.flush", "dt.ptr", "rs.snap", "inval", "rc.gen", "rc.raw"};
+                                           "resolve cpu",  "other wait",  "frame decode", "d.build", "d.tex", "d.upload", "d.record", "dt.get", "dt.snap", "dt.desc", "up.const", "up.vb", "up.idx", "dt.flush", "dt.ptr", "rs.snap", "inval", "rc.gen", "rc.raw", "ww harvest"};
 
 inline const bool g_enabled = std::getenv("FA_PROFILE") != nullptr;
 inline std::atomic<uint64_t> g_ns[kCount];
 inline std::atomic<uint64_t> g_count[kCount];
 
 // Plain counters (bytes, items) printed per frame after the timed sections.
-enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kVbSame, kVbSameCnt, kVbUnbCnt, kFtGen, kFtSnap, kWbSnapKB, kWbGenKB, kDescFull, kVbDirectKB, kIdxFast, kIdxStrip, kIdxStripReset, kIdxStripFFFF, kIdxInline, kIdxListSlow, kIdxOther, kVbChecked, kVbChgSubmit, kVbChgSubmitKB, kVbChgGpu, kVbChgGpuKB, kConstBlocks, kStatCount };
-inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us", "vb KB unchanged", "unb pools unchanged", "unb pool copies", "flushtex by generic", "flushtex by snap", "wb snap KB", "wb gen KB", "desc pool full", "vb KB direct", "indices fast", "idx strip", "idx strip reset", "idx strip reset ffff", "idx inline", "idx list slow", "idx other", "vbcheck draws", "vbcheck changed by submit", "vbcheck KB changed by submit", "vbcheck changed during gpu", "vbcheck KB changed during gpu", "const blocks"};
+enum Stat : int { kVbBytes, kVbUnbounded, kIdxCount, kConstUploads, kSubmits, kFlushSync, kFlushSwap, kFlushTex, kFlushOverlap, kFlushCap, kGpuUs, kVbSame, kVbSameCnt, kVbUnbCnt, kFtGen, kFtSnap, kWbSnapKB, kWbGenKB, kDescFull, kVbDirectKB, kIdxFast, kIdxStrip, kIdxStripReset, kIdxStripFFFF, kIdxInline, kIdxListSlow, kIdxOther, kVbChecked, kVbChgSubmit, kVbChgSubmitKB, kVbChgGpu, kVbChgGpuKB, kConstBlocks, kWwClean, kWwMiss, kWwPagesWritten, kWwPagesWatched, kStatCount };
+inline const char* const kStatNames[kStatCount] = {"vb KB", "vb KB unbounded", "indices", "const uploads", "submits", "flush sync", "flush swap", "flush tex", "flush overlap", "flush cap", "gpu exec us", "vb KB unchanged", "unb pools unchanged", "unb pool copies", "flushtex by generic", "flushtex by snap", "wb snap KB", "wb gen KB", "desc pool full", "vb KB direct", "indices fast", "idx strip", "idx strip reset", "idx strip reset ffff", "idx inline", "idx list slow", "idx other", "vbcheck draws", "vbcheck changed by submit", "vbcheck KB changed by submit", "vbcheck changed during gpu", "vbcheck KB changed during gpu", "const blocks", "ww clean", "ww miss", "ww pages written", "ww pages watched"};
 inline std::atomic<uint64_t> g_stat[kStatCount];
 inline void Add(Stat s, uint64_t n) {
     if (g_enabled) g_stat[s].fetch_add(n, std::memory_order_relaxed);
@@ -94,7 +95,7 @@ inline void OnSwap() {
         ns[i] = g_ns[i].exchange(0, std::memory_order_relaxed);
         n[i] = g_count[i].exchange(0, std::memory_order_relaxed);
     }
-    char line[1536];
+    char line[2048];
     int len = std::snprintf(line, sizeof line, "[gpuprof] %.1f s: %.1f swaps/s, gpu thread busy %.0f%% | ms per frame:", dt,
                             double(swaps) / dt, 100.0 * double(ns[kPump]) / 1e9 / dt);
     for (int i = 1; i < kCount && len > 0 && len < int(sizeof line); i++) {

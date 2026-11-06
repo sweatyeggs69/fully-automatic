@@ -24,6 +24,14 @@ public:
     // The renderer pinned physical memory for the GPU (udmabuf): freeing must zero pages in place
     // instead of dropping them, or the GPU would keep seeing the old pages.
     virtual void PhysicalPinned() {}
+    // Host mappings through which guest physical memory is read and written: host address `base`
+    // shows physical bytes [physOffset, physOffset + size). Fills at most `max`, returns the count.
+    struct PhysicalView {
+        uint8_t* base;
+        uint32_t physOffset;
+        uint32_t size;
+    };
+    virtual int PhysicalViews(PhysicalView* out, int max) const { return 0; }
 };
 
 }  // namespace fa::gpu

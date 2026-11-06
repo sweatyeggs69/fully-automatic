@@ -37,6 +37,7 @@
 #include "fa/gpu/shader.hpp"
 #include "fa/gpu/texture.hpp"
 #include "fa/gpu/xenos.hpp"
+#include "fa/mem/write_watch.hpp"
 
 namespace fa::gpu {
 
@@ -400,6 +401,7 @@ struct Texture {
     uint64_t lastFullGen = 0;  // frame of the last full hash
     uint32_t stable = 0;       // consecutive checked frames with unchanged content
     uint32_t guestBase = 0, guestSize = 0;
+    uint64_t wwToken = 0;  // write watch token of the bytes last checked (0 = not watched)
     bool ok = false;
 };
 
@@ -581,6 +583,7 @@ struct VulkanRenderer::Impl {
     void InvalidateTextures(uint32_t base, uint32_t size, uint32_t site = 0) {
         prof::Scope pi_(prof::kInval);
         texEpoch++;
+        WwTouch(base, size);  // the host writes this memory now or at the next flush
         const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
         for (auto& [k, e] : snaps)
             if (e.valid && uint64_t(e.base) < hi && lo < uint64_t(e.base) + e.size) { e.valid = false; e.invBase = uint32_t(lo); e.invSize = size; e.invSite = site; }
@@ -1692,6 +1695,51 @@ struct VulkanRenderer::Impl {
         if (pa != r.lastBase) r.lastBase = pa;
         return frame < r.until;
     }
+    // ---- kernel write tracking ----------------------------------------------------------------
+    // On unless FA_WW=0, and only with direct vertex reads (pinned memory: frees zero pages in place
+    // instead of punching holes, which could drop the kernel's write protection). Texture checks
+    // skip hashing when no page of the texture was written since its last check. FA_WW_VERIFY=1
+    // still hashes those textures and counts the ones that changed anyway ("ww miss", should be 0).
+    fa::mem::WriteWatch ww;
+    static inline const bool wwVerify = [] { const char* e = std::getenv("FA_WW_VERIFY"); return e && e[0] == '1'; }();
+    void SetupWriteWatch() {
+        const char* e = std::getenv("FA_WW");
+        if (e && e[0] == '0') return;
+        // FA_WW=2 also runs without pinned memory (tests: their memory is never freed).
+        if (!guestBuf && !(e && e[0] == '2')) { std::fprintf(stderr, "[writewatch] off: needs direct vertex reads (pinned guest memory)\n"); return; }
+        GuestMemory::PhysicalView pv[4];
+        const int n = mem.PhysicalViews(pv, 4);
+        if (n <= 0) { std::fprintf(stderr, "[writewatch] off: guest memory views not available\n"); return; }
+        std::vector<fa::mem::WriteWatch::View> views;
+        for (int i = 0; i < n; i++) views.push_back({pv[i].base, pv[i].physOffset, pv[i].size});
+        const char* why = nullptr;
+        if (!ww.Init(views, mem.PhysicalSize(), &why)) { std::fprintf(stderr, "[writewatch] off: %s\n", why); return; }
+        stats.writeWatch = 1;
+        std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
+    }
+    // Physical address of a guest address the renderer reads (HostPtr's mapping), or -1.
+    static int64_t WwPhys(uint32_t a) { return a < 0x20000000u ? int64_t(a) : a >= 0xA0000000u ? int64_t(a & 0x1FFFFFFFu) : -1; }
+    uint64_t WwWatch(uint32_t a, uint32_t n) {
+        const int64_t p = ww.Enabled() ? WwPhys(a) : -1;
+        return p < 0 ? 0 : ww.Watch(uint32_t(p), n);
+    }
+    bool WwClean(uint32_t a, uint32_t n, uint64_t token) const {
+        const int64_t p = ww.Enabled() ? WwPhys(a) : -1;
+        return p >= 0 && ww.Clean(uint32_t(p), n, token);
+    }
+    void WwTouch(uint32_t a, uint32_t n) {
+        const int64_t p = ww.Enabled() ? WwPhys(a) : -1;
+        if (p >= 0) ww.Touch(uint32_t(p), n);
+    }
+    void WwHarvest() {
+        if (!ww.Enabled()) return;
+        prof::Scope ph_(prof::kWwHarvest);
+        ww.Harvest();
+        const auto st = ww.TakeStats();
+        prof::Add(prof::kWwPagesWritten, st.pagesWritten);
+        prof::Add(prof::kWwPagesWatched, st.pagesWatched);
+    }
+
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
     static uint32_t GuestPhys(uint32_t a) { return a < 0x20000000u ? a : (a & 0x1FFFFFFFu); }
 
@@ -1888,6 +1936,7 @@ struct VulkanRenderer::Impl {
         vkGetDeviceQueue(dev, qfam, 0, &queue);
         ProbeGuestImport();
         SetupDirectVb();
+        SetupWriteWatch();
 
         // Depth format: D32S8 where available (AMD has no D24S8), else D24S8.
         VkFormatProperties fp;
@@ -2427,8 +2476,24 @@ struct VulkanRenderer::Impl {
             if (mipSrc) sh = sh * 0x9E3779B97F4A7C15ull + SampleHash(mipSrc, mipBytes) + 1;
             return sh;
         };
+        // Kernel write tracking: no page written since the last check means the bytes are unchanged.
+        const bool wwClean = tex.ok && tex.wwToken && !padded.size() && WwClean(t.base, size, tex.wwToken) &&
+                             (!mipSrc || WwClean(t.mipBase, mipBytes, tex.wwToken));
+        if (wwClean && !wwVerify) {
+            prof::Add(prof::kWwClean, 1);
+            stats.textureWwClean++;
+            tex.validatedGen = generation;
+            tex.stable++;
+            return tex.image.view;
+        }
+        // Watch before reading, so a write during the hash or upload makes this copy stale.
+        uint64_t wwTok = 0;
+        if (ww.Enabled() && !padded.size()) {
+            wwTok = WwWatch(t.base, size);
+            if (wwTok && mipSrc && !WwWatch(t.mipBase, mipBytes)) wwTok = 0;
+        }
         uint64_t sh = 0;
-        if (quickCheck && tex.ok && size + mipBytes >= 65536) {
+        if (!wwClean && quickCheck && tex.ok && size + mipBytes >= 65536) {
             prof::Scope ps_(prof::kTexCheck);
             sh = sampled();
             if (tex.stable >= 8 && generation - tex.lastFullGen < 16 && sh == tex.sampleHash) {
@@ -2447,6 +2512,19 @@ struct VulkanRenderer::Impl {
         tex.validatedGen = generation;
         tex.lastFullGen = generation;
         tex.sampleHash = sh;
+        tex.wwToken = wwTok;
+        if (wwClean) {
+            prof::Add(prof::kWwClean, 1);
+            stats.textureWwClean++;
+            if (h != tex.contentHash) {
+                prof::Add(prof::kWwMiss, 1);
+                stats.textureWwMiss++;
+                static int logged = 0;
+                if (logged++ < 20)
+                    std::fprintf(stderr, "[writewatch] MISS: texture %08x (%u bytes, mips %08x %u) changed but no write was seen\n",
+                                 t.base, size, t.mipBase, mipBytes);
+            }
+        }
         if (tex.ok && h == tex.contentHash) { tex.stable++; return tex.image.view; }
         tex.stable = 0;
         prof::Scope ps_(prof::kTexUpload);
@@ -4017,6 +4095,7 @@ struct VulkanRenderer::Impl {
         }
         generation++;
         texEpoch++;
+        WwHarvest();
         if (prof::g_enabled) {
             const char* h = std::getenv("HOME");
             struct stat st;

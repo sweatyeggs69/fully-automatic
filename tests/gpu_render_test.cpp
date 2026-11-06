@@ -1,8 +1,12 @@
 // End-to-end renderer test: PM4 stream -> CommandProcessor -> VulkanRenderer (offscreen EDRAM
 // targets) -> resolve into guest memory, then decode the resolved surface and check pixels.
 // Runs on any Vulkan 1.3 device (lavapipe works). Exits 0 with "skipped" when there is none.
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -17,7 +21,27 @@
 using namespace fa::gpu;
 
 struct FakeMem : GuestMemory {
-    std::vector<uint8_t> bytes = std::vector<uint8_t>(16 << 20);  // big-endian storage
+    // Big-endian storage in a shared mapping, like the runtime's physical memory, so the kernel
+    // write tracking can watch it.
+    struct Bytes {
+        size_t n = 16 << 20;
+        uint8_t* p = [this] {
+            int fd = memfd_create("render-test", 0);
+            void* m = fd >= 0 && ftruncate(fd, n) == 0 ? mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+            if (fd >= 0) close(fd);
+            if (m == MAP_FAILED) { std::printf("gpu_render_test: guest memory mapping failed\n"); std::exit(1); }
+            return static_cast<uint8_t*>(m);
+        }();
+        size_t size() const { return n; }
+        uint8_t& operator[](size_t i) { return p[i]; }
+        const uint8_t& operator[](size_t i) const { return p[i]; }
+    } bytes;
+    uint32_t PhysicalSize() const override { return uint32_t(bytes.size()); }
+    int PhysicalViews(PhysicalView* out, int max) const override {
+        if (max < 1) return 0;
+        out[0] = {bytes.p, 0, uint32_t(bytes.size())};
+        return 1;
+    }
     uint32_t Read32(uint32_t a) const override {
         return (uint32_t(bytes[a]) << 24) | (bytes[a + 1] << 16) | (bytes[a + 2] << 8) | bytes[a + 3];
     }
@@ -77,6 +101,7 @@ static void Pixel(const FakeMem& mem, uint32_t base, uint32_t pitch, uint32_t he
 
 int main() {
     FakeMem mem;
+    setenv("FA_WW", "2", 0);  // write tracking without pinned memory (no udmabuf here)
     VulkanRenderer r(mem, nullptr);
     VulkanRenderer::Options opt;
     opt.validation = std::getenv("FA_VK_VALIDATION") != nullptr;
@@ -244,6 +269,36 @@ int main() {
         Pixel(mem, dest2, 128, 64, 60, 60, p);
         std::printf("  perspective (60,60) = %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
         CHECK(p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255);
+    }
+
+    // Kernel write tracking: next frame an unchanged texture is not hashed again, and a texture the
+    // guest wrote is uploaded again.
+    {
+        RegisterFile none;
+        Stream q{mem, ring, ringBytes / 4, s.w};
+        auto texDraw = [&] {
+            q.shader(0, xasm::ColorVS());
+            q.shader(1, xasm::TexturePS(1));
+            q.reg(xe::PA_CL_VTE_CNTL, 0);
+            q.vfetch0(texVb, 21);
+            q.draw(xe::kPrimRectangleList, 3);
+            cp.SetWritePtr(q.w % (ringBytes / 4));
+            CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+            r.Flush();
+        };
+        const uint64_t up0 = st.textureUploads, clean0 = st.textureWwClean;
+        r.Swap(0, 0, 0, none);
+        texDraw();
+        CHECK(st.textureUploads == up0);
+        const bool on = st.writeWatch != 0;
+        if (on) CHECK(st.textureWwClean == clean0 + 1);
+        mem.Write32(tex, 0xFF00FF00u);
+        r.Swap(0, 0, 0, none);
+        texDraw();
+        CHECK(st.textureUploads == up0 + 1);
+        if (on) CHECK(st.textureWwClean == clean0 + 1);
+        std::printf("  write watch %s: unchanged texture %s, written texture uploaded again %s\n", on ? "on" : "off",
+                    st.textureWwClean > clean0 ? "skipped" : "hashed", st.textureUploads == up0 + 1 ? "yes" : "NO");
     }
 
     if (failures) { std::printf("gpu_render_test: %d failure(s)\n", failures); return 1; }

@@ -31,6 +31,9 @@ public:
     struct Stats {
         std::atomic<uint64_t> draws{0}, drawsSkipped{0}, resolves{0}, clears{0}, shadersCompiled{0},
             shaderErrors{0}, pipelines{0}, textureUploads{0}, submits{0};
+        // Kernel write tracking: 1 when on; texture checks it answered without hashing; textures it
+        // called unchanged that had changed (FA_WW_VERIFY=1 only, should stay 0).
+        std::atomic<uint64_t> writeWatch{0}, textureWwClean{0}, textureWwMiss{0};
     };
 
     // `next` receives every call too (FrameBackend: stats, texture debug view, window frames).
