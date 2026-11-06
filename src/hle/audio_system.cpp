@@ -37,7 +37,20 @@ static ClientRing g_rings[AudioSystem::kMaxClients];
 AudioSystem::AudioSystem() = default;
 AudioSystem::~AudioSystem() { shutdown(); }
 
-void AudioSystem::downmix_frame(const float* in, float* out) {
+// Soft knee instead of a hard clamp: the game's 5.1 mix routinely sums past
+// full scale once it is folded to stereo (race audio peaked at exactly 0 dBFS
+// in runs 110-117), and a hard clamp there sounds like crackle. Below the knee
+// the signal is untouched; above it, it bends smoothly towards +-1.
+static inline float soft_limit(float x, int& limited) {
+    constexpr float knee = 0.8f, room = 1.0f - knee;
+    float a = std::fabs(x);
+    if (a <= knee) return x;
+    if (a > 1.0f) ++limited;
+    float y = knee + room * std::tanh((a - knee) / room);
+    return x < 0 ? -y : y;
+}
+
+int AudioSystem::downmix_frame(const float* in, float* out) {
     constexpr float c = 0.70710678f;
     const float* fl = in;
     const float* fr = in + kFrameSamples;
@@ -45,11 +58,13 @@ void AudioSystem::downmix_frame(const float* in, float* out) {
     const float* lfe = in + 3 * kFrameSamples;
     const float* bl = in + 4 * kFrameSamples;
     const float* br = in + 5 * kFrameSamples;
+    int limited = 0;
     for (int i = 0; i < kFrameSamples; ++i) {
         float common = c * fc[i] + 0.5f * lfe[i];
-        out[2 * i] = std::clamp(fl[i] + common + c * bl[i], -1.0f, 1.0f);
-        out[2 * i + 1] = std::clamp(fr[i] + common + c * br[i], -1.0f, 1.0f);
+        out[2 * i] = soft_limit(fl[i] + common + c * bl[i], limited);
+        out[2 * i + 1] = soft_limit(fr[i] + common + c * br[i], limited);
     }
+    return limited;
 }
 
 bool AudioSystem::init(const GuestHooks& hooks, bool disable_output) {
@@ -190,7 +205,7 @@ void AudioSystem::submit_frame_host(int client, const uint8_t* be) {
     float planar[kChannels * kFrameSamples];
     for (int i = 0; i < kChannels * kFrameSamples; ++i) planar[i] = be_float(be + 4 * i);
     float stereo[kFrameFloats];
-    downmix_frame(planar, stereo);
+    int limited = downmix_frame(planar, stereo);
     {
         float peak = 0;
         double sq = 0;
@@ -200,6 +215,7 @@ void AudioSystem::submit_frame_host(int client, const uint8_t* be) {
         }
         std::lock_guard sl(stats_mu_);
         ++stats_.frames;
+        stats_.limited_samples += uint64_t(limited);
         if (peak == 0) ++stats_.silent_frames;
         stats_.peak = std::max(stats_.peak, peak);
         stats_.sum_sq += sq;
