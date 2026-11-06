@@ -11,6 +11,9 @@
 #include "fa/gpu/frame_backend.hpp"
 #include "fa/gpu/gpu_profile.hpp"
 #include "fa/rt/video.hpp"
+#include "fa/rt/store_trace_ctl.hpp"
+
+namespace fa::rt { __attribute__((weak)) void direct_tap_frame_end(); }  // runtime/src/direct_tap.cpp (fullauto only)
 
 #include <atomic>
 #include <chrono>
@@ -180,6 +183,8 @@ void gpu_thread() {
 }
 
 void start_gpu() {
+    if (std::getenv("FA_STORE_TRACE"))
+        fa::gpu::g_indirect_buffer_observer = [](uint32_t a, uint32_t n) { fa::rt::store_trace_add_range(a, n * 4); };
     if (g_gpu_started.exchange(true)) return;
     fa::gpu::Backend* be = g_backend_override.load();
     g_cp = new fa::gpu::CommandProcessor(g_gpu_mem, be ? *be : static_cast<fa::gpu::Backend&>(g_gpu_backend));
@@ -202,6 +207,7 @@ FA_IMPORT(VdInitializeRingBuffer) {
     g_vd.ring_size_log2 = arg32(ctx, 1);
     g_vd.ring_size_bytes = 8u << g_vd.ring_size_log2;
     std::fprintf(stderr, "[gpu] ring buffer at %08x, %u bytes\n", g_vd.ring_base, g_vd.ring_size_bytes);
+    fa::rt::store_trace_add_range(g_vd.ring_base, g_vd.ring_size_bytes);
     start_gpu();
 }
 
@@ -264,6 +270,8 @@ FA_IMPORT(VdGetCurrentDisplayInformation) {
 FA_IMPORT(VdSetDisplayMode) { ret32(ctx, 0); }
 FA_IMPORT(VdInitializeScalerCommandBuffer) { ret32(ctx, 0); }
 FA_IMPORT(VdSwap) {
+    fa::rt::store_trace_frame_end();
+    if (fa::rt::direct_tap_frame_end) fa::rt::direct_tap_frame_end();
     // (buffer, fetch constant, writeback, system buffer, system buffer id, frontbuffer address ptr,
     //  format ptr, color space ptr, width ptr, height ptr). The caller reserves 64 dwords of the
     // ring at `buffer` for the swap: load the frontbuffer fetch constant into fetch slot 0, emit

@@ -183,6 +183,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
         case pm4::kIndirectBufferPfd:
             if (n >= 2 && depth == 0 && !ib_.active) {
                 ib_ = {true, d[0] & 0x1FFFFFFF, d[1] & 0xFFFFF, 0};
+                if (g_indirect_buffer_observer) g_indirect_buffer_observer(ib_.base, ib_.size);
             } else {
                 ++stats_.unknown;  // nested indirect buffers are not used by the game
             }
@@ -295,6 +296,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                 (t ? dc.psDwords : dc.vsDwords) = uint32_t(s.ucode.size());
                 (t ? dc.psHash : dc.vsHash) = s.hash;
             }
+            if (g_draw_observer) g_draw_observer(dc);
             backend_.Draw(dc, regs_);
             ++stats_.draws;
             break;
