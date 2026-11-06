@@ -404,7 +404,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             }
             if (g_draw_observer) g_draw_observer(dc, regs_);
             if (g_draw_feeder) g_draw_feeder(dc, regs_);
-            backend_.Draw(dc, regs_);
+            if (!g_direct_draw || !g_direct_draw(dc, regs_, backend_)) backend_.Draw(dc, regs_);
             ++stats_.draws;
             if (tt_.on) tt_.draws++;
             break;
