@@ -277,6 +277,20 @@ static void tap_draw_shaders(const uint8_t* base, uint32_t dev) {
                 std::fprintf(stderr, "[tap] draw slot1 raw obj %08x:", obj);
                 for (uint32_t i = 0; i < 24; i++) std::fprintf(stderr, " %08x", __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + i * 4)));
                 std::fprintf(stderr, "\n");
+                // 82147E08 derives r23 = obj + [obj+0x48] + 0x34 for this slot; also dump the guest pointer at +0x0C.
+                const uint32_t off48 = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x48));
+                if (off48 < 0x10000) {
+                    const uint32_t r23 = obj + off48 + 0x34;
+                    std::fprintf(stderr, "[tap] draw slot1 r23 %08x:", r23);
+                    for (uint32_t i = 0; i < 24; i++) std::fprintf(stderr, " %08x", __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + r23 + i * 4)));
+                    std::fprintf(stderr, "\n");
+                }
+                const uint32_t p3 = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + obj + 0x0C));
+                if (p3 >= 0x10000) {
+                    std::fprintf(stderr, "[tap] draw slot1 ptr+0x0C %08x:", p3);
+                    for (uint32_t i = 0; i < 24; i++) std::fprintf(stderr, " %08x", __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + p3 + i * 4)));
+                    std::fprintf(stderr, "\n");
+                }
             }
             continue;
         }
