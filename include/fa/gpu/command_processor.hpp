@@ -18,6 +18,8 @@ inline void (*g_draw_feeder)(const DrawCall& draw, RegisterFile& regs) = nullptr
 // of Backend::Draw. Returns false when there is no record (the command processor then draws as usual).
 class Backend;
 inline bool (*g_direct_draw)(const DrawCall& draw, const RegisterFile& regs, Backend& backend) = nullptr;
+// Direct hooks (stage B): the resolve of a copy-mode draw from the game's resolve record; false = CP resolves.
+inline bool (*g_direct_resolve)(const DrawCall& draw, const RegisterFile& regs, Backend& backend) = nullptr;
 
 // Consumes the PM4 ring buffer the game fills (set up through VdInitializeRingBuffer).
 // Single threaded: the runtime core calls Pump() from its GPU thread whenever the

@@ -391,7 +391,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                                  regs_[xe::RB_COPY_DEST_INFO], regs_[xe::PA_SC_WINDOW_OFFSET], regs_[xe::RB_SURFACE_INFO],
                                  regs_[xe::RB_COLOR_INFO], regs_[xe::RB_DEPTH_INFO]);
                 }
-                backend_.Resolve(regs_);
+                if (!g_direct_resolve || !g_direct_resolve(dc, regs_, backend_)) backend_.Resolve(regs_);
                 ++stats_.resolves;
                 break;
             }

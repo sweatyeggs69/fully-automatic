@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include "fa/gpu/command_processor.hpp"
+#include "fa/gpu/pm4.hpp"
 #include "fa/gpu/xenos.hpp"
 #include "fa/rt/import.hpp"
 #include "fa/rt/memory.hpp"
@@ -32,6 +33,7 @@ PPC_FUNC_IMPL(__imp__sub_82147BF8);
 PPC_FUNC_IMPL(__imp__sub_82147370);
 PPC_FUNC_IMPL(__imp__sub_823162F8);
 PPC_FUNC_IMPL(__imp__sub_82147160);
+PPC_FUNC_IMPL(__imp__sub_82142490);
 
 namespace {
 // FA_TAP=1 turns on the observe-only taps and parity report. FA_DIRECT is a bit mask of hooked families
@@ -593,6 +595,84 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool inde
     g_q_words_pushed += r.size();
 }
 
+// Resolve records (stage B): the game's D3D resolve (82142490) writes its copy setup straight into the stream (copy
+// registers, RB_MODECONTROL, the rectangle's vertex fetch constant, a copy-mode draw) without the device shadow. Until
+// its arguments are decoded, the hook reads back the register writes the function itself just emitted (a narrow
+// read of the game's own output, not the CP) and queues them in order with the draw records. Key: the copy-mode draw
+// packet inside that output, which is what the CP resolves on.
+uint64_t g_rs_pushed = 0, g_rs_wrapped = 0, g_rs_nodraw = 0;  // game thread
+std::vector<std::pair<uint32_t, uint32_t>> g_rs_writes;       // game thread
+
+void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
+    namespace pm4 = fa::gpu::pm4;
+    if (after <= before || after - before > 0x10000) { g_rs_wrapped++; g_prev_valid = false; return; }
+    auto rd = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a)); };
+    auto keep = [](uint32_t reg) { return (reg >= 0x2000 && reg < 0x2400) || (reg >= 0x4000 && reg < 0x4928); };
+    g_rs_writes.clear();
+    uint32_t key = 0xFFFFFFFFu, prim = 0, count = 0;
+    for (uint32_t a = before + 4; a <= after;) {
+        const uint32_t h = rd(a);
+        switch (pm4::TypeOf(h)) {
+            case pm4::kType0: {
+                const uint32_t n = pm4::T0Count(h), reg = pm4::T0Base(h);
+                for (uint32_t i = 0; i < n && a + 4 + i * 4 <= after; i++) {
+                    const uint32_t rg = pm4::T0OneReg(h) ? reg : reg + i;
+                    if (keep(rg)) g_rs_writes.push_back({rg, rd(a + 4 + i * 4)});
+                }
+                a += 4 + n * 4;
+                break;
+            }
+            case pm4::kType1:
+                if (keep(pm4::T1Reg0(h))) g_rs_writes.push_back({pm4::T1Reg0(h), rd(a + 4)});
+                if (keep(pm4::T1Reg1(h))) g_rs_writes.push_back({pm4::T1Reg1(h), rd(a + 8)});
+                a += 12;
+                break;
+            case pm4::kType2: a += 4; break;
+            case pm4::kType3: {
+                const uint32_t n = pm4::T3Count(h), op = pm4::T3Opcode(h);
+                if (a + n * 4 > after) { a = after + 4; break; }
+                if (op == pm4::kSetConstant && n >= 2) {
+                    const uint32_t d0 = rd(a + 4), index = d0 & 0x7FF, type = (d0 >> 16) & 0xFF;
+                    const uint32_t b = type == 0 ? 0x4000 : type == 1 ? 0x4800 : type == 2 ? 0x4900 : type == 3 ? 0x4908 : type == 4 ? 0x2000 : 0;
+                    if (b) for (uint32_t i = 1; i < n; i++) if (keep(b + index + i - 1)) g_rs_writes.push_back({b + index + i - 1, rd(a + 4 + i * 4)});
+                } else if ((op == pm4::kDrawIndx || op == pm4::kDrawIndx2) && key == 0xFFFFFFFFu) {
+                    const uint32_t init = rd(a + 4 + (op == pm4::kDrawIndx ? 4 : 0));
+                    key = a & 0x1FFFFFFF;
+                    prim = init & 0x3F;
+                    count = init >> 16;
+                }
+                a += 4 + n * 4;
+                break;
+            }
+        }
+    }
+    if (key == 0xFFFFFFFFu) { g_rs_nodraw++; return; }
+    std::vector<uint32_t>& r = g_rec_buf;
+    r.assign(kRecHdr, 0);
+    r[1] = 2;  // resolve
+    r[2] = key;
+    r[3] = prim;
+    r[4] = count;
+    // Runs in write order (later writes win when applied), consecutive registers merged.
+    for (size_t i = 0; i < g_rs_writes.size();) {
+        size_t j = i + 1;
+        while (j < g_rs_writes.size() && g_rs_writes[j].first == g_rs_writes[j - 1].first + 1) j++;
+        r.push_back(g_rs_writes[i].first);
+        r.push_back(uint32_t(j - i));
+        for (size_t k = i; k < j; k++) r.push_back(g_rs_writes[k].second);
+        i = j;
+    }
+    r[0] = uint32_t(r.size());
+    const uint64_t w = g_q_w.load(std::memory_order_relaxed), rr = g_q_r.load(std::memory_order_acquire);
+    // The game restores its state after a resolve through its dirty bits, which the shadow diff does not see: the
+    // next draw record carries the full state.
+    g_prev_valid = false;
+    if (w + r.size() - rr > kQWords) { g_q_dropped++; return; }
+    for (size_t i = 0; i < r.size(); i++) g_q[(w + i) & kQMask] = r[i];
+    g_q_w.store(w + r.size(), std::memory_order_release);
+    g_rs_pushed++;
+}
+
 // CP thread state for the queue path.
 constexpr uint32_t kImg = 0x4928, kBlocks = (kImg + 15) / 16;
 uint32_t g_cur[kImg], g_sent[kImg];
@@ -647,7 +727,8 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     }
     g_q_r.store(r, std::memory_order_release);
     if (match == ~0ull - 1) { g_b_flushed++; return false; }
-    if (!eligible) return false;
+    // A resolve record matched by a draw that is not a copy (no shader identities in it): leave it to the PM4 path.
+    if (!eligible || (g_q[(hdr + 1) & kQMask] & 2)) return false;
     for (uint32_t reg : kCpRegs)
         if (g_cur[reg] != regs[reg]) { g_cur[reg] = regs[reg]; mark(reg); }
     auto hv = [&](uint32_t i) { return g_q[(hdr + i) & kQMask]; };
@@ -758,6 +839,63 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
     }
     std::memset(g_blk_dirty, 0, sizeof g_blk_dirty);
     g_b_draws++;
+    return true;
+}
+
+// CP resolve (copy-mode draw): consume records up to the resolve record of this packet; with FA_TAP=1 compare the
+// image with the CP's registers the resolve reads; with FA_DIRECT bit 5 (32) resolve from the image.
+uint64_t g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[0x30];
+int g_rb_printed = 0;
+constexpr uint32_t kResolveRegs[] = {0x2000, 0x2001, 0x2002, 0x2080, 0x2081, 0x2082, 0x2205, 0x2208, 0x2302,
+                                     0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801};
+
+bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    g_rb_resolves++;
+    if (!g_cur_init) return false;
+    const uint64_t w = g_q_w.load(std::memory_order_acquire);
+    uint64_t r = g_q_r.load(std::memory_order_relaxed), at = r, match = ~0ull;
+    for (int n = 0; n < 256 && at < w; n++) {
+        if (g_q[(at + 2) & kQMask] == dc.packetAddr) { match = at; break; }
+        at += g_q[at & kQMask];
+    }
+    if (match == ~0ull) { g_rb_missing++; return false; }
+    while (r <= match) {
+        const uint32_t len = g_q[r & kQMask];
+        for (uint32_t i = kRecHdr; i < len;) {
+            const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
+            for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
+            i += 2 + cnt;
+        }
+        if (r != match) g_b_skipped++;
+        g_b_recs++;
+        r += len;
+    }
+    g_q_r.store(r, std::memory_order_release);
+    // Window offset and scissor stay with the CP (not in any record yet).
+    for (uint32_t reg : {0x2080u, 0x2081u, 0x2082u})
+        if (g_cur[reg] != regs[reg]) { g_cur[reg] = regs[reg]; mark(reg); }
+    if (g_tap_report) {
+        g_rb_cmp++;
+        bool any = false;
+        for (uint32_t reg : kResolveRegs) {
+            if (g_cur[reg] == regs[reg]) continue;
+            any = true;
+            g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F]++;
+            if (g_rb_printed < 12) {
+                g_rb_printed++;
+                std::fprintf(stderr, "[direct] resolve image reg %04x: game %08x cp %08x (packet %08x)\n", reg, g_cur[reg], regs[reg], dc.packetAddr);
+            }
+        }
+        g_rb_diff += any;
+    }
+    if (!(g_direct & 32)) return false;
+    static fa::gpu::RegisterFile rf;
+    rf = regs;  // registers no record covers yet keep the CP's values
+    std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
+    std::memcpy(rf.r.data() + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
+    backend.Resolve(rf);
+    g_rb_direct++;
     return true;
 }
 
@@ -920,6 +1058,17 @@ PPC_FUNC(sub_82147370) {
 
 void apply_pending_locked(const uint8_t* base);
 
+// D3D resolve (82142490): r3 device. Its own stream output becomes a resolve record (see push_resolve_record).
+PPC_FUNC(sub_82142490) {
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t before = (g_direct & 8) ? __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev)) : 0;
+    __imp__sub_82142490(ctx, base);
+    if (g_direct & 8) {
+        const uint32_t after = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + dev));
+        push_resolve_record(base, before, after);
+    }
+}
+
 // Non-indexed draw (823152C0): r3 device, r4 primitive type, r5 start vertex (written to the shadow as 0x2102
 // VGT_INDX_OFFSET before the flush), r6 vertex count. Counts above 65535 are split into several packets by the
 // game; those are left to the PM4 path (no record).
@@ -1019,6 +1168,7 @@ void direct_tap_frame_end() {
     if (!g_on) return;
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
     if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
+    if ((g_direct & 8) && !fa::gpu::g_direct_resolve) fa::gpu::g_direct_resolve = direct_resolve_queue;
     if ((g_direct & 8) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw_queue;
     else if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
@@ -1045,6 +1195,17 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
                      (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_dwords);
+        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, resolved from the record %llu\n",
+                     (unsigned long long)g_rs_pushed, (unsigned long long)g_rs_wrapped, (unsigned long long)g_rs_nodraw,
+                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_direct);
+        if (g_tap_report) {
+            std::fprintf(stderr, "[direct] stage B resolve check: compared %llu, image differs %llu | by reg:", (unsigned long long)g_rb_cmp, (unsigned long long)g_rb_diff);
+            for (uint32_t reg : kResolveRegs) {
+                const uint64_t c = g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F];
+                if (c) std::fprintf(stderr, " %04x:%llu", reg, (unsigned long long)c);
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B check: draws %llu, image differs from CP %llu, args differ %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
                          (unsigned long long)g_b_cmp_draws, (unsigned long long)g_b_diff_draws, (unsigned long long)g_b_bad_args);
