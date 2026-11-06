@@ -520,7 +520,8 @@ uint32_t draw_key(const uint8_t* base, uint32_t dev, bool indexed = true) {
     return (wptr - back) & 0x1FFFFFFF;
 }
 
-void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool indexed = true) {
+constexpr uint32_t kStateOnlyKey = 0xFFFFFFFEu;  // record flag bit 4 (16): state written by a flush outside a draw hook
+void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool indexed = true, bool stateOnly = false) {
     uint32_t g[kGDwords];
     {
         auto rd_block = [&](uint32_t* dst, uint32_t off, uint32_t n) {
@@ -558,7 +559,8 @@ void push_record(const uint8_t* base, uint32_t dev, const DrawArgs& a, bool inde
     r.clear();
     r.resize(kRecHdr);
     r[1] = (full ? 1 : 0) | ((base[dev + 10432] & 4) ? 8 : 0);  // bit 3: predicated-tiling recording variant
-    r[2] = draw_key(base, dev, indexed);
+    r[2] = stateOnly ? kStateOnlyKey : draw_key(base, dev, indexed);
+    if (stateOnly) r[1] |= 16;
     r[3] = a.prim;
     r[4] = a.count;
     r[5] = indexed && a.ibBase ? a.ibBase + a.start * 2 : 0;
@@ -738,6 +740,9 @@ std::unordered_map<uint32_t, ReplayRef> g_replay;  // packet -> where its state 
 uint32_t g_chain_id = 0, g_chain_cur = 0;          // 0 = not in a chain
 size_t g_chain_words = 0;
 uint32_t g_rep_chain = 0, g_rep_pos = 0;           // what g_rep holds
+constexpr size_t kChainCap = (128u << 20) / 4;    // words
+std::unordered_map<uint32_t, uint64_t> g_chain_use;  // chain -> last time it was created or replayed
+uint64_t g_use_tick = 0, g_rpl_evicted = 0;
 uint64_t g_rpl_rebuilds = 0, g_rpl_badargs = 0, g_rpl_diff_badargs = 0;
 // Called for every record the CP applies, in order.
 void chain_note(uint64_t r, uint32_t len) {
@@ -745,9 +750,23 @@ void chain_note(uint64_t r, uint32_t len) {
     const uint32_t f = g_q[(r + 1) & kQMask];
     if (!(f & 8)) { g_chain_cur = 0; return; }
     if ((f & 1) || !g_chain_cur) {
-        if (g_chain_words > (64u << 20) / 4) { g_chains.clear(); g_replay.clear(); g_chain_words = 0; g_rep_chain = 0; }
+        // Run 137: clearing every chain at the cap left ~60 replays per race frame without state. Evict the least
+        // recently replayed chains instead, down to three quarters of the cap.
+        if (g_chain_words > kChainCap) {
+            std::vector<std::pair<uint64_t, uint32_t>> byUse;
+            for (const auto& [id, w] : g_chains) byUse.push_back({g_chain_use[id], id});
+            std::sort(byUse.begin(), byUse.end());
+            for (const auto& [use, id] : byUse) {
+                if (g_chain_words <= kChainCap / 4 * 3) break;
+                g_chain_words -= g_chains[id].size();
+                g_chains.erase(id);
+                g_chain_use.erase(id);
+                g_rpl_evicted++;
+            }
+        }
         g_chain_cur = ++g_chain_id;
         g_chains[g_chain_cur].clear();
+        g_chain_use[g_chain_cur] = ++g_use_tick;
     }
     std::vector<uint32_t>& c = g_chains[g_chain_cur];
     for (uint32_t k = 0; k < len; k++) c.push_back(g_q[(r + k) & kQMask]);
@@ -839,6 +858,7 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     const auto ci = g_chains.find(ref.chain);
     if (ci == g_chains.end() || ci->second.size() < ref.end) { g_rpl_missing++; return false; }
     g_rpl_found++;
+    g_chain_use[ref.chain] = ++g_use_tick;
     const std::vector<uint32_t>& wv = ci->second;
     // The kept draw must be this draw (run 132: the replay check's samples were whole vs matrices from another
     // object, a packet address the game reused with a new recording): same primitive, count and index address.
@@ -906,7 +926,31 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     return true;
 }
 
+bool g_last_nomatch = false;  // the last direct_draw_queue call found no record for its packet
+
+// Applies the state-only records at the head of the queue (stage C3: flushes outside the draw hooks).
+uint64_t apply_state_head() {
+    const uint64_t w = g_q_w.load(std::memory_order_acquire);
+    uint64_t r = g_q_r.load(std::memory_order_relaxed), n = 0;
+    while (r < w && (g_q[(r + 1) & kQMask] & 16)) {
+        const uint32_t len = g_q[r & kQMask];
+        for (uint32_t i = kRecHdr; i < len;) {
+            const uint32_t first = g_q[(r + i) & kQMask], cnt = g_q[(r + i + 1) & kQMask];
+            for (uint32_t k = 0; k < cnt; k++) g_cur[first + k] = g_q[(r + i + 2 + k) & kQMask];
+            for (uint32_t b = first >> 4; b <= (first + cnt - 1) >> 4; b++) g_blk_dirty[b >> 6] |= 1ull << (b & 63);
+            i += 2 + cnt;
+        }
+        chain_note(r, len);
+        g_b_recs++;
+        r += len;
+        n++;
+    }
+    g_q_r.store(r, std::memory_order_release);
+    return n;
+}
+
 bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    g_last_nomatch = false;
     // FA_DIRECT bit 4 (16) adds non-indexed draws (auto indices). Their records are queued either way, so a draw that
     // stays on the PM4 path still consumes its record (run 109: with FA_DIRECT=8 the menus' runs of more than 256
     // non-indexed records were never consumed, the CP stopped finding records and the producer dropped).
@@ -959,7 +1003,7 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         // Safety valve: if the backlog grows past half the ring, apply everything queued (applying in order always
         // keeps the image consistent; only the lookups for those draws are lost).
         if (w - r > kQWords / 2) match = ~0ull - 1;
-        else return replay_draw(dc, regs, backend, eligible);
+        else { g_last_nomatch = true; return replay_draw(dc, regs, backend, eligible); }
     }
     g_in_replay = false;
     const uint32_t cid0 = g_chain_cur, cstart = g_chain_cur ? uint32_t(g_chains[g_chain_cur].size()) : 0;
@@ -1126,9 +1170,10 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
 // (64% of command bytes, and game-thread time). Every direct draw and resolve already takes them from records. What
 // the CP still draws or resolves itself (inline-index draws, draws without a record or chain, resolves without a
 // complete record) gets the record image overlaid on its registers instead of the CP's now stale ones.
-thread_local int t_flush_depth = 0, t_resolve_depth = 0;
+thread_local int t_flush_depth = 0, t_resolve_depth = 0, t_draw_depth = 0;
 inline bool c3_skip() { return (g_direct & 256) && t_flush_depth > 0 && t_resolve_depth == 0; }
-uint64_t g_c3_skipped = 0, g_c3_draws = 0, g_c3_resolves = 0;  // skipped writer calls (game thread), CP fallbacks
+inline bool c3_skip_outer() { return (g_direct & 256) && t_flush_depth == 0 && t_resolve_depth == 0; }
+uint64_t g_c3_skipped = 0, g_c3_draws = 0, g_c3_resolves = 0, g_c3_state_recs = 0, g_c3_state_applied = 0;  // skipped writer calls (game thread), CP fallbacks
 
 void overlay_image(fa::gpu::RegisterFile& rf, std::initializer_list<uint32_t> keep_cp, const fa::gpu::RegisterFile& regs) {
     std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
@@ -1142,6 +1187,7 @@ void overlay_image(fa::gpu::RegisterFile& rf, std::initializer_list<uint32_t> ke
 bool direct_draw_c3(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
     if (direct_draw_queue(dc, regs, backend)) return true;
     if (!(g_direct & 256) || !g_cur_init) return false;
+    if (g_last_nomatch) g_c3_state_applied += apply_state_head();
     static fa::gpu::RegisterFile rf;
     rf = regs;
     overlay_image(rf, {}, regs);
@@ -1341,7 +1387,9 @@ PPC_FUNC(sub_823152C0) {
     if (g_on) g_tap2_calls.fetch_add(1, std::memory_order_relaxed);
     const uint32_t dev = ctx.r3.u32;
     const DrawArgs a{ctx.r4.u32, 0, ctx.r6.u32, 0, 0};
+    t_draw_depth++;
     __imp__sub_823152C0(ctx, base);
+    t_draw_depth--;
     if ((g_direct & 8) && a.count <= 65535) {
         {
             std::lock_guard<std::mutex> lk(g_set_mu);
@@ -1373,9 +1421,20 @@ PPC_FUNC(sub_82148508) {
         apply_pending_locked(base);
         g_flushes++;
     }
+    const bool c3 = c3_skip_outer();
     t_flush_depth++;
     __imp__sub_82148508(ctx, base);
     t_flush_depth--;
+    // A flush outside the draw hooks (run 137: about one draw per menu frame that no draw hook sees, drawn by the CP)
+    // no longer reaches the CP's registers: queue its state as a record the CP applies before drawing such a draw.
+    if (c3 && (g_direct & 8) && t_draw_depth == 0) {
+        {
+            std::lock_guard<std::mutex> lk(g_set_mu);
+            apply_pending_locked(base);
+        }
+        push_record(base, ctx.r3.u32, DrawArgs{}, true, true);
+        g_c3_state_recs++;
+    }
 }
 
 // Stage C3 writers: skipped inside the flush (see c3_skip).
@@ -1415,7 +1474,9 @@ PPC_FUNC(sub_82315500) {
     }
     const uint32_t dev = ctx.r3.u32;
     const DrawArgs args0{ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, 0, 0};
+    t_draw_depth++;
     __imp__sub_82315500(ctx, base);
+    t_draw_depth--;
     if (g_on) {
         {
             std::lock_guard<std::mutex> lk(g_set_mu);
@@ -1486,10 +1547,10 @@ void direct_tap_frame_end() {
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
                          (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
         if (g_direct & 256)
-            std::fprintf(stderr, "[direct] stage C3: flush writer calls skipped %llu | CP draws from the image %llu, CP resolves from the image %llu\n",
-                         (unsigned long long)g_c3_skipped, (unsigned long long)g_c3_draws, (unsigned long long)g_c3_resolves);
-        std::fprintf(stderr, "[direct] stage B replays: draws kept %llu (packets %zu, chains %zu, %zu words), draws without a record with a chain %llu (replay runs %llu, rebuilds %llu), without %llu, drawn from the replay %llu\n",
-                     (unsigned long long)g_rpl_stored, g_replay.size(), g_chains.size(), g_chain_words, (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
+            std::fprintf(stderr, "[direct] stage C3: flush writer calls skipped %llu, state-only records %llu (applied before a CP draw %llu) | CP draws from the image %llu, CP resolves from the image %llu\n",
+                         (unsigned long long)g_c3_skipped, (unsigned long long)g_c3_state_recs, (unsigned long long)g_c3_state_applied, (unsigned long long)g_c3_draws, (unsigned long long)g_c3_resolves);
+        std::fprintf(stderr, "[direct] stage B replays: draws kept %llu (packets %zu, chains %zu, %zu words, evicted %llu), draws without a record with a chain %llu (replay runs %llu, rebuilds %llu), without %llu, drawn from the replay %llu\n",
+                     (unsigned long long)g_rpl_stored, g_replay.size(), g_chains.size(), g_chain_words, (unsigned long long)g_rpl_evicted, (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
                      (unsigned long long)g_rpl_rebuilds, (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B replay check: draw arguments differ %llu (of the image diffs %llu)\n", (unsigned long long)g_rpl_badargs, (unsigned long long)g_rpl_diff_badargs);
