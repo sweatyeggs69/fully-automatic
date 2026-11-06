@@ -13,7 +13,7 @@
 #include "fa/rt/video.hpp"
 #include "fa/rt/store_trace_ctl.hpp"
 
-namespace fa::rt { __attribute__((weak)) void direct_tap_frame_end(); }  // runtime/src/direct_tap.cpp (fullauto only)
+namespace fa::rt { uint64_t gpu_predicated_skips(); __attribute__((weak)) void direct_tap_frame_end(); }  // runtime/src/direct_tap.cpp (fullauto only)
 
 #include <atomic>
 #include <chrono>
@@ -194,6 +194,7 @@ void start_gpu() {
 }
 }  // namespace
 
+uint64_t fa::rt::gpu_predicated_skips() { return g_cp ? g_cp->GetStats().predicatedSkips : 0; }
 fa::gpu::FrameBackend& fa::rt::gpu_frame_backend() { return g_gpu_backend; }
 fa::gpu::GuestMemory& fa::rt::gpu_memory() { return g_gpu_mem; }
 void fa::rt::set_gpu_backend(fa::gpu::Backend* backend) {

@@ -296,7 +296,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                 (t ? dc.psDwords : dc.vsDwords) = uint32_t(s.ucode.size());
                 (t ? dc.psHash : dc.vsHash) = s.hash;
             }
-            if (g_draw_observer) g_draw_observer(dc);
+            if (g_draw_observer) g_draw_observer(dc, regs_);
             backend_.Draw(dc, regs_);
             ++stats_.draws;
             break;
