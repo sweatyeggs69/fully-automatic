@@ -7,6 +7,9 @@
 
 namespace fa::gpu {
 
+// Diagnostics: called with the guest address and dword count of every indirect buffer the ring points at.
+inline void (*g_indirect_buffer_observer)(uint32_t addr, uint32_t dwords) = nullptr;
+
 // Consumes the PM4 ring buffer the game fills (set up through VdInitializeRingBuffer).
 // Single threaded: the runtime core calls Pump() from its GPU thread whenever the
 // guest advances the write pointer, or on a timer while a wait is pending.
