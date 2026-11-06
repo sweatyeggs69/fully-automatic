@@ -39,6 +39,10 @@ struct Agg { uint64_t stores = 0, bytes = 0; std::map<uint32_t, uint64_t> ops; }
 std::mutex g_mu;
 std::vector<Range> g_ranges;
 std::unordered_map<Key, Agg, KeyHash> g_agg;
+std::unordered_map<Key, Agg, KeyHash> g_out;  // PM4-header-looking stores outside every known range
+std::map<uint32_t, uint64_t> g_out_pages;     // 64 KB physical pages those stores landed in
+int g_tus = 0;
+uint64_t g_hits = 0, g_hits_phys = 0, g_hits_in = 0;
 int g_swap = 0, g_first = -1, g_frames = 1, g_period = 0;
 bool g_cfg_done = false;
 volatile sig_atomic_t g_usr2 = 0;
@@ -98,6 +102,26 @@ void dump() {
         for (auto& [op, c] : a->ops) std::fprintf(f, "%02x:%llu ", op, (unsigned long long)c);
         std::fprintf(f, "]\n");
     }
+    std::fprintf(f, "\n## counters: instrumented stores seen %llu, in physical windows %llu, inside known ranges %llu, ranges %zu, instrumented TUs %d\n",
+                 (unsigned long long)g_hits, (unsigned long long)g_hits_phys, (unsigned long long)g_hits_in, g_ranges.size(), g_tus);
+    {
+        std::map<std::string, Agg> oleaf;
+        for (auto& [k, a] : g_out) {
+            Agg& l = oleaf[name_of(k.pc[0])];
+            l.stores += a.stores;
+            for (auto& [op, n] : a.ops) l.ops[op] += n;
+        }
+        std::fprintf(f, "## PM4-header-looking 32-bit stores OUTSIDE known ranges (%zu leaf functions)\n", oleaf.size());
+        for (auto& [n, a] : oleaf) {
+            std::fprintf(f, "%9llu %s  [", (unsigned long long)a.stores, n.c_str());
+            for (auto& [op, c] : a.ops) std::fprintf(f, "%02x:%llu ", op, (unsigned long long)c);
+            std::fprintf(f, "]\n");
+        }
+        std::fprintf(f, "## 64 KB physical pages receiving them (page: count)\n");
+        for (auto& [pg, c] : g_out_pages) std::fprintf(f, "%05x0000: %llu\n", pg, (unsigned long long)c);
+        std::fprintf(f, "## known ranges (first 20)\n");
+        for (size_t i = 0; i < g_ranges.size() && i < 20; i++) std::fprintf(f, "%08x-%08x\n", g_ranges[i].lo, g_ranges[i].hi);
+    }
     std::vector<std::pair<const Key*, const Agg*>> chains;
     for (auto& [k, a] : g_agg) chains.push_back({&k, &a});
     std::sort(chains.begin(), chains.end(), [](auto& a, auto& b) { return a.second->bytes > b.second->bytes; });
@@ -115,14 +139,38 @@ void dump() {
 }
 }  // namespace
 
+extern "C" int fa_st_register_tu() {
+    static std::atomic<int> n{0};
+    g_tus = n.fetch_add(1) + 1;
+    return g_tus;
+}
+
 extern "C" void fa_st_hit(uint32_t ea, uint32_t size, uint64_t value) {
-    if (ea < 0xA0000000u) return;
-    const uint32_t phys = ea & 0x1FFFFFFFu;
     std::lock_guard<std::mutex> lk(g_mu);
+    g_hits++;
+    if (ea < 0xA0000000u) return;
+    g_hits_phys++;
+    // 0xE0000000 is the 4 KB-page view: physical = offset + 0x1000.
+    const uint32_t phys = (ea & 0x1FFFFFFFu) + (ea >= 0xE0000000u ? 0x1000u : 0u);
     bool in = false;
     for (const Range& r : g_ranges)
         if (phys >= r.lo && phys < r.hi) { in = true; break; }
-    if (!in) return;
+    if (in) g_hits_in++;
+    if (!in) {
+        // Not in a known command buffer. Still note stores that look like a type-3 PM4 header, so a
+        // wrong range (or a command buffer we never learned about) shows up in the output.
+        if (size != 4 || (value >> 30) != 3) return;
+        void* bt2[kDepth + kSkip] = {};
+        backtrace(bt2, kDepth + kSkip);
+        Key k2{};
+        for (int i = 0; i < kDepth; i++) k2.pc[i] = bt2[i + kSkip];
+        Agg& a2 = g_out[k2];
+        a2.stores++;
+        a2.bytes += size;
+        a2.ops[(value >> 8) & 0x7F]++;
+        g_out_pages[phys >> 16]++;
+        return;
+    }
     void* bt[kDepth + kSkip] = {};
     backtrace(bt, kDepth + kSkip);
     Key k{};
@@ -154,8 +202,8 @@ void store_trace_frame_end() {
         g_first = n;  // restart the window here
     }
     if (n == g_first) {
-        std::fprintf(stderr, "[store-trace] armed at swap %d (%zu ranges)\n", n, g_ranges.size());
-        { std::lock_guard<std::mutex> lk(g_mu); g_agg.clear(); }
+        std::fprintf(stderr, "[store-trace] armed at swap %d (%zu ranges, %d instrumented translation units)\n", n, g_ranges.size(), g_tus);
+        { std::lock_guard<std::mutex> lk(g_mu); g_agg.clear(); g_out.clear(); g_out_pages.clear(); g_hits = g_hits_phys = g_hits_in = 0; }
         fa_st_armed = 1;
     } else if (n == g_first + g_frames) {
         fa_st_armed = 0;
