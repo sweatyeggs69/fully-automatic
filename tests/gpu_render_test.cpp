@@ -640,6 +640,24 @@ int main() {
                 CHECK(red);
             }
         }
+        // The presenter decodes the front buffer from guest memory right after Swap returns: with frames in
+        // flight its writeback must not wait for the batch to finish (runs 130, 131, 133 showed whatever the
+        // frame had resolved there before).
+        {
+            const uint32_t destF = 0x360000;
+            for (uint32_t i = 0; i < 64 * 128; i++) mem.Write32(destF + i * 4, 0);
+            RegisterFile rs = rc;
+            rs[xe::RB_COPY_CONTROL] = 0;
+            rs[xe::RB_COPY_DEST_BASE] = destF;
+            rs[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rs);  // EDRAM is still red from the section above
+            r.Swap(destF, 128, 64, rs);
+            Pixel(mem, destF, 128, 64, 100, 40, px);
+            const bool red = px[0] == 255 && px[1] == 0 && px[2] == 0;
+            if (!red) std::printf("FAIL front buffer at swap = %02x %02x %02x %02x\n", px[0], px[1], px[2], px[3]);
+            CHECK(red);
+            r.Flush();
+        }
         std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
                     (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());
     }

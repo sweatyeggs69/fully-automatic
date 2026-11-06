@@ -4422,8 +4422,21 @@ struct VulkanRenderer::Impl {
                          (unsigned long long)(total >> 20));
     }
 
-    void Swap() {
+    // fbBase/fbBytes: the front buffer the presenter reads from guest memory right after this returns.
+    void Swap(uint32_t fbBase = 0, uint32_t fbBytes = 0) {
         if (kBatches > 1) {
+            // The window shows the front buffer decoded from guest memory as soon as this returns, so its
+            // writeback cannot land later: memory the frame reused for other resolves (written by an earlier
+            // flush) would show instead (runs 130, 131, 133: garbage, the top tile black).
+            if (fbBytes && PendingOverlaps(fbBase, fbBytes)) {
+                prof::Add(prof::kFlushFront, 1);
+                FlushPending(prof::kFlushSwap);
+            }
+            if (fbBytes && InFlightWrites(fbBase, fbBytes)) {
+                prof::Add(prof::kFlushFront, 1);
+                prof::Scope pw_(prof::kResolveWait);
+                WaitIdle();
+            }
             FlushPendingAsync();
             prof::Scope ps_(prof::kOtherWait);
             Submit();
@@ -4554,7 +4567,13 @@ void VulkanRenderer::Resolve(const RegisterFile& regs) {
 }
 
 void VulkanRenderer::Swap(uint32_t addr, uint32_t width, uint32_t height, const RegisterFile& regs) {
-    if (p_->ready && !p_->broken) p_->Swap();
+    if (p_->ready && !p_->broken) {
+        // The front buffer the presenter reads (VdSwap put its fetch constant in slot 0).
+        uint32_t base = addr ? addr : (regs[pm4::kFetchConstBase + 1] & 0xFFFFF000u);
+        uint32_t w = width ? width : 1280, h = height ? height : 720;
+        const uint32_t bytes = ((w + 31) & ~31u) * ((h + 31) & ~31u) * 4;
+        p_->Swap(base & 0x1FFFFFFFu, base ? bytes : 0);
+    }
     if (p_->next) p_->next->Swap(addr, width, height, regs);
 }
 
