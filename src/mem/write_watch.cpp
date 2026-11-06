@@ -61,6 +61,7 @@ bool WriteWatch::Init(const std::vector<View>& views, uint32_t physSize, const c
     pages_ = physSize / kPage;
     written_.assign(pages_, 0);
     watched_.assign(pages_, 0);
+    seenAt_.assign(pages_, 0);
     viewSeen_.assign(views_.size(), std::vector<uint8_t>((pages_ >> kRegionShift) + 1, 0));
     if (why) *why = "";
     return true;
@@ -107,8 +108,12 @@ bool WriteWatch::Clean(uint32_t phys, uint32_t size, uint64_t token) const {
     const uint32_t first = phys / kPage;
     const uint64_t end64 = (uint64_t(phys) + size + kPage - 1) / kPage;
     if (end64 > pages_) return false;
-    for (uint32_t p = first; p < uint32_t(end64); p++)
+    bool hot = queryAllViews_;
+    for (uint32_t p = first; p < uint32_t(end64); p++) {
         if (!watched_[p] || written_[p] > token) return false;
+        hot |= seenAt_[p] && harvestNo_ - seenAt_[p] < kHotHarvests;
+    }
+    if (!hot) { stats_.queryCold++; return true; }
     // Writes since the last Harvest: the kernel still shows those pages as written.
     return !WrittenNow(first, uint32_t(end64) - first);
 }
@@ -186,12 +191,12 @@ void WriteWatch::Scan(size_t view, uint32_t firstPage, uint32_t count) {
         stats_.scanCalls++;
         if (n < 0) {
             // Unknown state: count the rest of the run as written.
-            for (uint64_t p = (s.start - base) / kPage; p < b; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1;
+            for (uint64_t p = (s.start - base) / kPage; p < b; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1, seenAt_[p] = harvestNo_;
             return;
         }
         for (long i = 0; i < n; i++) {
             const uint64_t p0 = (regions[i].start - base) / kPage, p1 = (regions[i].end - base) / kPage;
-            for (uint64_t p = p0; p < p1 && p < pages_; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1;
+            for (uint64_t p = p0; p < p1 && p < pages_; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1, seenAt_[p] = harvestNo_;
             stats_.pagesWritten += p1 - p0;
         }
         if (!s.walk_end || s.walk_end <= s.start) break;
@@ -209,6 +214,7 @@ void WriteWatch::Harvest() {
     const auto t0 = std::chrono::steady_clock::now();
     // Pages seen written now get the new epoch, which is larger than every token handed out so far.
     ++epoch_;
+    ++harvestNo_;
     if (runsDirty_) {
         runs_.clear();
         // Runs closer than kMergeGap pages are scanned as one: a scan call costs more than walking a

@@ -1919,6 +1919,7 @@ struct VulkanRenderer::Impl {
         prof::Add(prof::kWwQueries, st.queryCalls);
         prof::Add(prof::kWwQueryUs, uint64_t(st.queryMs * 1000.0));
         prof::Add(prof::kWwQuerySkips, st.querySkips);
+        prof::Add(prof::kWwQueryCold, st.queryCold);
     }
 
     // Physical address the GPU buffer uses for a fetch address (same mapping as GuestMemory).
@@ -3908,7 +3909,11 @@ struct VulkanRenderer::Impl {
         if (!addr || !bytes || (bytes & 3) || bytes > 0x40000) return nullptr;
         DirectShader& e = directShaders[(uint64_t(addr) << 32) ^ (uint64_t(bytes) << 1) ^ type];
         const uint32_t n = bytes / 4;
-        if (e.ucode.size() == n && (e.frame == frame || (e.wwToken && WwClean(addr, bytes, e.wwToken)))) return &e;
+        if (e.ucode.size() == n && e.frame == frame) return &e;
+        if (e.ucode.size() == n && e.wwToken && WwClean(addr, bytes, e.wwToken)) {
+            e.frame = frame;  // checked once per frame, not on every draw
+            return &e;
+        }
         if (!mem.HostPtr(addr, bytes)) return nullptr;
         e.wwToken = WwWatch(addr, bytes);  // before reading: a write during the read makes it stale
         e.ucode.resize(n);
@@ -4530,6 +4535,19 @@ void VulkanRenderer::Idle() {
         p_->RetireFinished();
     }
     if (p_->next) p_->next->Idle();
+}
+
+void VulkanRenderer::Drain() {
+    if (p_->ready && !p_->broken && Impl::kBatches > 1) {
+        bool pending = !p_->doneActions.empty();
+        for (const auto& b : p_->batches) pending |= b.inFlight && !b.done.empty();
+        if (pending) {
+            prof::Add(prof::kDrainWaits, 1);
+            p_->SubmitAndWait();  // retiring the batches applies their writes, in order
+            p_->Begin();
+        }
+    }
+    if (p_->next) p_->next->Drain();
 }
 
 void VulkanRenderer::Flush() {
