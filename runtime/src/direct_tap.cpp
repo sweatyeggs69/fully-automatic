@@ -104,7 +104,7 @@ constexpr uint32_t kStBase = 0x2CC0, kStDwords = 160;  // covers all windows
 // the per-object constant blocks the game writes straight into the stream (823162F8 + 821B8510), which are not in the
 // shadow. The mirror holds the latest value of every ALU vec4 any block wrote (the GPU keeps registers until rewritten).
 struct DrawArgs { uint32_t prim, start, count, ibFlags, ibBase; };
-struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords], mir[1024]; uint64_t own[4]; uint32_t bl[40]; DrawArgs a; };  // bl: bool+loop constants  // mir: VS vec4s only (all blocks seen start at VS vec4 64)
+struct Snap { uint32_t vs[kVsDwords], ps[kPsDwords], tex[kTexDwords], st[kStDwords], mir[1024]; uint64_t own[4]; uint32_t bl[40]; uint32_t vsObj, vsUcode, vsBytes, psObj, psUcode, psBytes, declObj; DrawArgs a; };  // bl: bool+loop constants  // mir: VS vec4s only (all blocks seen start at VS vec4 64)
 struct PendingBlock { uint32_t first, count, payload; };
 std::vector<PendingBlock> g_pending;   // under g_set_mu
 uint32_t g_mirror[2048];               // under g_set_mu
@@ -189,6 +189,16 @@ void snapshot_draw(const uint8_t* base, uint32_t dev) {
     const uint32_t* q = reinterpret_cast<const uint32_t*>(base + dev + kStBase);
     for (uint32_t i = 0; i < kStDwords; i++) s.st[i] = __builtin_bswap32(q[i]);
     s.a = g_cur_args;
+    {
+        auto rd = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a)); };
+        s.vsObj = rd(dev + 0x3294);
+        s.vsUcode = s.vsObj ? rd(s.vsObj + 0x28) : 0;
+        s.vsBytes = s.vsObj ? rd(s.vsObj + 0x258) : 0;
+        s.psObj = rd(dev + 0x3290);
+        s.psUcode = s.psObj ? rd(s.psObj + 0x0C) : 0;
+        s.psBytes = s.psObj ? rd(s.psObj + 0x3C) : 0;
+        s.declObj = rd(dev + 0x2C90);
+    }
     {
         const uint32_t* b = reinterpret_cast<const uint32_t*>(base + dev + 0x2780);
         for (uint32_t i = 0; i < 40; i++) s.bl[i] = __builtin_bswap32(b[i]);
@@ -382,6 +392,73 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
                 }
             }
     }
+}
+
+
+// FA_DIRECT bit 2 (stage A): the CP hands the game's draw record to Backend::DrawDirect. The register image is the
+// CP's register file with everything the record holds taken from the game (constants with the per-object block rule,
+// fetch, bool/loop, render-state windows); the payload carries the dwords that changed since the last record sent.
+std::vector<uint32_t> g_dd_sent;   // CP thread only
+std::vector<uint8_t> g_dd_payload; // CP thread only
+uint64_t g_dd_draws = 0, g_dd_missing = 0, g_dd_refused = 0, g_dd_dwords = 0;
+uint32_t g_dd_seq = 0;
+
+bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
+    if (!(g_direct & 4) || !dc.indexed || !dc.inlineIndices.empty()) return false;
+    std::vector<uint32_t> img(regs.r.begin(), regs.r.end());
+    fa::gpu::DirectDraw rec;
+    {
+        std::lock_guard<std::mutex> lk(g_snap_mu);
+        const Snap* sn = lookup_snap_locked(dc.packetAddr);
+        if (!sn) { g_dd_missing++; return false; }
+        for (uint32_t v = 0; v < 256; v++) {
+            const bool tch = touched(v), own = sn->own[v >> 6] >> (v & 63) & 1;
+            for (uint32_t j = 0; j < 4; j++) img[kRegVs + v * 4 + j] = (tch && own) ? sn->mir[v * 4 + j] : sn->vs[v * 4 + j];
+        }
+        for (uint32_t i = 0; i < kPsDwords; i++) if (!touched(256 + (i >> 2))) img[kRegPs + i] = sn->ps[i];
+        for (uint32_t i = 0; i < kTexDwords; i++) img[kRegTex + i] = sn->tex[i];
+        for (uint32_t i = 0; i < 40; i++) img[0x4900 + i] = sn->bl[i];
+        for (const StWin& w : kStWins)
+            for (uint32_t j = 0; j < w.n; j++) {
+                const uint32_t reg = w.reg + j;
+                if (reg == 0x2208 || reg == 0x2011 || reg == 0x2388) continue;
+                img[reg] = sn->st[(w.off - kStBase) / 4 + j];
+            }
+        rec.vsObj = sn->vsObj; rec.vsUcode = sn->vsUcode; rec.vsBytes = sn->vsBytes;
+        rec.psObj = sn->psObj; rec.psUcode = sn->psUcode; rec.psBytes = sn->psBytes;
+        rec.declObj = sn->declObj;
+    }
+    rec.seq = g_dd_seq++;
+    rec.packetAddr = dc.packetAddr;
+    rec.primType = dc.primType;
+    rec.indexCount = dc.indexCount;
+    rec.indexAddr = dc.indexGuestAddr;
+    rec.index32 = dc.index32;
+    rec.indexEndian = uint8_t(dc.indexEndian);
+    // Payload: runs of dwords that differ from what the backend last received.
+    const bool full = g_dd_sent.size() != img.size();
+    g_dd_payload.clear();
+    for (uint32_t i = 0; i < img.size();) {
+        if (!full && img[i] == g_dd_sent[i]) { i++; continue; }
+        uint32_t j = i;
+        while (j < img.size() && (full || img[j] != g_dd_sent[j])) j++;
+        fa::gpu::DirectRegRun run{i, j - i};
+        const size_t at = g_dd_payload.size();
+        g_dd_payload.resize(at + sizeof run + run.count * 4);
+        std::memcpy(g_dd_payload.data() + at, &run, sizeof run);
+        std::memcpy(g_dd_payload.data() + at + sizeof run, img.data() + i, run.count * 4);
+        g_dd_dwords += run.count;
+        i = j;
+    }
+    rec.payloadBytes = uint32_t(g_dd_payload.size());
+    if (!backend.DrawDirect(rec, g_dd_payload.data())) {
+        g_dd_refused++;
+        g_dd_sent.clear();  // the backend did not take the state: resend everything next time
+        return false;
+    }
+    g_dd_sent.swap(img);
+    g_dd_draws++;
+    return true;
 }
 
 void on_cp_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs) {
@@ -592,6 +669,7 @@ void direct_tap_frame_end() {
     if (!g_on) return;
     if (g_tap_report && !fa::gpu::g_draw_observer) fa::gpu::g_draw_observer = on_cp_draw;
     if ((g_direct & 3) && !fa::gpu::g_draw_feeder) fa::gpu::g_draw_feeder = feed_cp_draw;
+    if ((g_direct & 4) && !fa::gpu::g_direct_draw) fa::gpu::g_direct_draw = direct_draw;
     g_swaps_a.store(++g_swaps, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(g_par_mu);
@@ -607,6 +685,9 @@ void direct_tap_frame_end() {
         std::lock_guard<std::mutex> lk(g_snap_mu);
         std::fprintf(stderr, "[direct] swap %d: FA_DIRECT=%u fed draws %llu, no snapshot %llu, dwords replaced where the PM4 value differed %llu\n",
                      g_swaps, g_direct, (unsigned long long)g_feed_draws, (unsigned long long)g_feed_missing, (unsigned long long)g_feed_changed);
+        if (g_direct & 4)
+            std::fprintf(stderr, "[direct] stage A: draws through DrawDirect %llu, no record %llu, refused by backend %llu, payload dwords %llu\n",
+                         (unsigned long long)g_dd_draws, (unsigned long long)g_dd_missing, (unsigned long long)g_dd_refused, (unsigned long long)g_dd_dwords);
     }
     if (!g_tap_report || g_swaps % 300) return;
     const uint64_t tc = g_tap_calls.load(), ti = g_tap_indices.load(), cd = g_cp_draws.load(), ci = g_cp_indices.load();

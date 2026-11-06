@@ -14,6 +14,10 @@ inline void (*g_draw_observer)(const DrawCall& draw, const RegisterFile& regs) =
 // Direct hooks (runtime/src/direct_tap.cpp, FA_DIRECT): called right before the backend draws, may replace
 // register values with ones taken from the game's own device state. Null in normal runs.
 inline void (*g_draw_feeder)(const DrawCall& draw, RegisterFile& regs) = nullptr;
+// Direct hooks stage A (FA_DIRECT bit 2): draws the game's own draw record through Backend::DrawDirect instead
+// of Backend::Draw. Returns false when there is no record (the command processor then draws as usual).
+class Backend;
+inline bool (*g_direct_draw)(const DrawCall& draw, const RegisterFile& regs, Backend& backend) = nullptr;
 
 // Consumes the PM4 ring buffer the game fills (set up through VdInitializeRingBuffer).
 // Single threaded: the runtime core calls Pump() from its GPU thread whenever the
