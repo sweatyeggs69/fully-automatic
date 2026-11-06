@@ -609,7 +609,7 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
     auto rd = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a)); };
     auto keep = [](uint32_t reg) { return (reg >= 0x2000 && reg < 0x2400) || (reg >= 0x4000 && reg < 0x4928); };
     g_rs_writes.clear();
-    uint32_t key = 0xFFFFFFFFu, prim = 0, count = 0;
+    uint32_t key = 0xFFFFFFFFu, prim = 0, count = 0, destAt = 0;
     for (uint32_t a = before + 4; a <= after;) {
         const uint32_t h = rd(a);
         switch (pm4::TypeOf(h)) {
@@ -618,6 +618,7 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
                 for (uint32_t i = 0; i < n && a + 4 + i * 4 <= after; i++) {
                     const uint32_t rg = pm4::T0OneReg(h) ? reg : reg + i;
                     if (keep(rg)) g_rs_writes.push_back({rg, rd(a + 4 + i * 4)});
+                    if (rg == 0x2319) destAt = a + 4 + i * 4;
                 }
                 a += 4 + n * 4;
                 break;
@@ -640,6 +641,10 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
                     key = a & 0x1FFFFFFF;
                     prim = init & 0x3F;
                     count = init >> 16;
+                    // Stop at the copy draw: after it the game clears RB_COPY_CONTROL and RB_COPY_DEST_INFO (run 113:
+                    // all 5085 resolve images had 0 there), and those later writes must not reach the copy.
+                    a = after + 4;
+                    break;
                 }
                 a += 4 + n * 4;
                 break;
@@ -653,6 +658,10 @@ void push_resolve_record(const uint8_t* base, uint32_t before, uint32_t after) {
     r[2] = key;
     r[3] = prim;
     r[4] = count;
+    // RB_COPY_DEST_BASE is patched in the stream after the resolve returns (run 115: the frame's last resolve, the
+    // front buffer copy, differed by +0x280000 in 598 of 7775 resolves): keep where its value lives and read it when
+    // the CP gets there.
+    r[5] = destAt;
     // Runs in write order (later writes win when applied), consecutive registers merged.
     for (size_t i = 0; i < g_rs_writes.size();) {
         size_t j = i + 1;
@@ -872,6 +881,10 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
         r += len;
     }
     g_q_r.store(r, std::memory_order_release);
+    if (const uint32_t destAt = g_q[(match + 5) & kQMask]) {
+        const uint32_t v = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(fa::rt::host(destAt)));
+        if (g_cur[0x2319] != v) { g_cur[0x2319] = v; mark(0x2319); }
+    }
     // Window offset and scissor stay with the CP (not in any record yet).
     for (uint32_t reg : {0x2080u, 0x2081u, 0x2082u})
         if (g_cur[reg] != regs[reg]) { g_cur[reg] = regs[reg]; mark(reg); }
