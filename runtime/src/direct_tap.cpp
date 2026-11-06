@@ -727,8 +727,30 @@ constexpr size_t kDirtyWords = (kBlocks + 63) / 64;
 uint32_t g_rep[kImg];
 uint64_t g_rep_dirty[kDirtyWords];
 bool g_in_replay = false;
-struct ReplaySeg { std::vector<uint32_t> words; uint32_t last; };  // records in order; offset of the matched one
-std::unordered_map<uint32_t, ReplaySeg> g_replay;
+// A chain is every record applied from the first (full state) record of a recording until a record that is not the
+// recording variant. Run 132: replaying only the records since the previous CP draw lost state (menu textures) when
+// a replay did not start at the recording's first draw; the chain lets a replay rebuild the exact state of any draw.
+struct ReplayRef { uint32_t chain, start, end, last; };  // chain id; word offsets of this draw's records and header
+std::unordered_map<uint32_t, std::vector<uint32_t>> g_chains;
+std::unordered_map<uint32_t, ReplayRef> g_replay;  // packet -> where its state is in a chain
+uint32_t g_chain_id = 0, g_chain_cur = 0;          // 0 = not in a chain
+size_t g_chain_words = 0;
+uint32_t g_rep_chain = 0, g_rep_pos = 0;           // what g_rep holds
+uint64_t g_rpl_rebuilds = 0;
+// Called for every record the CP applies, in order.
+void chain_note(uint64_t r, uint32_t len) {
+    if (!g_tap_report && !(g_direct & 128)) return;
+    const uint32_t f = g_q[(r + 1) & kQMask];
+    if (!(f & 8)) { g_chain_cur = 0; return; }
+    if ((f & 1) || !g_chain_cur) {
+        if (g_chain_words > (64u << 20) / 4) { g_chains.clear(); g_replay.clear(); g_chain_words = 0; g_rep_chain = 0; }
+        g_chain_cur = ++g_chain_id;
+        g_chains[g_chain_cur].clear();
+    }
+    std::vector<uint32_t>& c = g_chains[g_chain_cur];
+    for (uint32_t k = 0; k < len; k++) c.push_back(g_q[(r + k) & kQMask]);
+    g_chain_words += len;
+}
 uint64_t g_rpl_stored = 0, g_rpl_found = 0, g_rpl_missing = 0, g_rpl_drawn = 0, g_rpl_starts = 0, g_rpl_cmp = 0, g_rpl_diff = 0, g_rpl_diff_seg[16];
 int g_rpl_printed = 0;
 inline void mark_rep(uint32_t reg) { g_rep_dirty[(reg >> 4) >> 6] |= 1ull << ((reg >> 4) & 63); }
@@ -811,16 +833,26 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     if (!g_tap_report && !(g_direct & 128)) return false;
     const auto it = g_replay.find(dc.packetAddr);
     if (it == g_replay.end()) { g_rpl_missing++; return false; }
+    const ReplayRef ref = it->second;
+    const auto ci = g_chains.find(ref.chain);
+    if (ci == g_chains.end() || ci->second.size() < ref.end) { g_rpl_missing++; return false; }
     g_rpl_found++;
-    if (!g_in_replay) {
+    const std::vector<uint32_t>& wv = ci->second;
+    uint32_t from = ref.start;
+    if (!g_in_replay || g_rep_chain != ref.chain || g_rep_pos > ref.start) {
+        // Rebuild: the current image, then the chain from its full first record.
+        if (!g_in_replay) g_rpl_starts++;
+        g_rpl_rebuilds++;
         std::memcpy(g_rep + 0x2000, g_cur + 0x2000, 0x400 * 4);
         std::memcpy(g_rep + 0x4000, g_cur + 0x4000, (kImg - 0x4000) * 4);
         std::memcpy(g_rep_dirty, g_blk_dirty, sizeof g_rep_dirty);
         g_in_replay = true;
-        g_rpl_starts++;
+        g_rep_chain = ref.chain;
+        from = 0;
+    } else {
+        from = g_rep_pos;  // records of draws the CP skipped since the last replayed draw still carry state
     }
-    const std::vector<uint32_t>& wv = it->second.words;
-    for (size_t at = 0; at < wv.size();) {
+    for (size_t at = from; at < ref.end;) {
         const uint32_t len = wv[at];
         for (uint32_t i = kRecHdr; i < len;) {
             const uint32_t first = wv[at + i], cnt = wv[at + i + 1];
@@ -830,6 +862,7 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
         }
         at += len;
     }
+    g_rep_pos = ref.end;
     for (uint32_t reg : kCpRegs)
         if (g_rep[reg] != regs[reg]) { g_rep[reg] = regs[reg]; mark_rep(reg); }
     if (g_tap_report) {
@@ -854,7 +887,7 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
         g_rpl_diff += any;
     }
     if (!(g_direct & 128) || !eligible) return false;
-    const uint32_t* hdr = wv.data() + it->second.last;
+    const uint32_t* hdr = wv.data() + ref.last;
     if (hdr[1] & 2) return false;  // a resolve record
     if (!send_direct(dc, regs, backend, g_rep, g_rep_dirty, g_blk_dirty, hdr)) return false;
     if (!dc.indexed) g_b_nonidx++;
@@ -918,7 +951,7 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         else return replay_draw(dc, regs, backend, eligible);
     }
     g_in_replay = false;
-    const uint64_t r0 = r;
+    const uint32_t cid0 = g_chain_cur, cstart = g_chain_cur ? uint32_t(g_chains[g_chain_cur].size()) : 0;
     // Apply every record up to and including the match (records the CP never draws still carry state).
     uint64_t hdr = 0;
     while (r <= match && r < w) {
@@ -931,19 +964,24 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
         }
         if (r != match) g_b_skipped++;
         g_b_recs++;
+        chain_note(r, len);
         hdr = r;
         r += len;
     }
     g_q_r.store(r, std::memory_order_release);
     if (match == ~0ull - 1) { g_b_flushed++; return false; }
     if ((g_tap_report || (g_direct & 128)) && (g_q[(hdr + 1) & kQMask] & 8)) {
-        // Keep this draw's records for replays of its packet.
-        if (g_replay.size() > 32768) g_replay.clear();
-        ReplaySeg& sgm = g_replay[dc.packetAddr];
-        sgm.words.resize(r - r0);
-        for (uint64_t k = r0; k < r; k++) sgm.words[k - r0] = g_q[k & kQMask];
-        sgm.last = uint32_t(hdr - r0);
+        // Where this draw's state is in its chain, for replays of its packet. A draw that opened a new chain in this
+        // call starts at 0.
+        if (g_chain_cur) {
+            const std::vector<uint32_t>& c = g_chains[g_chain_cur];
+            const uint32_t len = g_q[hdr & kQMask];
+            const uint32_t end = uint32_t(c.size()), last = end - len;
+            g_replay[dc.packetAddr] = {g_chain_cur, cid0 == g_chain_cur ? cstart : 0, end, last};
+        }
         g_rpl_stored++;
+    } else if (!g_replay.empty()) {
+        g_replay.erase(dc.packetAddr);  // the packet address now holds a draw that is not recorded
     }
     // A resolve record matched by a draw that is not a copy (no shader identities in it): leave it to the PM4 path.
     if (!eligible || (g_q[(hdr + 1) & kQMask] & 2)) return false;
@@ -1031,6 +1069,7 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
         }
         if (r != match) g_b_skipped++;
         g_b_recs++;
+        chain_note(r, len);
         r += len;
     }
     g_q_r.store(r, std::memory_order_release);
@@ -1375,9 +1414,9 @@ void direct_tap_frame_end() {
             std::fprintf(stderr, "[direct] draws without a record: packet never drawn direct %llu, drawn before %llu (same frame %llu, same target %llu, same window offset %llu)\n",
                          (unsigned long long)g_rp_never, (unsigned long long)g_rp_seen, (unsigned long long)g_rp_same_swap,
                          (unsigned long long)g_rp_same_surface, (unsigned long long)g_rp_same_window);
-        std::fprintf(stderr, "[direct] stage B replays: segments stored %llu (packets kept %zu), draws without a record with a segment %llu (replay runs %llu), without %llu, drawn from the replay %llu\n",
-                     (unsigned long long)g_rpl_stored, g_replay.size(), (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
-                     (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
+        std::fprintf(stderr, "[direct] stage B replays: draws kept %llu (packets %zu, chains %zu, %zu words), draws without a record with a chain %llu (replay runs %llu, rebuilds %llu), without %llu, drawn from the replay %llu\n",
+                     (unsigned long long)g_rpl_stored, g_replay.size(), g_chains.size(), g_chain_words, (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
+                     (unsigned long long)g_rpl_rebuilds, (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B replay check: compared %llu, image differs from CP %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
                          (unsigned long long)g_rpl_cmp, (unsigned long long)g_rpl_diff);
