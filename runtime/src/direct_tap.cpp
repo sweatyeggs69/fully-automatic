@@ -853,7 +853,7 @@ bool direct_draw_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile&
 
 // CP resolve (copy-mode draw): consume records up to the resolve record of this packet; with FA_TAP=1 compare the
 // image with the CP's registers the resolve reads; with FA_DIRECT bit 5 (32) resolve from the image.
-uint64_t g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[0x30];
+uint64_t g_rb_notcopy = 0, g_rb_resolves = 0, g_rb_missing = 0, g_rb_direct = 0, g_rb_cmp = 0, g_rb_diff = 0, g_rb_reg[32];
 int g_rb_printed = 0;
 constexpr uint32_t kResolveRegs[] = {0x2000, 0x2001, 0x2002, 0x2080, 0x2081, 0x2082, 0x2205, 0x2208, 0x2302,
                                      0x2318, 0x2319, 0x231A, 0x231B, 0x231C, 0x231D, 0x231E, 0x231F, 0x4800, 0x4801};
@@ -891,10 +891,11 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
     if (g_tap_report) {
         g_rb_cmp++;
         bool any = false;
-        for (uint32_t reg : kResolveRegs) {
+        for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++) {
+            const uint32_t reg = kResolveRegs[ri];
             if (g_cur[reg] == regs[reg]) continue;
             any = true;
-            g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F]++;
+            g_rb_reg[ri]++;
             if (g_rb_printed < 12) {
                 g_rb_printed++;
                 std::fprintf(stderr, "[direct] resolve image reg %04x: game %08x cp %08x (packet %08x)\n", reg, g_cur[reg], regs[reg], dc.packetAddr);
@@ -903,6 +904,9 @@ bool direct_resolve_queue(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFi
         g_rb_diff += any;
     }
     if (!(g_direct & 32)) return false;
+    // A record that does not describe a copy cannot be this resolve (run 116: 12 of 160,557 resolves had
+    // RB_MODECONTROL 4 in the record against 6 in the CP, with other state from a different pass): leave it to the CP.
+    if ((g_cur[0x2208] & 7) != 6) { g_rb_notcopy++; return false; }
     static fa::gpu::RegisterFile rf;
     rf = regs;  // registers no record covers yet keep the CP's values
     std::memcpy(rf.r.data() + 0x2000, g_cur + 0x2000, 0x400 * 4);
@@ -1208,15 +1212,13 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_q_pushed, (unsigned long long)g_q_nonidx, (unsigned long long)g_b_nonidx, g_q_pushed ? double(g_q_words_pushed) / double(g_q_pushed) : 0.0, (unsigned long long)g_q_dropped,
                      (unsigned long long)g_b_draws, (unsigned long long)g_b_missing, (unsigned long long)g_b_refused,
                      (unsigned long long)g_b_recs, (unsigned long long)g_b_skipped, (unsigned long long)g_b_flushed, (unsigned long long)g_b_dwords);
-        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, resolved from the record %llu\n",
+        std::fprintf(stderr, "[direct] stage B resolves: records pushed %llu, output not contiguous %llu, no copy draw %llu | CP resolves %llu, no record %llu, record not a copy %llu, resolved from the record %llu\n",
                      (unsigned long long)g_rs_pushed, (unsigned long long)g_rs_wrapped, (unsigned long long)g_rs_nodraw,
-                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_direct);
+                     (unsigned long long)g_rb_resolves, (unsigned long long)g_rb_missing, (unsigned long long)g_rb_notcopy, (unsigned long long)g_rb_direct);
         if (g_tap_report) {
             std::fprintf(stderr, "[direct] stage B resolve check: compared %llu, image differs %llu | by reg:", (unsigned long long)g_rb_cmp, (unsigned long long)g_rb_diff);
-            for (uint32_t reg : kResolveRegs) {
-                const uint64_t c = g_rb_reg[reg >= 0x4800 ? 0x2E + (reg - 0x4800) : reg >= 0x2300 ? 0x10 + (reg - 0x2310) : reg - 0x2000 < 0x10 ? reg - 0x2000 : 0x2F];
-                if (c) std::fprintf(stderr, " %04x:%llu", reg, (unsigned long long)c);
-            }
+            for (size_t ri = 0; ri < sizeof kResolveRegs / sizeof kResolveRegs[0]; ri++)
+                if (g_rb_reg[ri]) std::fprintf(stderr, " %04x:%llu", kResolveRegs[ri], (unsigned long long)g_rb_reg[ri]);
             std::fprintf(stderr, "\n");
         }
         if (g_tap_report) {
