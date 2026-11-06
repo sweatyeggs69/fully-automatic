@@ -61,6 +61,7 @@ bool WriteWatch::Init(const std::vector<View>& views, uint32_t physSize, const c
     pages_ = physSize / kPage;
     written_.assign(pages_, 0);
     watched_.assign(pages_, 0);
+    viewSeen_.assign(views_.size(), std::vector<uint8_t>((pages_ >> kRegionShift) + 1, 0));
     if (why) *why = "";
     return true;
 #else
@@ -114,10 +115,22 @@ bool WriteWatch::Clean(uint32_t phys, uint32_t size, uint64_t token) const {
 
 bool WriteWatch::WrittenNow(uint32_t firstPage, uint32_t count) const {
 #if defined(PAGEMAP_SCAN)
-    for (const View& v : views_) {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Done {
+        const std::chrono::steady_clock::time_point t0;
+        Stats& st;
+        ~Done() { st.queryMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } done{t0, stats_};
+    for (size_t vi = 0; vi < views_.size(); vi++) {
+        const View& v = views_[vi];
         const uint32_t vFirst = v.physOffset / kPage, vEnd = vFirst + v.size / kPage;
         const uint32_t a = std::max(firstPage, vFirst), b = std::min(firstPage + count, vEnd);
         if (a >= b) continue;
+        if (!queryAllViews_) {
+            bool seen = false;
+            for (uint32_t r = a >> kRegionShift; r <= (b - 1) >> kRegionShift && !seen; r++) seen = viewSeen_[vi][r];
+            if (!seen) { stats_.querySkips++; continue; }
+        }
         const uint64_t base = reinterpret_cast<uint64_t>(v.base) - uint64_t(vFirst) * kPage;
         page_region r{};
         pm_scan_arg s{};
@@ -150,8 +163,10 @@ void WriteWatch::Touch(uint32_t phys, uint32_t size) {
     for (uint32_t p = first; p < uint32_t(end64); p++) written_[p] = e;
 }
 
-void WriteWatch::Scan(const View& v, uint32_t firstPage, uint32_t count) {
+void WriteWatch::Scan(size_t view, uint32_t firstPage, uint32_t count) {
 #if defined(PAGEMAP_SCAN)
+    const View& v = views_[view];
+    std::vector<uint8_t>& seen = viewSeen_[view];
     const uint32_t vFirst = v.physOffset / kPage, vEnd = vFirst + v.size / kPage;
     const uint32_t a = std::max(firstPage, vFirst), b = std::min(firstPage + count, vEnd);
     if (a >= b) return;
@@ -171,19 +186,19 @@ void WriteWatch::Scan(const View& v, uint32_t firstPage, uint32_t count) {
         stats_.scanCalls++;
         if (n < 0) {
             // Unknown state: count the rest of the run as written.
-            for (uint64_t p = (s.start - base) / kPage; p < b; p++) written_[p] = epoch_;
+            for (uint64_t p = (s.start - base) / kPage; p < b; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1;
             return;
         }
         for (long i = 0; i < n; i++) {
             const uint64_t p0 = (regions[i].start - base) / kPage, p1 = (regions[i].end - base) / kPage;
-            for (uint64_t p = p0; p < p1 && p < pages_; p++) written_[p] = epoch_;
+            for (uint64_t p = p0; p < p1 && p < pages_; p++) written_[p] = epoch_, seen[p >> kRegionShift] = 1;
             stats_.pagesWritten += p1 - p0;
         }
         if (!s.walk_end || s.walk_end <= s.start) break;
         s.start = s.walk_end;
     }
 #else
-    (void)v;
+    (void)view;
     (void)firstPage;
     (void)count;
 #endif
@@ -213,7 +228,7 @@ void WriteWatch::Harvest() {
         runsDirty_ = false;
     }
     for (const Run& r : runs_)
-        for (const View& v : views_) Scan(v, r.first, r.count);
+        for (size_t vi = 0; vi < views_.size(); vi++) Scan(vi, r.first, r.count);
     stats_.harvests++;
     stats_.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

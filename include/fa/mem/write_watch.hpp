@@ -52,10 +52,15 @@ public:
     void Touch(uint32_t phys, uint32_t size);
     // Once per frame, before lookups: collects the pages written since the last call.
     void Harvest();
+    // Clean's kernel query normally skips a view in 2 MB regions where Harvest never saw that view
+    // write (most memory is only ever written through one of the three views). The cost: the very
+    // first write to a region through a new view is seen at the next Harvest instead of right away.
+    // true asks every view every time.
+    void SetQueryAllViews(bool all) { queryAllViews_ = all; }
 
     struct Stats {
-        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0;
-        double ms = 0;
+        uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0, querySkips = 0;
+        double ms = 0, queryMs = 0;
     };
     // Since the last call.
     Stats TakeStats();
@@ -63,7 +68,7 @@ public:
 private:
     struct Run { uint32_t first, count; };  // physical pages
     void Protect(uint32_t firstPage, uint32_t count);
-    void Scan(const View& v, uint32_t firstPage, uint32_t count);
+    void Scan(size_t view, uint32_t firstPage, uint32_t count);
     bool WrittenNow(uint32_t firstPage, uint32_t count) const;
 
     int uffd_ = -1;
@@ -76,6 +81,9 @@ private:
     std::vector<Run> runs_;              // watched pages, coalesced (rebuilt lazily)
     bool runsDirty_ = false;
     mutable Stats stats_;
+    static constexpr uint32_t kRegionShift = 9;  // 512 pages = 2 MB
+    std::vector<std::vector<uint8_t>> viewSeen_;  // per view, per region: Harvest saw a write through it
+    bool queryAllViews_ = false;
 };
 
 }  // namespace fa::mem
