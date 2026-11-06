@@ -19,6 +19,7 @@ class CommandProcessor {
 public:
     struct Stats {
         uint64_t packets = 0, draws = 0, swaps = 0, unknown = 0, resolves = 0, shaderLoads = 0, predicatedSkips = 0;
+        uint64_t tileSkips = 0;  // draws and resolves of replayed tiles not sent to the backend (FA_TILE_ONCE)
         uint64_t unknownOps[128] = {};  // unhandled type-3 packets by opcode
     };
     enum class Status { Idle, Blocked };
@@ -66,6 +67,17 @@ private:
     // (bin_select & bin_mask) != 0. D3D replays a frame once per screen tile this way.
     uint64_t binMask_ = 0xFFFFFFFFull, binSelect_ = 0xFFFFFFFFull;
     void LoadShader(uint32_t type, std::vector<uint32_t>&& ucode, uint32_t srcAddr);
+    // Tile replay. D3D's predicated tiling replays the frame once per screen tile (bin select bits
+    // 2t and 2t + 1 of the high word select tile t, for its two passes). With FA_TILE_ONCE=1 the
+    // first tile is drawn at full frame height and the draws and resolves of the other tiles are
+    // dropped; every other packet (registers, fences, waits) still runs. The tile height is learnt
+    // from the second tile's scissor, so the first tiled frame is drawn the normal way.
+    int TileOf() const {
+        const uint32_t hi = uint32_t(binSelect_ >> 32) & 0x3FFFFFFFu;
+        return (binSelect_ == ~0ull || !hi) ? -1 : __builtin_ctz(hi) / 2;
+    }
+    bool tileOnce_ = false, sawTile0_ = false;
+    uint32_t tileRows_ = 0, tileSurface_ = 0;
     // FA_TILE_TRACE=<first swap>[,<frames>], or touching ~/.cache/fullauto/tile_trace: logs the frame's structure (indirect buffers, bin
     // mask/select, tile window and target registers, draw runs, resolves) for tile replay work.
     struct TileTrace {

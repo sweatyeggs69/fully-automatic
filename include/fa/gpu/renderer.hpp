@@ -34,6 +34,7 @@ public:
         // Kernel write tracking: 1 when on; texture checks it answered without hashing; textures it
         // called unchanged that had changed (FA_WW_VERIFY=1 only, should stay 0).
         std::atomic<uint64_t> writeWatch{0}, textureWwClean{0}, textureWwMiss{0};
+        std::atomic<uint64_t> tileResolvesExtended{0};  // FA_TILE_ONCE: first-tile resolves copied at full height
     };
 
     // `next` receives every call too (FrameBackend: stats, texture debug view, window frames).

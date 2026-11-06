@@ -30,7 +30,10 @@ bool Compare(uint32_t fn, uint32_t value, uint32_t ref) {
 
 }  // namespace
 
-CommandProcessor::CommandProcessor(GuestMemory& mem, Backend& backend) : mem_(mem), backend_(backend) {}
+CommandProcessor::CommandProcessor(GuestMemory& mem, Backend& backend) : mem_(mem), backend_(backend) {
+    const char* e = std::getenv("FA_TILE_ONCE");
+    tileOnce_ = e && e[0] == '1';
+}
 
 void CommandProcessor::SetRingBuffer(uint32_t baseGuestAddr, uint32_t sizeBytes) {
     ringBase_ = baseGuestAddr;
@@ -107,6 +110,11 @@ void CommandProcessor::TraceSwap() {
 void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
     if (reg >= kRegisterCount) return;
     if (tt_.on) TraceReg(reg, value);
+    // The second tile's scissor starts where the first tile ends.
+    if (reg == xe::PA_SC_WINDOW_SCISSOR_TL && TileOf() == 1 && ((value >> 16) & 0x3FFF)) {
+        tileRows_ = (value >> 16) & 0x3FFF;
+        tileSurface_ = regs_[xe::RB_SURFACE_INFO];
+    }
     regs_[reg] = value;
     if (reg - pm4::kAluConstBase < 2048u) regs_.aluDirty |= 1u << ((reg - pm4::kAluConstBase) >> 6);
     // Scratch registers are mirrored to memory (SCRATCH_ADDR + 4 * i) when their SCRATCH_UMSK bit
@@ -364,6 +372,14 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
                 if (dc.inlineIndices.size() > dc.indexCount) dc.inlineIndices.resize(dc.indexCount);
             }
             regs_[xe::VGT_DRAW_INITIATOR] = init;
+            if (tileOnce_ && tileRows_) {
+                const int tile = TileOf();
+                if (tile == 0) sawTile0_ = true;
+                if (tile >= 1 && sawTile0_) { ++stats_.tileSkips; break; }
+                // Only the tiled target (the surface the tiles were drawn to) is extended: passes
+                // before and after the tiles run with the first tile's select too.
+                regs_.tileRows = tile == 0 && regs_[xe::RB_SURFACE_INFO] == tileSurface_ ? tileRows_ : 0;
+            }
             if ((regs_[xe::RB_MODECONTROL] & 7) == xe::kEdramCopy) {
                 if (tt_.on) {
                     TraceFlushDraws();
@@ -394,6 +410,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             if (n >= 4) {
                 backend_.Swap(d[1], d[2], d[3], regs_);
                 TraceSwap();
+                sawTile0_ = false;
                 ++stats_.swaps;
             }
             break;

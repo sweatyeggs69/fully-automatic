@@ -3872,6 +3872,7 @@ struct VulkanRenderer::Impl {
         int32_t x0 = int32_t(tl & 0x3FFF), y0 = int32_t((tl >> 16) & 0x3FFF);
         int32_t x1 = int32_t(br & 0x3FFF), y1 = int32_t((br >> 16) & 0x3FFF);
         if (x1 == 0 && y1 == 0) { x1 = int32_t(w); y1 = int32_t(h); }
+        if (regs.tileRows && y0 == 0 && uint32_t(y1) == regs.tileRows) y1 = int32_t(h);  // first tile stands for the frame
         if (!(tl >> 31)) {
             int32_t ox = xe::SBits(regs[xe::PA_SC_WINDOW_OFFSET], 0, 15), oy = xe::SBits(regs[xe::PA_SC_WINDOW_OFFSET], 16, 15);
             x0 += ox; x1 += ox; y0 += oy; y1 += oy;
@@ -3914,6 +3915,11 @@ struct VulkanRenderer::Impl {
         int32_t x0 = std::min({fx(v[0]), fx(v[2]), fx(v[4])}), y0 = std::min({fx(v[1]), fx(v[3]), fx(v[5])});
         int32_t x1 = std::max({fx(v[0]), fx(v[2]), fx(v[4])}), y1 = std::max({fx(v[1]), fx(v[3]), fx(v[5])});
         x0 = (x0 + 127) >> 8; y0 = (y0 + 127) >> 8; x1 = (x1 + 127) >> 8; y1 = (y1 + 127) >> 8;
+        if (regs.tileRows && y0 == 0 && uint32_t(y1) <= regs.tileRows) {
+            // First tile of a frame whose other tiles are skipped: copy the whole destination height.
+            const int32_t destRows = int32_t((regs[xe::RB_COPY_DEST_PITCH] >> 16) & 0x3FFF);
+            if (destRows > y1) { y1 = destRows; stats.tileResolvesExtended++; }
+        }
         if ((regs[xe::PA_SU_SC_MODE_CNTL] >> 16) & 1) {
             int32_t ox = xe::SBits(regs[xe::PA_SC_WINDOW_OFFSET], 0, 15), oy = xe::SBits(regs[xe::PA_SC_WINDOW_OFFSET], 16, 15);
             x0 += ox; x1 += ox; y0 += oy; y1 += oy;

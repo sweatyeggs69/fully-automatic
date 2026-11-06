@@ -16,6 +16,10 @@ struct RegisterFile {
     // Float constant blocks (64 dwords = 16 vec4 each, 32 blocks) written since the renderer last
     // uploaded them. Set by the command processor, cleared by the renderer as it uploads.
     mutable uint32_t aluDirty = ~0u;
+    // Tile replay (FA_TILE_ONCE=1): non-zero while the command processor runs the first tile of a
+    // tiled frame and skips the others. It is the tile height in rows: a scissor or resolve that
+    // ends there stands for the whole frame, so the backend extends it to the full target.
+    uint32_t tileRows = 0;
     uint32_t& operator[](uint32_t i) { return r[i]; }
     uint32_t operator[](uint32_t i) const { return r[i]; }
 };
