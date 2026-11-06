@@ -29,6 +29,7 @@ PPC_FUNC_IMPL(__imp__sub_823152C0);
 PPC_FUNC_IMPL(__imp__sub_82147BF8);
 PPC_FUNC_IMPL(__imp__sub_82147370);
 PPC_FUNC_IMPL(__imp__sub_823162F8);
+PPC_FUNC_IMPL(__imp__sub_82147160);
 
 namespace {
 // FA_TAP=1 turns on the observe-only taps and parity report. FA_DIRECT is a bit mask of hooked families
@@ -644,23 +645,32 @@ void apply_pending_locked(const uint8_t* base) {
     g_pending.clear();
 }
 
-// Dirty-state flush (82148508): the blocks issued before it are in the stream first, then the flush writes every
-// VS float constant group whose dirty bit is set (device+0x10, MSB first, 4 vec4 per bit) from the shadow. The mirror
-// follows the same order, so it holds what the GPU's constant registers hold.
+// Dirty-state flush (82148508): the blocks issued before it are in the stream first, then the flush writes the dirty
+// constant groups. The VS dirty word is read by the vec4 range writer 82147160, not at flush entry: the shader-change
+// helpers the flush calls first (82147288, 82147E08 via 82147D18) OR more VS bits into device+0x10 (run 102: 7.3% of
+// touched vec4s differed, in whole 4-vec4 groups 68..103, because the mirror read the word too early).
 PPC_FUNC(sub_82148508) {
     if (g_on) {
-        const uint32_t dev = ctx.r3.u32;
-        const uint64_t dirty = __builtin_bswap64(*reinterpret_cast<const uint64_t*>(base + dev + 0x10));
         std::lock_guard<std::mutex> lk(g_set_mu);
         apply_pending_locked(base);
         g_flushes++;
-        for (uint32_t k = 0; k < 64; k++) {
-            if (!(dirty >> (63 - k) & 1)) continue;
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(base + dev + kOffVs) + k * 16;
-            for (uint32_t i = 0; i < 16; i++) g_mirror[k * 16 + i] = __builtin_bswap32(src[i]);
-        }
     }
     __imp__sub_82148508(ctx, base);
+}
+
+// Vec4 range writer (82147160): r4 dirty bits (MSB first, 4 vec4 per bit), r5 first register, r6 shadow pointer.
+// Writing VS constants (r5 = 0x4000) from the shadow is exactly what the GPU's constant file then holds.
+PPC_FUNC(sub_82147160) {
+    if (g_on && ctx.r5.u32 == 0x4000) {
+        const uint64_t dirty = ctx.r4.u64;
+        const uint32_t* shadow = reinterpret_cast<const uint32_t*>(base + ctx.r6.u32);
+        std::lock_guard<std::mutex> lk(g_set_mu);
+        for (uint32_t k = 0; k < 64; k++) {
+            if (!(dirty >> (63 - k) & 1)) continue;
+            for (uint32_t i = 0; i < 16; i++) g_mirror[k * 16 + i] = __builtin_bswap32(shadow[k * 16 + i]);
+        }
+    }
+    __imp__sub_82147160(ctx, base);
 }
 
 PPC_FUNC(sub_82315500) {
