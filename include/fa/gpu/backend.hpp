@@ -69,6 +69,7 @@ struct DirectDraw {
     uint64_t vsConstDirty = 0, psConstDirty = 0;
     uint32_t fetchDirty = 0, stateDirty = 0;
     uint32_t payloadBytes = 0;  // bytes of DirectRegRun headers and values
+    uint32_t tileRows = 0;      // RegisterFile::tileRows of the command processor's tile replay skip (0 = none)
 };
 
 class Backend {
