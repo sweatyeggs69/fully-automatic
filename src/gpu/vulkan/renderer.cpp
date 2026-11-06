@@ -1033,7 +1033,7 @@ struct VulkanRenderer::Impl {
                     for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
             }
         };
-        uint8_t* dst = mem.HostPtrWrite(d.base, j.destBytes);
+        uint8_t* dst = WbPtr(d.base, j.destBytes);
         if (dst) {
             rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
                 for (size_t i = size_t(ya) * w; i < size_t(yb) * w; i++) toFloat(i);
@@ -1943,7 +1943,32 @@ struct VulkanRenderer::Impl {
         // FA_WW_COLD=1: no kernel query for memory not written in the last 120 frames (opt-in, see run 119).
         { const char* wc = std::getenv("FA_WW_COLD"); ww.SetSkipCold(wc && wc[0] == '1'); }
         stats.writeWatch = 1;
-        std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "");
+        // Resolve writebacks go through a mapping of their own that is not write protected: through the watched
+        // views every first write to a page takes a fault (about 3 ms per 18 MB, the race writes about that much
+        // per frame), and the renderer marks that memory written itself (WwTouch). FA_WB_ALIAS=0 turns it off.
+        const char* wa = std::getenv("FA_WB_ALIAS");
+        const int fd = mem.PhysicalFd();
+        if (!(wa && wa[0] == '0') && fd >= 0) {
+            void* m = mmap(nullptr, mem.PhysicalSize(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED) {
+                wbAlias = static_cast<uint8_t*>(m);
+                wbViews.assign(pv, pv + n);
+            }
+        }
+        std::fprintf(stderr, "[writewatch] on: %d views of %u MB%s%s\n", n, mem.PhysicalSize() >> 20, wwVerify ? ", verifying" : "",
+                     wbAlias ? ", writebacks unwatched" : "");
+    }
+    uint8_t* wbAlias = nullptr;
+    std::vector<GuestMemory::PhysicalView> wbViews;
+    // Where a resolve writes guest memory: HostPtrWrite's checks, then the same bytes through wbAlias.
+    uint8_t* WbPtr(uint32_t a, uint32_t n) {
+        uint8_t* p = mem.HostPtrWrite(a, n);
+        if (!p || !wbAlias) return p;
+        for (const auto& v : wbViews) {
+            const uint8_t* b = static_cast<const uint8_t*>(v.base);
+            if (p >= b && uint64_t(p - b) + n <= v.size) return wbAlias + v.physOffset + (p - b);
+        }
+        return p;
     }
     // Physical address of a guest address the renderer reads (HostPtr's mapping), or -1.
     static int64_t WwPhys(uint32_t a) { return a < 0x20000000u ? int64_t(a) : a >= 0xA0000000u ? int64_t(a & 0x1FFFFFFFu) : -1; }
@@ -2349,6 +2374,7 @@ struct VulkanRenderer::Impl {
     }
 
     ~Impl() {
+        if (wbAlias) munmap(wbAlias, mem.PhysicalSize());
         if (dev) {
             vkDeviceWaitIdle(dev);
             for (Batch& b : batches) {
@@ -4185,7 +4211,7 @@ struct VulkanRenderer::Impl {
                             for (int c = 0; c < 4; c++) px[i * 4 + c] *= (1.0f / 32.0f);
                     }
                 };
-                uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+                uint8_t* dst = WbPtr(d.base, destBytes);
                 if (dst) {
                     // Bands of rows in parallel: each converts its rows and writes their texels.
                     rowPool.Run(h, [&](uint32_t ya, uint32_t yb) {
@@ -4255,7 +4281,7 @@ struct VulkanRenderer::Impl {
             default: return false;
         }
         if (x8 >= bpp) return false;
-        uint8_t* dst = mem.HostPtrWrite(d.base, destBytes);
+        uint8_t* dst = WbPtr(d.base, destBytes);
         if (!dst) return false;
         const uint32_t pitch = (std::max(d.pitch, 32u) + 31) & ~31u, height = (std::max(d.height, 1u) + 31) & ~31u;
         auto xf = [&](uint32_t v) {

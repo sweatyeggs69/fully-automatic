@@ -25,10 +25,9 @@ struct FakeMem : GuestMemory {
     // write tracking can watch it.
     struct Bytes {
         size_t n = 16 << 20;
+        int fd = memfd_create("render-test", 0);  // kept open: the renderer maps it again for its writebacks
         uint8_t* p = [this] {
-            int fd = memfd_create("render-test", 0);
             void* m = fd >= 0 && ftruncate(fd, n) == 0 ? mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
-            if (fd >= 0) close(fd);
             if (m == MAP_FAILED) { std::printf("gpu_render_test: guest memory mapping failed\n"); std::exit(1); }
             return static_cast<uint8_t*>(m);
         }();
@@ -37,6 +36,7 @@ struct FakeMem : GuestMemory {
         const uint8_t& operator[](size_t i) const { return p[i]; }
     } bytes;
     uint32_t PhysicalSize() const override { return uint32_t(bytes.size()); }
+    int PhysicalFd() const override { return bytes.fd; }
     int PhysicalViews(PhysicalView* out, int max) const override {
         if (max < 1) return 0;
         out[0] = {bytes.p, 0, uint32_t(bytes.size())};
