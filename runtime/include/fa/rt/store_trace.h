@@ -11,6 +11,10 @@
 
 extern "C" volatile uint8_t fa_st_armed;
 extern "C" void fa_st_hit(uint32_t ea, uint32_t size, uint64_t value);
+extern "C" int fa_st_register_tu();
+// One per instrumented translation unit; the count is printed when a capture arms, so a build
+// where this header did not take effect is obvious.
+[[maybe_unused]] static const int fa_st_tu_marker = fa_st_register_tu();
 
 #undef PPC_STORE_U8
 #undef PPC_STORE_U16
