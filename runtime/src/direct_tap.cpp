@@ -406,7 +406,11 @@ uint32_t g_dd_seq = 0;
 
 bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs, fa::gpu::Backend& backend) {
     if (!(g_direct & 4) || !dc.indexed || !dc.inlineIndices.empty()) return false;
-    std::vector<uint32_t> img(regs.r.begin(), regs.r.end());
+    // Only the register ranges the renderer reads are diffed: 0x2000..0x23FF (render state, scissor, window offset,
+    // copy registers) and 0x4000..0x4927 (float, fetch, bool and loop constants).
+    static std::vector<uint32_t> img(fa::gpu::kRegisterCount);
+    std::memcpy(img.data() + 0x2000, regs.r.data() + 0x2000, 0x400 * 4);
+    std::memcpy(img.data() + 0x4000, regs.r.data() + 0x4000, 0x928 * 4);
     fa::gpu::DirectDraw rec;
     {
         std::lock_guard<std::mutex> lk(g_snap_mu);
@@ -439,10 +443,12 @@ bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     // Payload: runs of dwords that differ from what the backend last received.
     const bool full = g_dd_sent.size() != img.size();
     g_dd_payload.clear();
-    for (uint32_t i = 0; i < img.size();) {
+    static const uint32_t kRanges[2][2] = {{0x2000, 0x2400}, {0x4000, 0x4928}};
+    for (const auto& rg : kRanges)
+    for (uint32_t i = rg[0]; i < rg[1];) {
         if (!full && img[i] == g_dd_sent[i]) { i++; continue; }
         uint32_t j = i;
-        while (j < img.size() && (full || img[j] != g_dd_sent[j])) j++;
+        while (j < rg[1] && (full || img[j] != g_dd_sent[j])) j++;
         fa::gpu::DirectRegRun run{i, j - i};
         const size_t at = g_dd_payload.size();
         g_dd_payload.resize(at + sizeof run + run.count * 4);
@@ -452,12 +458,15 @@ bool direct_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
         i = j;
     }
     rec.payloadBytes = uint32_t(g_dd_payload.size());
+    rec.tileRows = regs.tileRows;
     if (!backend.DrawDirect(rec, g_dd_payload.data())) {
         g_dd_refused++;
         g_dd_sent.clear();  // the backend did not take the state: resend everything next time
         return false;
     }
-    g_dd_sent.swap(img);
+    if (g_dd_sent.size() != img.size()) g_dd_sent.assign(img.size(), 0);
+    std::memcpy(g_dd_sent.data() + 0x2000, img.data() + 0x2000, 0x400 * 4);
+    std::memcpy(g_dd_sent.data() + 0x4000, img.data() + 0x4000, 0x928 * 4);
     g_dd_draws++;
     return true;
 }
