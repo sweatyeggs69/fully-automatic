@@ -112,6 +112,7 @@ uint64_t g_mirror_valid[8];            // vec4 bits ever written by a block (und
 DrawArgs g_cur_args{};                 // set by the draw hook for snapshot_draw (game draw thread)
 uint64_t g_rec_cmp = 0, g_rec_bad_prim = 0, g_rec_bad_count = 0, g_rec_bad_addr = 0, g_mir_cmp = 0, g_mir_diff = 0;
 int g_rec_printed = 0, g_mir_printed = 0;
+uint64_t g_mir_vec[256];
 uint64_t g_st_mis[0x400], g_st_cmp = 0;
 int g_st_printed = 0;
 std::mutex g_snap_mu;
@@ -247,7 +248,8 @@ void exact_compare(uint32_t pkt, const fa::gpu::RegisterFile& regs, const fa::gp
             for (uint32_t j = 0; j < 4; j++) same &= sn->mir[v * 4 + j] == regs[0x4000 + v * 4 + j];
             if (!same) {
                 g_mir_diff++;
-                if (g_mir_printed < 12) {
+                g_mir_vec[v]++;
+                if (g_mir_printed < 12 && g_mir_cmp > 20000000) {
                     g_mir_printed++;
                     std::fprintf(stderr, "[tap] mirror vec4 %u: game %08x %08x %08x %08x cp %08x %08x %08x %08x (packet %08x)\n", v,
                                  sn->mir[v * 4], sn->mir[v * 4 + 1], sn->mir[v * 4 + 2], sn->mir[v * 4 + 3],
@@ -402,6 +404,14 @@ PPC_FUNC(sub_823162F8) {
         // Returns the payload pointer the caller then fills (821B8510); read it at the next draw.
         std::lock_guard<std::mutex> lk(g_set_mu);
         g_pending.push_back({first_arg, count_arg, ctx.r3.u32});
+        static int blk_samples = 0;
+        if (blk_samples < 8) {
+            blk_samples++;
+            const uint32_t r3 = ctx.r3.u32;
+            auto rd = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a)); };
+            std::fprintf(stderr, "[tap] const block: first %u count %u returned %08x | [-8] %08x [-4] %08x [0] %08x [+4] %08x\n",
+                         first_arg, count_arg, r3, rd(r3 - 8), rd(r3 - 4), rd(r3), rd(r3 + 4));
+        }
     }
 }
 
@@ -600,6 +610,9 @@ void direct_tap_frame_end() {
         std::fprintf(stderr, "[tap]   stage A record: draws %llu, prim differs %llu, count differs %llu, index address differs %llu | per-object constant mirror: vec4 compared %llu, differ %llu\n",
                      (unsigned long long)g_rec_cmp, (unsigned long long)g_rec_bad_prim, (unsigned long long)g_rec_bad_count, (unsigned long long)g_rec_bad_addr,
                      (unsigned long long)g_mir_cmp, (unsigned long long)g_mir_diff);
+        std::fprintf(stderr, "[tap]   mirror differences by vec4:");
+        for (uint32_t v = 0; v < 256; v++) if (g_mir_vec[v]) std::fprintf(stderr, " %u:%llu", v, (unsigned long long)g_mir_vec[v]);
+        std::fprintf(stderr, "\n");
         std::fprintf(stderr, "[tap]   render-state windows: compared %llu dwords; registers that differ (reg:count of %llu draws):", (unsigned long long)g_st_cmp, (unsigned long long)g_ex_found);
         for (uint32_t i = 0; i < 0x400; i++) if (g_st_mis[i]) std::fprintf(stderr, " %04x:%llu", 0x2000 + i, (unsigned long long)g_st_mis[i]);
         std::fprintf(stderr, "\n");
