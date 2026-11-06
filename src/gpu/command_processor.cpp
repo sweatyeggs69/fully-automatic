@@ -358,6 +358,8 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             uint32_t init = d[first];
             DrawCall dc;
             dc.packetAddr = curPacket_;
+            dc.ibBase = ib_.active ? ib_.base : 0;
+            dc.tile = TileOf();
             dc.primType = init & 0x3F;
             uint32_t source = (init >> 6) & 3;  // 0 = DMA, 1 = immediate, 2 = auto index
             dc.index32 = (init >> 11) & 1;
