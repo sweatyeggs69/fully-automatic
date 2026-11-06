@@ -696,6 +696,25 @@ struct VulkanRenderer::Impl {
         return false;
     }
     // Copies the resolved rectangle of `src` into the snapshot of `key` and marks it pending.
+    // A pending snapshot of another base overlapping a new resolve to [key, key + bytes) must reach guest
+    // memory first, since the new one lands over it. One that the new resolve covers completely would only
+    // be overwritten: it is dropped instead, which saves the GPU wait of a flush (FA_SNAP_DROP=0 flushes).
+    void DropOrFlushOverlaps(uint32_t key, uint32_t bytes, uint32_t self) {
+        static const bool noDrop = [] { const char* e = std::getenv("FA_SNAP_DROP"); return e && e[0] == '0'; }();
+        const uint64_t lo = key, hi = uint64_t(key) + bytes;
+        for (size_t i = 0; i < pendingKeys.size();) {
+            const uint32_t k = pendingKeys[i];
+            Snap& o = snaps[k];
+            const uint64_t olo = o.base, ohi = uint64_t(o.base) + o.size;
+            if (k == self || olo >= hi || lo >= ohi) { i++; continue; }
+            if (noDrop || olo < lo || ohi > hi) { FlushPending(prof::kFlushOverlap); return; }
+            o.pending = false;
+            pendingBytes -= std::min<uint64_t>(pendingBytes, uint64_t(o.w) * o.filled * 4);
+            pendingKeys.erase(pendingKeys.begin() + i);
+            prof::Add(prof::kSnapDropped, 1);
+        }
+    }
+
     bool SnapStore(RenderTarget* src, const ResolveDest& d, uint32_t destBytes, uint32_t key, uint32_t w, uint32_t h) {
         const VkFormat fmt = src->image.format;
         const uint32_t pitchAl = (std::max(d.pitch, 32u) + 31) & ~31u;
@@ -714,10 +733,7 @@ struct VulkanRenderer::Impl {
                 const uint32_t ry = (key - P.base) / rowBytes;
                 if (ry != P.filled || ry + h > P.img.h) continue;
                 if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-                for (uint32_t k : pendingKeys) {
-                    const Snap& o = snaps[k];
-                    if (k != pk && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
-                }
+                DropOrFlushOverlaps(key, destBytes, pk);
                 if (!P.valid) break;
                 const bool keep = P.valid;
                 InvalidateTextures(key, destBytes, 689);
@@ -747,10 +763,7 @@ struct VulkanRenderer::Impl {
         if (d.height > h && d.height <= 2048 && w == d.pitch && uint64_t(pitchAl) * 4 * ((d.height + 31) & ~31u) == destBytes) H = d.height;
         // A pending surface of another base overlapping this one is written first (order matters).
         if (!pendingGen.empty() && PendingOverlaps(key, destBytes)) FlushPending(prof::kFlushOverlap);
-        for (uint32_t k : pendingKeys) {
-            const Snap& o = snaps[k];
-            if (k != key && uint64_t(o.base) < uint64_t(key) + destBytes && uint64_t(key) < uint64_t(o.base) + o.size) { FlushPending(prof::kFlushOverlap); break; }
-        }
+        DropOrFlushOverlaps(key, destBytes, key);
         if (e.img.img && (e.img.w != w || e.img.h != H || e.img.format != fmt)) {
             if (e.pending) FlushPending(prof::kFlushOverlap);
             ReleaseSnapImage(e);

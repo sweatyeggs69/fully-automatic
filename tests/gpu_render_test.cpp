@@ -563,6 +563,28 @@ int main() {
             if (!ok) std::printf("FAIL direct (%u,%u) = %02x %02x %02x %02x\n", pts[i][0], pts[i][1], px[0], px[1], px[2], px[3]);
             CHECK(ok);
         }
+        // Two resolves in one frame where the second covers the first completely: the first is dropped
+        // (never written), and the memory must end up with the second one. Resolve 1 copies the scene's top
+        // 32 rows to the destination's bottom half and clears to white; resolve 2 copies the white surface.
+        {
+            const uint32_t destE = 0x3C0000;
+            rc[xe::RB_COLOR_CLEAR] = rc[xe::RB_COLOR_CLEAR_LO] = 0xFFFFFFFFu;
+            rc[xe::RB_COPY_CONTROL] = 1u << 8;  // copy, then clear colour
+            rc[xe::RB_COPY_DEST_BASE] = destE + 32 * 128 * 4;
+            rc[xe::RB_COPY_DEST_PITCH] = (32u << 16) | 128;
+            r.Resolve(rc);
+            rc[xe::RB_COPY_CONTROL] = 0;
+            rc[xe::RB_COPY_DEST_BASE] = destE;
+            rc[xe::RB_COPY_DEST_PITCH] = (64u << 16) | 128;
+            r.Resolve(rc);
+            r.Flush();
+            for (uint32_t y : {4u, 40u}) {
+                Pixel(mem, destE, 128, 64, 4, y, px);
+                const bool ok = px[0] == 255 && px[1] == 255 && px[2] == 255;
+                if (!ok) std::printf("FAIL covered resolve (4,%u) = %02x %02x %02x %02x\n", y, px[0], px[1], px[2], px[3]);
+                CHECK(ok);
+            }
+        }
         std::printf("  direct records: %llu draws, %llu register dwords, %llu shader reads\n", (unsigned long long)st.directDraws.load(),
                     (unsigned long long)st.directRegs.load(), (unsigned long long)st.directShaderReads.load());
     }
