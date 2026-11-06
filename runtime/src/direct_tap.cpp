@@ -35,6 +35,7 @@ namespace {
 const unsigned g_direct = std::getenv("FA_DIRECT") ? unsigned(std::strtoul(std::getenv("FA_DIRECT"), nullptr, 0)) : 0u;
 bool g_tap_report = std::getenv("FA_TAP") != nullptr;
 bool g_on = g_tap_report || g_direct != 0;
+int g_feed_printed = 0;
 uint64_t g_feed_draws = 0, g_feed_missing = 0, g_feed_changed = 0, g_feed_dwords = 0;
 std::atomic<uint64_t> g_tap_calls{0}, g_tap_indices{0}, g_cp_draws{0}, g_cp_indices{0};
 std::atomic<uint64_t> g_tap_last_calls{0};
@@ -226,6 +227,11 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
             if (touched(k * 256 + (i >> 2))) continue;
             uint32_t& dst = regs[rb[k] + i];
             if (dst != src[k][i]) {
+                if (g_feed_printed < 16) {
+                    g_feed_printed++;
+                    std::fprintf(stderr, "[direct] differs: %s const reg %04x pm4 %08x game %08x (packet %08x, vec4 %u)\n", k ? "ps" : "vs",
+                                 rb[k] + i, dst, src[k][i], dc.packetAddr, k * 256 + (i >> 2));
+                }
                 dst = src[k][i];
                 regs.aluDirty |= 1u << ((k * 1024 + i) >> 6);
                 g_feed_changed++;
@@ -234,7 +240,14 @@ void feed_cp_draw(const fa::gpu::DrawCall& dc, fa::gpu::RegisterFile& regs) {
     }
     for (uint32_t i = 0; i < kTexDwords; i++) {
         uint32_t& dst = regs[kRegTex + i];
-        if (dst != sn->tex[i]) { dst = sn->tex[i]; g_feed_changed++; }
+        if (dst != sn->tex[i]) {
+            if (g_feed_printed < 16) {
+                g_feed_printed++;
+                std::fprintf(stderr, "[direct] differs: fetch reg %04x pm4 %08x game %08x (packet %08x)\n", kRegTex + i, dst, sn->tex[i], dc.packetAddr);
+            }
+            dst = sn->tex[i];
+            g_feed_changed++;
+        }
     }
     g_feed_dwords += 2048 + kTexDwords;
 }
