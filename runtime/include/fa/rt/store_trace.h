@@ -1,4 +1,4 @@
-// Diagnostic only (cmake -DFA_STORE_TRACE=ON, or FA_STORE_TRACE=1 tools/fa-build.sh).
+// Diagnostic only (cmake -DFA_STORE_TRACE=ON, or FA_STORE_TRACE_BUILD=ON tools/fa-build.sh).
 // Force-included into every recompiled ppc_recomp.*.cpp. It wraps the guest store macros so that,
 // while a capture is armed, every store into a GPU command buffer range reports itself with the
 // host backtrace (recompiled functions are real host functions named sub_XXXXXXXX, so the
@@ -6,6 +6,9 @@
 // notes/direct-gpu-hooks-design.md (Phase 0). Costs one load and branch per guest store.
 // Not covered: vector stores that do not go through PPC_STORE_*.
 #pragma once
+// ppc_context.h refuses to compile unless ppc_config.h came first, and this header is force-included
+// before anything else.
+#include <ppc_config.h>
 #include FA_XENON_CONTEXT_H
 #include <cstdint>
 
