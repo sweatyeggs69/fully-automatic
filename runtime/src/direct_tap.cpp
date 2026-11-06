@@ -736,7 +736,7 @@ std::unordered_map<uint32_t, ReplayRef> g_replay;  // packet -> where its state 
 uint32_t g_chain_id = 0, g_chain_cur = 0;          // 0 = not in a chain
 size_t g_chain_words = 0;
 uint32_t g_rep_chain = 0, g_rep_pos = 0;           // what g_rep holds
-uint64_t g_rpl_rebuilds = 0;
+uint64_t g_rpl_rebuilds = 0, g_rpl_badargs = 0, g_rpl_diff_badargs = 0;
 // Called for every record the CP applies, in order.
 void chain_note(uint64_t r, uint32_t len) {
     if (!g_tap_report && !(g_direct & 128)) return;
@@ -838,6 +838,12 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
     if (ci == g_chains.end() || ci->second.size() < ref.end) { g_rpl_missing++; return false; }
     g_rpl_found++;
     const std::vector<uint32_t>& wv = ci->second;
+    // The kept draw must be this draw (run 132: the replay check's samples were whole vs matrices from another
+    // object, a packet address the game reused with a new recording): same primitive, count and index address.
+    const uint32_t* h0 = wv.data() + ref.last;
+    const bool sameArgs = h0[3] == dc.primType && h0[4] == dc.indexCount &&
+                          (!dc.indexed || (h0[5] & 0x1FFFFFFF) == (dc.indexGuestAddr & 0x1FFFFFFF));
+    if (!sameArgs) g_rpl_badargs++;
     uint32_t from = ref.start;
     if (!g_in_replay || g_rep_chain != ref.chain || g_rep_pos > ref.start) {
         // Rebuild: the current image, then the chain from its full first record.
@@ -874,19 +880,22 @@ bool replay_draw(const fa::gpu::DrawCall& dc, const fa::gpu::RegisterFile& regs,
                 const uint32_t reg = sg.reg + i;
                 if (reg >= 0x4000 && reg < 0x4800 && touched((reg - 0x4000) >> 2)) continue;
                 if (g_rep[reg] != regs[reg]) {
+                    // One sample line per differing draw (its first register), so the samples cover several draws.
+                    if (!any && g_rpl_printed < 24) {
+                        g_rpl_printed++;
+                        std::fprintf(stderr, "[direct] replay image reg %04x: replay %08x cp %08x (packet %08x, ib %08x, same args %d, rebuilt %d, kept at chain %u)\n", reg,
+                                     g_rep[reg], regs[reg], dc.packetAddr, dc.ibBase, int(sameArgs), int(from == 0), ref.chain);
+                    }
                     any = true;
                     g_rpl_diff_seg[si]++;
-                    if (g_rpl_printed < 16) {
-                        g_rpl_printed++;
-                        std::fprintf(stderr, "[direct] replay image reg %04x: replay %08x cp %08x (packet %08x, ib %08x)\n", reg, g_rep[reg], regs[reg], dc.packetAddr, dc.ibBase);
-                    }
                 }
             }
             si++;
         }
         g_rpl_diff += any;
+        g_rpl_diff_badargs += any && !sameArgs;
     }
-    if (!(g_direct & 128) || !eligible) return false;
+    if (!(g_direct & 128) || !eligible || !sameArgs) return false;
     const uint32_t* hdr = wv.data() + ref.last;
     if (hdr[1] & 2) return false;  // a resolve record
     if (!send_direct(dc, regs, backend, g_rep, g_rep_dirty, g_blk_dirty, hdr)) return false;
@@ -1418,6 +1427,7 @@ void direct_tap_frame_end() {
                      (unsigned long long)g_rpl_stored, g_replay.size(), g_chains.size(), g_chain_words, (unsigned long long)g_rpl_found, (unsigned long long)g_rpl_starts,
                      (unsigned long long)g_rpl_rebuilds, (unsigned long long)g_rpl_missing, (unsigned long long)g_rpl_drawn);
         if (g_tap_report) {
+            std::fprintf(stderr, "[direct] stage B replay check: draw arguments differ %llu (of the image diffs %llu)\n", (unsigned long long)g_rpl_badargs, (unsigned long long)g_rpl_diff_badargs);
             std::fprintf(stderr, "[direct] stage B replay check: compared %llu, image differs from CP %llu | by segment (vs ps fetch boolloop 2000 2100 2180 2200 2209 2280 2300 2380):",
                          (unsigned long long)g_rpl_cmp, (unsigned long long)g_rpl_diff);
             for (size_t i = 0; i < sizeof kGSegs / sizeof kGSegs[0]; i++) std::fprintf(stderr, " %llu", (unsigned long long)g_rpl_diff_seg[i]);
