@@ -43,6 +43,11 @@ void audio_stats_reporter(int secs) {
                      (unsigned long long)(x.decode_errors - xprev.decode_errors), double(x.passes - xprev.passes) / dt,
                      double(x.loops - xprev.loops) / dt, (unsigned long long)(a.clipped_samples - prev.clipped_samples),
                      a.max_gap_ms, a.min_queued == (1 << 30) ? -1 : a.min_queued);
+        // Output rings: "drained" passes found a ring the game had read empty (an audible gap for
+        // that voice unless it was ending), "dry" ran out of input, "full" filled the ring.
+        std::fprintf(stderr, "[audio] xma rings: drained %llu, dry %llu, full %llu, no output %llu\n",
+                     (unsigned long long)(x.drained - xprev.drained), (unsigned long long)(x.dry - xprev.dry),
+                     (unsigned long long)(x.full - xprev.full), (unsigned long long)(x.no_output - xprev.no_output));
         std::fflush(stderr);
         prev = a;
         xprev = x;

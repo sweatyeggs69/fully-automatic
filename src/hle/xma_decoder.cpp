@@ -320,11 +320,13 @@ struct XmaDecoder::Context {
     FrameDecoder dec;
     Carry carry;
     bool carry_crossed = false;
+    bool primed = false;  // wrote output since the last reset (an empty ring after this means the reader caught up)
     int trace_count = 0;
 
     void reset_stream() {
         carry.reset();
         carry_crossed = false;
+        primed = false;
         dec.flush();
     }
 
@@ -346,8 +348,12 @@ struct XmaDecoder::Context {
     }
 
     void decode(XmaContextData& d, const GuestHooks& hooks) {
-        if (!d.output_buffer_valid) return;
+        if (!d.output_buffer_valid) {
+            st_no_output_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) {
+            st_dry_.fetch_add(1, std::memory_order_relaxed);
             d.output_buffer_valid = 0;
             return;
         }
@@ -362,14 +368,24 @@ struct XmaDecoder::Context {
         uint32_t used = wr >= rd ? wr - rd : cap - rd + wr;
         uint32_t space = cap - used;
         const uint32_t frame_bytes = kSamplesPerFrame * 2 * uint32_t(channels);
+        if (used == 0 && primed) st_drained_.fetch_add(1, std::memory_order_relaxed);
+        // FA_XMA_GAP=1: never fill the ring completely, so a full ring never reads as read == write.
+        static const bool keep_gap = [] {
+            const char* e = std::getenv("FA_XMA_GAP");
+            return e && *e && *e != '0';
+        }();
+        const uint32_t reserve = keep_gap ? frame_bytes : 0;
 
         float pcm0[kSamplesPerFrame], pcm1[kSamplesPerFrame];
         float* pcm[2] = {pcm0, pcm1};
         uint8_t be[kSamplesPerFrame * 4];
 
         int guard = 0;
-        while (space >= frame_bytes && guard++ < 256) {
-            if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) break;
+        while (space >= frame_bytes + reserve && guard++ < 256) {
+            if (!d.input_buffer_0_valid && !d.input_buffer_1_valid) {
+                st_dry_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
             bool cur_valid = d.current_buffer ? d.input_buffer_1_valid : d.input_buffer_0_valid;
             if (!cur_valid) {  // the game refilled the other buffer only
                 d.current_buffer ^= 1;
@@ -437,6 +453,7 @@ struct XmaDecoder::Context {
             for (uint32_t i = 0; i < frame_bytes; ++i) out[(wr + i) % cap] = be[i];
             wr = (wr + frame_bytes) % cap;
             space -= frame_bytes;
+            primed = true;
             d.output_buffer_write_offset = wr / kBytesPerBlock;
 
             uint32_t next;
@@ -448,13 +465,17 @@ struct XmaDecoder::Context {
         }
         // A full ring reads as read == write; mark it invalid until the game
         // consumes some output and validates it again.
-        if (wr == rd) d.output_buffer_valid = 0;
+        if (wr == rd) {
+            st_full_.fetch_add(1, std::memory_order_relaxed);
+            d.output_buffer_valid = 0;
+        }
     }
 };
 
 // ------------------------------------------------------------ decoder
 
-std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0};
+std::atomic<uint64_t> XmaDecoder::st_frames_{0}, XmaDecoder::st_bad_frames_{0}, XmaDecoder::st_decode_errors_{0},
+    XmaDecoder::st_drained_{0}, XmaDecoder::st_dry_{0}, XmaDecoder::st_full_{0}, XmaDecoder::st_no_output_{0};
 
 XmaDecoder::XmaDecoder() = default;
 
@@ -466,6 +487,10 @@ XmaDecoder::Stats XmaDecoder::stats() {
     s.frames = st_frames_.load(std::memory_order_relaxed);
     s.bad_frames = st_bad_frames_.load(std::memory_order_relaxed);
     s.decode_errors = st_decode_errors_.load(std::memory_order_relaxed);
+    s.drained = st_drained_.load(std::memory_order_relaxed);
+    s.dry = st_dry_.load(std::memory_order_relaxed);
+    s.full = st_full_.load(std::memory_order_relaxed);
+    s.no_output = st_no_output_.load(std::memory_order_relaxed);
     std::lock_guard lk(alloc_mu_);
     for (auto& c : contexts_) s.allocated += c->allocated ? 1 : 0;
     return s;
