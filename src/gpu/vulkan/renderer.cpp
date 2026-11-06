@@ -3448,7 +3448,8 @@ struct VulkanRenderer::Impl {
         sys.misc[0] = xe::AsFloat(regs[xe::RB_ALPHA_REF]);
         // Alpha to mask (bit 4) turns alpha into MSAA coverage. Targets are single sampled here, so
         // approximate it with a cut at 0.5, which gives foliage cards their leaf-shaped edges.
-        if (!((colorCtl >> 3) & 1) && ((colorCtl >> 4) & 1) && !dbgNoAtest && !std::getenv("FA_NO_A2M")) {
+        static const bool noA2m = std::getenv("FA_NO_A2M") != nullptr;  // read once, not per draw
+        if (!((colorCtl >> 3) & 1) && ((colorCtl >> 4) & 1) && !dbgNoAtest && !noA2m) {
             sys.flags[1] = 6;
             sys.misc[0] = 0.5f;
         }
