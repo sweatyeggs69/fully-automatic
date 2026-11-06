@@ -65,6 +65,22 @@ int main() {
     b[0x61000 - 4096 + 8] = 5;  // physical 0x61008, through the aliased view
     CHECK(!ww.Clean(0x60000, 0x2000, t3b));
     CHECK(ww.Clean(0x60000, 0x1000, t3b));
+    // A view never seen writing in a 2 MB region is not asked: the first write there through it is
+    // seen at the next Harvest (or right away with SetQueryAllViews).
+    mprotect(b + 0x1400000 - 4096, 0x2000, PROT_READ | PROT_WRITE);
+    uint64_t t3c = ww.Watch(0x1400000, 0x1000);  // region 10: no writes through either view so far
+    ww.Harvest();
+    b[0x1400000 - 4096 + 8] = 5;
+    CHECK(ww.Clean(0x1400000, 0x1000, t3c));
+    ww.SetQueryAllViews(true);
+    CHECK(!ww.Clean(0x1400000, 0x1000, t3c));
+    ww.SetQueryAllViews(false);
+    ww.Harvest();
+    CHECK(!ww.Clean(0x1400000, 0x1000, t3c));
+    uint64_t t3d = ww.Watch(0x1400000, 0x1000);
+    ww.Harvest();
+    b[0x1400000 - 4096 + 9] = 6;  // view b is known to write here now: seen right away
+    CHECK(!ww.Clean(0x1400000, 0x1000, t3d));
     // Unwatched memory is never clean.
     CHECK(!ww.Clean(0x900000, 0x1000, ww.Watch(0, 0)));
     // Touch marks host writes.
@@ -127,7 +143,9 @@ int main() {
     for (uint32_t i = 0; i < 1000; i++) cleanCount += ww.Clean(base + (i % 256) * 65536, 65536, tq);
     CHECK(cleanCount == 1000);
     const double perClean = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tq0).count() / 1000.0;
-    std::printf("write_watch_test: Clean of 64 KB about %.2f us (including one harvest)\n", perClean);
+    const auto qs = ww.TakeStats();
+    std::printf("write_watch_test: Clean of 64 KB about %.2f us (including one harvest), %llu queries, %llu views skipped\n", perClean,
+                (unsigned long long)qs.queryCalls, (unsigned long long)qs.querySkips);
     auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
     std::printf("write_watch_test: %u first writes %.2f ms (%.2f us each), harvest %.2f ms (%llu pages), idle harvest %.2f ms\n",
                 big / 4096, ms(t0, t1w), ms(t0, t1w) * 1000.0 / (big / 4096), ms(t1w, t2h),
