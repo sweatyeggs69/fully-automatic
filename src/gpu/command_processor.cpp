@@ -46,7 +46,7 @@ void CommandProcessor::SetReg(uint32_t reg, uint32_t value) {
     // is set. D3D's fences are written this way.
     if (reg >= pm4::kScratchReg0 && reg < pm4::kScratchReg0 + 8) {
         uint32_t i = reg - pm4::kScratchReg0;
-        if (regs_[pm4::kScratchUmsk] & (1u << i)) mem_.Write32(regs_[pm4::kScratchAddr] + i * 4, value);
+        if (regs_[pm4::kScratchUmsk] & (1u << i)) GuestWrite(regs_[pm4::kScratchAddr] + i * 4, value);
     }
 }
 
@@ -66,20 +66,21 @@ CommandProcessor::Status CommandProcessor::Pump() {
         while (ib_.active) {
             if (ib_.pos >= ib_.size) { ib_.active = false; break; }
             uint32_t avail = ib_.size - ib_.pos;
-            if (ExecutePacket(ib_.pos, ib_.base, ib_.size, avail, 1) == Result::Blocked) { backend_.Sync(); return Status::Blocked; }
+            if (ExecutePacket(ib_.pos, ib_.base, ib_.size, avail, 1) == Result::Blocked) { backend_.Sync(); backend_.Idle(); return Status::Blocked; }
         }
         if (rptr_ == wptr_) break;
         uint32_t avail = (wptr_ - rptr_) % ringSizeDwords_;
         if (avail == 0) break;
         uint32_t pos = rptr_;
         Result r = ExecutePacket(pos, ringBase_, ringSizeDwords_, avail, 0);
-        if (r == Result::Blocked) { backend_.Sync(); return Status::Blocked; }
+        if (r == Result::Blocked) { backend_.Sync(); backend_.Idle(); return Status::Blocked; }
         if (r == Result::Incomplete) break;
         rptr_ = pos % ringSizeDwords_;
         if (rptrWriteback_) mem_.Write32(rptrWriteback_, rptr_);
     }
     // Everything submitted so far is done: the guest may now read the results (it polls the read pointer).
     backend_.Sync();
+    backend_.Idle();
     return Status::Idle;
 }
 
@@ -209,7 +210,7 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
             uint32_t value = (d[0] & 0x10) ? mem_.Read32(d[1] & ~3u) : (d[1] < kRegisterCount ? regs_[d[1]] : 0);
             if (Compare(d[0], value & d[3], d[2])) {
                 backend_.Sync();
-                if (d[0] & 0x100) mem_.Write32(d[4] & ~3u, d[5]);
+                if (d[0] & 0x100) GuestWrite(d[4] & ~3u, d[5]);
                 else SetReg(d[4], d[5]);
             }
             break;
@@ -217,12 +218,12 @@ CommandProcessor::Result CommandProcessor::ExecuteType3(uint32_t op, const std::
 
         case pm4::kMemWrite:
             backend_.Sync();
-            for (uint32_t i = 1; i < n; ++i) mem_.Write32((d[0] & ~3u) + (i - 1) * 4, d[i]);
+            for (uint32_t i = 1; i < n; ++i) GuestWrite((d[0] & ~3u) + (i - 1) * 4, d[i]);
             break;
 
         case pm4::kEventWriteShd:  // fence / timestamp write
             backend_.Sync();
-            if (n >= 3) mem_.Write32(d[1] & ~3u, d[2]);
+            if (n >= 3) GuestWrite(d[1] & ~3u, d[2]);
             break;
 
         case pm4::kEventWriteExt:  // screen extents report; resolves are copy-mode draws

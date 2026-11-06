@@ -44,6 +44,10 @@ private:
     Result ExecuteType3(uint32_t op, const std::vector<uint32_t>& payload, int depth);
     uint32_t ReadDword(uint32_t base, uint32_t sizeDwords, uint32_t idx) const;
     void SetReg(uint32_t reg, uint32_t value);
+    // A write the guest may wait on: the backend applies it when the GPU caught up, or it lands now.
+    void GuestWrite(uint32_t addr, uint32_t value) {
+        if (!backend_.WriteWhenDone(addr, value)) mem_.Write32(addr, value);
+    }
 
     GuestMemory& mem_;
     Backend& backend_;

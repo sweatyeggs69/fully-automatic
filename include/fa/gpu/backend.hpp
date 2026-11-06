@@ -52,6 +52,13 @@ public:
     // The command stream is about to make GPU progress visible to the guest (fence, memory write,
     // interrupt): backends that defer writes into guest memory must finish them now.
     virtual void Sync() {}
+    // A write of the command stream the guest may wait on (fence, memory write). A backend that runs
+    // the GPU behind the command stream applies it once the GPU finished the work before it and
+    // returns true; false means the command processor writes it now.
+    virtual bool WriteWhenDone(uint32_t addr, uint32_t value) { return false; }
+    // The command processor ran out of commands or is blocked waiting: a good moment to hand
+    // recorded work to the GPU and apply finished writes.
+    virtual void Idle() {}
 };
 
 }  // namespace fa::gpu

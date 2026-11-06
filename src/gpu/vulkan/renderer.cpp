@@ -869,6 +869,84 @@ struct VulkanRenderer::Impl {
         }
     }
 
+    // With frames in flight, the swap does not wait for its writebacks: the snapshots are copied into the
+    // batch's own buffer and written into guest memory when the batch finished (Retire), like a GPU
+    // write landing then. Texture fetches of that memory wait for it (InFlightWrites). Generic resolves
+    // still take the waiting path.
+    void FlushPendingAsync() {
+        if (!HasPending()) return;
+        if (kBatches == 1 || !pendingGen.empty()) { FlushPending(prof::kFlushSwap); return; }
+        prof::Add(prof::kFlushSwap, 1);
+        std::vector<uint32_t> keys;
+        keys.swap(pendingKeys);
+        pendingBytes = 0;
+        struct Job { uint32_t key; ResolveDest dest; VkFormat fmt; uint32_t srcRt, w, filled; uint64_t ver; VkDeviceSize off; };
+        std::vector<Job> jobs;
+        VkDeviceSize total = 0;
+        for (uint32_t k : keys) {
+            Snap& e = snaps[k];
+            e.pending = false;
+            if (!e.valid || !e.img.img) continue;  // overwritten since: nothing to write
+            jobs.push_back({k, e.dest, e.img.format, e.srcRt, e.w, e.filled, e.version, total});
+            total += (VkDeviceSize(e.w) * e.filled * 4 + 15) & ~VkDeviceSize(15);
+        }
+        if (jobs.empty()) return;
+        EndRendering("flushasync");
+        if (wbBuf.size < total) {  // this batch's own buffer: not in use by the GPU
+            DestroyBuffer(wbBuf);
+            if (!CreateBuffer(wbBuf, std::max<VkDeviceSize>(total, 16u << 20), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) {
+                wbBuf = Buffer{};
+                for (const Job& j : jobs) { snaps[j.key].pending = true; pendingKeys.push_back(j.key); }
+                FlushPending(prof::kFlushSwap);
+                return;
+            }
+        }
+        Begin();
+        Barrier();
+        for (const Job& j : jobs) {
+            VkBufferImageCopy bic{};
+            bic.bufferOffset = j.off;
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bic.imageExtent = {j.w, j.filled, 1};
+            vkCmdCopyImageToBuffer(cmd, snaps[j.key].img.img, VK_IMAGE_LAYOUT_GENERAL, wbBuf.buf, 1, &bic);
+            const uint64_t lo = j.dest.base & 0x1FFFFFFFu;
+            wbRanges.push_back({lo, lo + ResolveDestByteSize(j.dest)});
+        }
+        Barrier();
+        const uint8_t* rb = static_cast<const uint8_t*>(wbBuf.map);
+        doneActions.push_back([this, jobs = std::move(jobs), rb] {
+            prof::Scope pc_(prof::kResolveCpu);
+            for (const Job& j : jobs) {
+                const uint32_t destBytes = ResolveDestByteSize(j.dest);
+                prof::Add(prof::kWbSnapKB, destBytes / 1024);
+                auto it = snaps.find(j.key);
+                Snap* e = it != snaps.end() ? &it->second : nullptr;
+                const bool same = e && e->version == j.ver;  // the snapshot still holds what was written
+                const bool keep = e && e->valid;
+                bool wrote;
+                {
+                    prof::Scope pr_(prof::kRcRaw);
+                    wrote = ResolveRaw(j.dest, j.fmt, false, 0, 0, j.w, j.filled, rb + j.off, destBytes);
+                }
+                if (wrote) {
+                    InvalidateTextures(j.dest.base, destBytes, 766);
+                } else if (SnapClass(j.dest.format) == 5) {
+                    PendingGeneric g{j.dest, j.fmt, false, j.srcRt, 0, 0, j.w, j.filled, destBytes, VkFormatBytes(j.fmt), 0};
+                    FinishGeneric(g, rb + j.off);
+                    wrote = true;
+                }
+                if (!e) continue;
+                if (wrote) {
+                    e->valid = keep;
+                    if (same) if (const uint8_t* gp = mem.HostPtr(j.dest.base, destBytes)) SnapSample(gp, destBytes, e->samples);
+                } else if (same) {
+                    e->valid = false;
+                    e->invSite = 770;
+                }
+            }
+        });
+    }
+
     // Converts the generic resolves recorded since the last flush into guest memory (their pixels are in readback).
     void FinishGenerics() {
         if (pendingGen.empty()) return;
@@ -1434,9 +1512,9 @@ struct VulkanRenderer::Impl {
         }
         return h;
     }
-    void VbCheckPass(const char* when, prof::Stat draws, prof::Stat kb) {
+    void VbCheckPass(std::vector<VbCheck>& checks, const char* when, prof::Stat draws, prof::Stat kb) {
         static int logged = 0, loggedLate = 0;
-        for (auto& c : vbChecks) {
+        for (auto& c : checks) {
             uint64_t h = HashGuest(c.addr, c.words);
             if (h == c.h) continue;
             prof::Add(draws, 1);
@@ -1449,10 +1527,99 @@ struct VulkanRenderer::Impl {
         }
     }
 
-    // Submits everything recorded so far and waits for it. All per-batch resources are reset.
-    void SubmitAndWait() {
+    // ---- batches in flight ----------------------------------------------------------------
+    // A batch is one command buffer with everything it needs until the GPU has run it: command pool,
+    // fence, texture descriptor pool, timestamps, its part of the upload ring, a writeback buffer, the
+    // images to free and the actions to run once it finished (writes the guest may observe: resolve
+    // writebacks, fence values). Nothing here knows about PM4 or registers.
+    // FA_FRAMES=N (1 to 3, default 1) keeps up to N batches: Submit() hands the current one to the GPU
+    // and only waits when the oldest one is still running, so the CPU records the next frame while the
+    // GPU draws this one. With 1 every submit waits, as before.
+    static inline const uint32_t kBatches = [] {
+        const char* e = std::getenv("FA_FRAMES");
+        return e ? std::clamp<uint32_t>(uint32_t(std::atoi(e)), 1u, 3u) : 1u;
+    }();
+    struct WbRange { uint64_t lo, hi; };
+    struct Batch {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkDescriptorPool texPool = VK_NULL_HANDLE;
+        VkQueryPool tsPool = VK_NULL_HANDLE;
+        uint32_t tsCount = 0;
+        std::vector<std::string> tsLabels;
+        Buffer wb;                                 // snapshot writebacks done when the batch finished
+        std::vector<WbRange> wbRanges;             // guest memory those writebacks will write
+        std::vector<Image> garbageImages;
+        std::vector<VkImageView> garbageViews;
+        std::vector<VbCheck> vbChecks;
+        std::vector<std::function<void()>> done;  // in order, on the GPU thread, after the GPU finished
+        bool inFlight = false;
+    };
+    // The current batch's resources live in the members (cmd, fence, cmdPool, texPool, tsPool, ...);
+    // its slot in `batches` is empty meanwhile.
+    std::vector<Batch> batches;
+    uint32_t curBatch = 0;
+    VkDeviceSize ringBase = 0;  // start of the current batch's part of the ring
+    Buffer wbBuf;
+    std::vector<WbRange> wbRanges;
+    std::vector<std::function<void()>> doneActions;
+    void SwapBatch(Batch& b) {
+        std::swap(b.pool, cmdPool);
+        std::swap(b.cmd, cmd);
+        std::swap(b.fence, fence);
+        std::swap(b.texPool, texPool);
+        std::swap(b.tsPool, tsPool);
+        std::swap(b.tsCount, tsCount);
+        std::swap(b.tsLabels, tsLabels);
+        std::swap(b.wb, wbBuf);
+        std::swap(b.wbRanges, wbRanges);
+        std::swap(b.garbageImages, garbageImages);
+        std::swap(b.garbageViews, garbageViews);
+        std::swap(b.vbChecks, vbChecks);
+        std::swap(b.done, doneActions);
+    }
+    // Waits for a submitted batch and releases what it held, then runs its actions.
+    void Retire(Batch& b) {
+        if (!b.inFlight) return;
+        Check(vkWaitForFences(dev, 1, &b.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        vkResetFences(dev, 1, &b.fence);
+        b.inFlight = false;
+        if (vbCheck) {
+            VbCheckPass(b.vbChecks, "gpu done", prof::kVbChgGpu, prof::kVbChgGpuKB);
+            prof::Add(prof::kVbChecked, b.vbChecks.size());
+            b.vbChecks.clear();
+        }
+        if (b.tsPool) {
+            std::vector<uint64_t> ts(b.tsCount);
+            if (b.tsCount >= 2 && vkGetQueryPoolResults(dev, b.tsPool, 0, b.tsCount, b.tsCount * sizeof(uint64_t), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                const double per = double(props.limits.timestampPeriod) / 1000.0;
+                if (ts[b.tsCount - 1] >= ts[0]) prof::Add(prof::kGpuUs, uint64_t(double(ts[b.tsCount - 1] - ts[0]) * per));
+                for (uint32_t i = 1; i < b.tsCount; i++) {
+                    if (ts[i] < ts[i - 1]) continue;
+                    PassStat& st = passStats[b.tsLabels[i]];
+                    st.us += double(ts[i] - ts[i - 1]) * per;
+                    st.n++;
+                }
+            }
+            b.tsCount = 0;
+        }
+        vkResetCommandPool(dev, b.pool, 0);
+        vkResetDescriptorPool(dev, b.texPool, 0);
+        for (auto& im : b.garbageImages) DestroyImage(im);
+        b.garbageImages.clear();
+        for (auto v : b.garbageViews) vkDestroyImageView(dev, v, nullptr);
+        b.garbageViews.clear();
+        std::vector<std::function<void()>> done;
+        done.swap(b.done);
+        b.wbRanges.clear();
+        for (auto& f : done) f();
+    }
+    // Hands the current batch to the GPU and makes the next one current, waiting only when that one
+    // (the oldest) is still running.
+    void Submit() {
         if (!recording) return;
-        if (vbCheck) VbCheckPass("submit", prof::kVbChgSubmit, prof::kVbChgSubmitKB);
+        if (vbCheck) VbCheckPass(vbChecks, "submit", prof::kVbChgSubmit, prof::kVbChgSubmitKB);
         EndRendering("submit");
         MarkTs("other");
         Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
@@ -1461,45 +1628,53 @@ struct VulkanRenderer::Impl {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd;
         Check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit");
-        Check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-        vkResetFences(dev, 1, &fence);
-        if (vbCheck) {
-            VbCheckPass("gpu done", prof::kVbChgGpu, prof::kVbChgGpuKB);
-            prof::Add(prof::kVbChecked, vbChecks.size());
-            vbChecks.clear();
-        }
-        if (tsPool) {
-            std::vector<uint64_t> ts(tsCount);
-            if (tsCount >= 2 && vkGetQueryPoolResults(dev, tsPool, 0, tsCount, tsCount * sizeof(uint64_t), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                const double per = double(props.limits.timestampPeriod) / 1000.0;
-                if (ts[tsCount - 1] >= ts[0]) prof::Add(prof::kGpuUs, uint64_t(double(ts[tsCount - 1] - ts[0]) * per));
-                for (uint32_t i = 1; i < tsCount; i++) {
-                    if (ts[i] < ts[i - 1]) continue;
-                    PassStat& st = passStats[tsLabels[i]];
-                    st.us += double(ts[i] - ts[i - 1]) * per;
-                    st.n++;
-                }
-            }
-            tsCount = 0;
-        }
-        vkResetCommandPool(dev, cmdPool, 0);
-        vkResetDescriptorPool(dev, texPool, 0);
+        Batch& b = batches[curBatch];
+        SwapBatch(b);
+        b.inFlight = true;
+        curBatch = (curBatch + 1) % kBatches;
+        Retire(batches[curBatch]);
+        SwapBatch(batches[curBatch]);
+        // Recording state that pointed into the previous batch.
         texSetsUsed = 0;
         lastTexSet = VK_NULL_HANDLE;
         texSetCache.clear();
         curPipeline = VK_NULL_HANDLE;  // bindings do not carry over to the next command buffer
-        ringPos = 0;
+        ringBase = VkDeviceSize(curBatch) * kRingSize;
+        ringPos = ringBase;
         vbCache.clear();
         vbExt.clear();
         unbCache.clear();
         lastConstsOff = ~0ull;
         cblkHave = 0;
-        for (auto& im : garbageImages) DestroyImage(im);
-        garbageImages.clear();
-        for (auto v : garbageViews) vkDestroyImageView(dev, v, nullptr);
-        garbageViews.clear();
         stats.submits++;
         prof::Add(prof::kSubmits, 1);
+    }
+    // Waits for every submitted batch, oldest first.
+    void WaitIdle() {
+        for (uint32_t i = 1; i < kBatches; i++) Retire(batches[(curBatch + i) % kBatches]);
+    }
+    // Retires the batches the GPU already finished, oldest first, without waiting.
+    void RetireFinished() {
+        for (uint32_t i = 1; i < kBatches; i++) {
+            Batch& b = batches[(curBatch + i) % kBatches];
+            if (!b.inFlight) continue;
+            if (vkGetFenceStatus(dev, b.fence) != VK_SUCCESS) break;
+            Retire(b);
+        }
+    }
+    // True when a submitted batch will still write guest memory overlapping [base, base + size).
+    bool InFlightWrites(uint32_t base, uint32_t size) const {
+        const uint64_t lo = base & 0x1FFFFFFFu, hi = lo + size;
+        for (const Batch& b : batches)
+            if (b.inFlight)
+                for (const WbRange& r : b.wbRanges)
+                    if (r.lo < hi && lo < r.hi) return true;
+        return false;
+    }
+    // Submits everything recorded so far and waits for all of it.
+    void SubmitAndWait() {
+        Submit();
+        WaitIdle();
     }
 
     // Linear allocation from the upload ring; flushes the batch when it runs out.
@@ -1507,11 +1682,11 @@ struct VulkanRenderer::Impl {
         flushed = false;
         align = std::max<VkDeviceSize>(align, 16);
         VkDeviceSize at = (ringPos + align - 1) / align * align;
-        if (at + size > ring.size) {
-            SubmitAndWait();
+        if (at + size > ringBase + kRingSize) {
+            Submit();
             Begin();
             flushed = true;
-            at = 0;
+            at = ringBase;
         }
         ringPos = at + size;
         return at;
@@ -1963,7 +2138,7 @@ struct VulkanRenderer::Impl {
             if (vkCreateQueryPool(dev, &qci, nullptr, &tsPool) != VK_SUCCESS) tsPool = VK_NULL_HANDLE;
         }
 
-        if (!CreateBuffer(ring, kRingSize,
+        if (!CreateBuffer(ring, kRingSize * kBatches,
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                           true)) {
@@ -2034,6 +2209,23 @@ struct VulkanRenderer::Impl {
         dpci.poolSizeCount = 1;
         dpci.pPoolSizes = &ps1;
         vkCreateDescriptorPool(dev, &dpci, nullptr, &texPool);
+        // The other batches' own resources (slot 0 is the current batch: its resources are the members).
+        batches.resize(kBatches);
+        for (uint32_t i = 1; i < kBatches; i++) {
+            Batch& b = batches[i];
+            if (vkCreateCommandPool(dev, &pci, nullptr, &b.pool) != VK_SUCCESS) return Fail(err, "vkCreateCommandPool", VK_ERROR_UNKNOWN);
+            cai.commandPool = b.pool;
+            vkAllocateCommandBuffers(dev, &cai, &b.cmd);
+            vkCreateFence(dev, &fci, nullptr, &b.fence);
+            vkCreateDescriptorPool(dev, &dpci, nullptr, &b.texPool);
+            if (tsPool) {
+                VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                qci.queryCount = kTsMax;
+                if (vkCreateQueryPool(dev, &qci, nullptr, &b.tsPool) != VK_SUCCESS) b.tsPool = VK_NULL_HANDLE;
+            }
+        }
+        if (kBatches > 1) std::fprintf(stderr, "[render] %u frames in flight\n", kBatches);
 
         // The pipeline cache persists between runs (the driver rejects data from another GPU or driver version),
         // so the shaders compiled for a race are not recompiled, and hitch, on every start.
@@ -2101,6 +2293,16 @@ struct VulkanRenderer::Impl {
     ~Impl() {
         if (dev) {
             vkDeviceWaitIdle(dev);
+            for (Batch& b : batches) {
+                for (auto& im : b.garbageImages) DestroyImage(im);
+                for (auto v : b.garbageViews) vkDestroyImageView(dev, v, nullptr);
+                DestroyBuffer(b.wb);
+                if (b.texPool) vkDestroyDescriptorPool(dev, b.texPool, nullptr);
+                if (b.tsPool) vkDestroyQueryPool(dev, b.tsPool, nullptr);
+                if (b.fence) vkDestroyFence(dev, b.fence, nullptr);
+                if (b.pool) vkDestroyCommandPool(dev, b.pool, nullptr);
+            }
+            DestroyBuffer(wbBuf);
             for (auto& [k, s] : shaders) if (s.module) vkDestroyShaderModule(dev, s.module, nullptr);
             if (rectGs) vkDestroyShaderModule(dev, rectGs, nullptr);
             if (nullPs) vkDestroyShaderModule(dev, nullPs, nullptr);
@@ -2409,6 +2611,11 @@ struct VulkanRenderer::Impl {
         if (tex.validatedGen == generation && tex.ok) return tex.image.view;
         tex.guestBase = t.base;
         tex.guestSize = size;
+        if (kBatches > 1 && InFlightWrites(t.base, size)) {
+            prof::Add(prof::kFlushTex, 1);
+            prof::Scope pw_(prof::kResolveWait);
+            WaitIdle();
+        }
         if (HasPending() && PendingOverlaps(t.base, size)) {
             {   // FA_SNAPLOG: which fetch forced the writeback, and of what (g = generic resolve, s = snapshot)
                 const uint64_t lo = t.base & 0x1FFFFFFFu, hi = lo + size;
@@ -2605,7 +2812,7 @@ struct VulkanRenderer::Impl {
         // Stage the texels (RGBA32F -> RGBA16F when that is the host format).
         size_t texels = ht.data.size() / (ht.isFloat ? 16 : 4);  // all layers and levels
         size_t bytes = texels * (fmt == VK_FORMAT_R8G8B8A8_UNORM ? 4 : fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 16);
-        if (bytes > ring.size / 2) return fallback.view;
+        if (bytes > kRingSize / 2) return fallback.view;
         bool flushed;
         VkDeviceSize at = RingAlloc(bytes, 16, flushed);
         uint8_t* dst = static_cast<uint8_t*>(ring.map) + at;
@@ -2987,7 +3194,7 @@ struct VulkanRenderer::Impl {
             }
             if (!sameSet) {
             prof::Scope pd_(prof::kDtDesc);
-            if (texSetsUsed >= kMaxTextureSets) { prof::Add(prof::kDescFull, 1); SubmitAndWait(); Begin(); }
+            if (texSetsUsed >= kMaxTextureSets) { prof::Add(prof::kDescFull, 1); Submit(); Begin(); }
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             ai.descriptorPool = texPool;
             ai.descriptorSetCount = 1;
@@ -4083,8 +4290,13 @@ struct VulkanRenderer::Impl {
     }
 
     void Swap() {
-        FlushPending(prof::kFlushSwap);
-        {
+        if (kBatches > 1) {
+            FlushPendingAsync();
+            prof::Scope ps_(prof::kOtherWait);
+            Submit();
+            RetireFinished();
+        } else {
+            FlushPending(prof::kFlushSwap);
             prof::Scope ps_(prof::kOtherWait);
             SubmitAndWait();
         }
@@ -4214,6 +4426,26 @@ void VulkanRenderer::Sync() {
     static const bool syncFlush = [] { const char* e = std::getenv("FA_SYNC_FLUSH"); return e && e[0] == '1'; }();
     if (p_->ready && !p_->broken && syncFlush) p_->FlushPending();
     if (p_->next) p_->next->Sync();
+}
+
+bool VulkanRenderer::WriteWhenDone(uint32_t addr, uint32_t value) {
+    // With frames in flight, a fence the game waits on is written once the GPU ran everything before it,
+    // so the game does not reuse memory the GPU has yet to read.
+    if (!p_->ready || p_->broken || Impl::kBatches == 1) return false;
+    p_->doneActions.push_back([m = &p_->mem, addr, value] { m->Write32(addr, value); });
+    return true;
+}
+
+void VulkanRenderer::Idle() {
+    if (p_->ready && !p_->broken && Impl::kBatches > 1) {
+        // Writes the game may be waiting for go to the GPU now, and finished batches apply theirs.
+        if (!p_->doneActions.empty()) {
+            p_->Submit();
+            p_->Begin();
+        }
+        p_->RetireFinished();
+    }
+    if (p_->next) p_->next->Idle();
 }
 
 void VulkanRenderer::Flush() {

@@ -50,6 +50,8 @@ public:
     void Resolve(const RegisterFile& regs) override;
     void Swap(uint32_t frontBufferGuestAddr, uint32_t width, uint32_t height, const RegisterFile& regs) override;
     void Sync() override;
+    bool WriteWhenDone(uint32_t addr, uint32_t value) override;
+    void Idle() override;
 
     // Submits pending GPU work and waits for it (tests).
     void Flush();

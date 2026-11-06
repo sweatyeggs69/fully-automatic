@@ -55,6 +55,8 @@ if(TARGET fa_render)
   target_include_directories(gpu_render_test PRIVATE tests)
   target_link_libraries(gpu_render_test fa_render fa_gpu)
   add_test(NAME gpu_render COMMAND gpu_render_test)
+  add_test(NAME gpu_render_frames COMMAND gpu_render_test)
+  set_tests_properties(gpu_render_frames PROPERTIES ENVIRONMENT "FA_FRAMES=2")
 endif()
 
 # HLE services used by the runtime: file system (ISO / folders), controller

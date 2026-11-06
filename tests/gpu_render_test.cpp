@@ -301,6 +301,54 @@ int main() {
                     st.textureWwClean > clean0 ? "skipped" : "hashed", st.textureUploads == up0 + 1 ? "yes" : "NO");
     }
 
+    // Fences and the swap's writebacks (FA_FRAMES=2 runs this test with frames in flight too): a fence
+    // the stream writes reaches guest memory once the GPU is done, and a resolve flushed by the swap
+    // lands in guest memory by the next full flush.
+    {
+        RegisterFile none;
+        const uint32_t fenceAddr = 0x280000, dest3 = 0x2C0000;
+        mem.Write32(fenceAddr, 0);
+        Stream q{mem, ring, ringBytes / 4, s.w};
+        q.shader(0, xasm::ColorVS());
+        q.shader(1, xasm::ColorPS());
+        q.reg(xe::PA_CL_VTE_CNTL, 0);
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::RB_COPY_CONTROL, (1u << 8) | (3u << 20));  // clear to blue
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        q.vfetch0(vb, 21);
+        q.draw(xe::kPrimTriangleList, 3);
+        q.vfetch0(rectVb, 6);
+        q.reg(xe::RB_COPY_CONTROL, 0);
+        q.reg(xe::RB_COPY_DEST_BASE, dest3);
+        q.reg(xe::RB_COPY_DEST_PITCH, (64u << 16) | 128);
+        q.reg(xe::RB_COPY_DEST_INFO, (kFmt8_8_8_8 << 7) | kEndian8in32);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramCopy);
+        q.draw(xe::kPrimRectangleList, 3);
+        q.reg(xe::RB_MODECONTROL, xe::kEdramColorDepth);
+        q.put(T3(pm4::kEventWriteShd, 3));
+        q.put(0);
+        q.put(fenceAddr);
+        q.put(0x1234);
+        cp.SetWritePtr(q.w % (ringBytes / 4));
+        CHECK(cp.Pump() == CommandProcessor::Status::Idle);
+        int polls = 0;
+        while (mem.Read32(fenceAddr) != 0x1234 && polls < 2000) {
+            usleep(1000);  // like the runtime's GPU thread, which polls every 0.5 ms
+            cp.Pump();     // idle: finished GPU work applies its writes
+            polls++;
+        }
+        CHECK(mem.Read32(fenceAddr) == 0x1234);
+        r.Swap(0, 0, 0, none);
+        r.Flush();
+        Pixel(mem, dest3, 128, 64, 4, 4, p);
+        CHECK(p[0] == 255 && p[1] == 0 && p[2] == 0 && p[3] == 255);
+        Pixel(mem, dest3, 128, 64, 60, 60, p);
+        CHECK(p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255);
+        std::printf("  fence written after %d idle polls, swap writeback (60,60) = %02x %02x %02x %02x\n", polls, p[0], p[1], p[2], p[3]);
+    }
+
     if (failures) { std::printf("gpu_render_test: %d failure(s)\n", failures); return 1; }
     std::printf("gpu_render_test: ok\n");
     return 0;
