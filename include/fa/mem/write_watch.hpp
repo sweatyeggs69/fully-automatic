@@ -60,6 +60,12 @@ public:
     void SetQueryAllViews(bool all) { queryAllViews_ = all; }
     // Skipping the query for quiet memory is opt-in until checked in game (run 119 showed broken textures).
     void SetSkipCold(bool skip) { skipCold_ = skip; }
+    // Clean's kernel query asks about a whole 2 MB region (per view) once per Harvest and keeps the pages
+    // it found written; later checks in that region read the kept answer. A write after the region was
+    // asked about is seen at the next Harvest, as a write after a range's own query always was (the
+    // copy's token is older). Runs 134 and 137 made 3,300 to 4,600 queries per frame (1.6 to 2.3 ms).
+    // false (the default): one query per checked range and view.
+    void SetRegionQueries(bool on) { regionQueries_ = on; }
 
     struct Stats {
         uint64_t harvests = 0, pagesWritten = 0, pagesWatched = 0, scanCalls = 0, queryCalls = 0, querySkips = 0, queryCold = 0;
@@ -91,6 +97,10 @@ private:
     uint32_t harvestNo_ = 0;
     bool queryAllViews_ = false;
     bool skipCold_ = false;
+    bool regionQueries_ = false;
+    mutable std::vector<std::vector<uint32_t>> regionAt_;  // per view, per region: harvestNo_ + 1 when asked since the last Harvest
+    mutable std::vector<uint32_t> nowAt_;                  // per page: harvestNo_ + 1 when a region query found it written
+    void QueryRegion(size_t view, uint32_t region) const;
 };
 
 }  // namespace fa::mem

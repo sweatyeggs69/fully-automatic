@@ -1970,6 +1970,9 @@ struct VulkanRenderer::Impl {
         { const char* av = std::getenv("FA_WW_ALLVIEWS"); ww.SetQueryAllViews(av && av[0] == '1'); }
         // FA_WW_COLD=1: no kernel query for memory not written in the last 120 frames (opt-in, see run 119).
         { const char* wc = std::getenv("FA_WW_COLD"); ww.SetSkipCold(wc && wc[0] == '1'); }
+        // FA_WW_REGIONQ=1: one kernel query per 2 MB region and view per frame instead of one per texture check
+        // and view (opt-in until a run shows no stale textures: like FA_WW_COLD it sees some writes a frame later).
+        { const char* rq = std::getenv("FA_WW_REGIONQ"); ww.SetRegionQueries(rq && rq[0] == '1'); }
         stats.writeWatch = 1;
         // Resolve writebacks go through a mapping of their own that is not write protected: through the watched
         // views every first write to a page takes a fault (about 3 ms per 18 MB, the race writes about that much
